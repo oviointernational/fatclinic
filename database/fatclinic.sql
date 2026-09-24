@@ -17,8 +17,8 @@
 -- salted hashes (e.g. bcrypt via pgcrypto crypt()) and force rotation.
 -- ============================================================================
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
+-- NOTE: no extensions required. (pgcrypto was removed — nothing in this
+-- schema uses it, and a failing CREATE EXTENSION would abort the apply.)
 -- ----------------------------------------------------------------------------
 -- Lookup: wards (admission requires a ward)
 -- ----------------------------------------------------------------------------
