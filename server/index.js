@@ -28,15 +28,19 @@ const DIST = path.join(ROOT, 'dist');
 
 const PORT = Number(process.env.PORT || 3001);
 
-// Railway Postgres: DATABASE_URL first, then the private-network variable.
+// Railway Postgres: DATABASE_URL, then DATABASE_PUBLIC_URL, then the
+// private-network variable, then local defaults.
 const CONNECTION_STRING =
   process.env.DATABASE_URL ||
+  process.env.DATABASE_PUBLIC_URL ||
   process.env.DATABASE_PRIVATE_URL ||
   'postgresql://postgres:postgres@localhost:5432/fatclinic';
 
-const USE_SSL =
-  String(process.env.PG_SSL || '').toLowerCase() === 'true' ||
-  /sslmode=require/.test(CONNECTION_STRING);
+// SSL: Railway's public hostnames require it; private/internal and
+// localhost do not. Override explicitly with PG_SSL=true/false.
+const _isPrivateHost = /railway\.internal|localhost|127\.0\.0\.1/.test(CONNECTION_STRING);
+const _sslEnv = String(process.env.PG_SSL || '').toLowerCase();
+const USE_SSL = _sslEnv === 'true' || (_sslEnv !== 'false' && !_isPrivateHost);
 
 const pool = new pg.Pool({
   connectionString: CONNECTION_STRING,
