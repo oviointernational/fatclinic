@@ -18,6 +18,45 @@ import { Patient, UserRole } from '../../types';
 import { OnlineBookingModal } from '../frontdesk/OnlineBookingModal';
 import { AccountModal } from '../common/AccountModal';
 
+/** Postgres API reachability dot (Railway DATABASE_PRIVATE_URL wiring). */
+const ServerStatus: React.FC = () => {
+  const [state, setState] = useState<'checking' | 'online' | 'offline'>('checking');
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const ping = async () => {
+      try {
+        const res = await fetch('/api/health', { cache: 'no-store' });
+        if (!cancelled) setState(res.ok ? 'online' : 'offline');
+      } catch {
+        if (!cancelled) setState('offline');
+      }
+    };
+    void ping();
+    const timer = setInterval(ping, 60000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
+  return (
+    <span
+      title={state === 'online' ? 'Server database: connected' : state === 'offline' ? 'Server database: unreachable (using local data)' : 'Checking server database…'}
+      className={`hidden sm:inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold border ${
+        state === 'online'
+          ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800'
+          : state === 'offline'
+          ? 'bg-slate-100 text-slate-500 border-slate-200 dark:bg-dark-surface dark:text-slate-400 dark:border-dark-border'
+          : 'bg-amber-50 text-amber-700 border-amber-200'
+      }`}
+    >
+      <span className={`w-1.5 h-1.5 rounded-full ${state === 'online' ? 'bg-emerald-500 animate-pulse' : state === 'offline' ? 'bg-slate-400' : 'bg-amber-500 animate-pulse'}`} />
+      <span>{state === 'online' ? 'Server DB' : state === 'offline' ? 'Local data' : '…'}</span>
+    </span>
+  );
+};
+
 interface HeaderProps {
   onSelectPatient?: (patient: Patient) => void;
   onOpenSignInModal: () => void;
@@ -130,6 +169,7 @@ export const Header: React.FC<HeaderProps> = ({
 
       {/* Upper Right: Actions, Role Switcher, Sleep Avatar & Auth */}
       <div className="flex items-center space-x-3">
+        <ServerStatus />
         {/* Book Appointment / Self-Register Modal Button */}
         <button
           onClick={() => setIsBookingModalOpen(true)}
