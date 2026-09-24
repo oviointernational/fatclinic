@@ -14,9 +14,6 @@ import {
   CustomRole
 } from '../../types';
 import {
-  Users,
-  Sliders,
-  Building,
   KeyRound,
   CheckCircle2,
   Save,
@@ -25,14 +22,11 @@ import {
   Trash2,
   UserPlus,
   Boxes,
-  TestTube,
-  Pill,
   Radio,
   Activity,
   Search,
   AlertTriangle,
-  X,
-  Receipt
+  X
 } from 'lucide-react';
 import { PermissionTreeEditor } from './PermissionTreeEditor';
 import { countGranted } from '../../services/permissions';
@@ -448,113 +442,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
   const generalServices = services.filter(s => !s.id.startsWith('SVC-RAD') && !s.id.startsWith('SVC-PT'));
 
   return (
-    <div className="h-full flex flex-col select-text overflow-y-auto p-4 md:p-6 space-y-5 bg-light-bg dark:bg-dark-bg">
+    <div className="h-full flex flex-col select-text overflow-y-auto px-4 md:px-6 pb-4 md:pb-6 space-y-5 bg-light-bg dark:bg-dark-bg">
       {/* Notification Bar */}
       {savedAlert && (
-        <div className="flex items-center space-x-2 px-3.5 py-2 rounded-xl bg-emerald-100 dark:bg-emerald-950/70 border border-emerald-300 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 text-xs font-bold animate-in fade-in flex-shrink-0">
+        <div className="mt-4 md:mt-6 flex items-center space-x-2 px-3.5 py-2 rounded-xl bg-emerald-100 dark:bg-emerald-950/70 border border-emerald-300 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 text-xs font-bold animate-in fade-in flex-shrink-0">
           <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
           <span>{savedAlert}</span>
         </div>
       )}
-
-      {/* Primary Administration Navigation Tabs */}
-      <div className="flex items-center space-x-1.5 overflow-x-auto pb-1 border-b border-light-border dark:border-dark-border text-xs font-bold scrollbar-none">
-        <button
-          onClick={() => setActiveTab('users')}
-          className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl transition-all whitespace-nowrap ${
-            activeTab === 'users'
-              ? 'bg-blue-600 text-white shadow-sm'
-              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-dark-card'
-          }`}
-        >
-          <Users className="w-4 h-4" />
-          <span>Staff Accounts & Roles ({allUsers.length})</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('consumables')}
-          className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl transition-all whitespace-nowrap ${
-            activeTab === 'consumables'
-              ? 'bg-emerald-600 text-white shadow-sm'
-              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-dark-card'
-          }`}
-        >
-          <Boxes className="w-4 h-4" />
-          <span>Clinical Consumables ({consumables.length})</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('lab')}
-          className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl transition-all whitespace-nowrap ${
-            activeTab === 'lab'
-              ? 'bg-rose-600 text-white shadow-sm'
-              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-dark-card'
-          }`}
-        >
-          <TestTube className="w-4 h-4" />
-          <span>Lab Investigations ({labDefs.length})</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('pharmacy')}
-          className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl transition-all whitespace-nowrap ${
-            activeTab === 'pharmacy'
-              ? 'bg-purple-600 text-white shadow-sm'
-              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-dark-card'
-          }`}
-        >
-          <Pill className="w-4 h-4" />
-          <span>Pharmacy Formulary ({medications.length})</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('radiology_physio')}
-          className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl transition-all whitespace-nowrap ${
-            activeTab === 'radiology_physio'
-              ? 'bg-indigo-600 text-white shadow-sm'
-              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-dark-card'
-          }`}
-        >
-          <Radio className="w-4 h-4" />
-          <span>Radiology & Physio</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('pricing')}
-          className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl transition-all whitespace-nowrap ${
-            activeTab === 'pricing'
-              ? 'bg-teal-600 text-white shadow-sm'
-              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-dark-card'
-          }`}
-        >
-          <Sliders className="w-4 h-4" />
-          <span>Master Pricing Matrix</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('receipts')}
-          className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl transition-all whitespace-nowrap ${
-            activeTab === 'receipts'
-              ? 'bg-cyan-600 text-white shadow-sm'
-              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-dark-card'
-          }`}
-        >
-          <Receipt className="w-4 h-4" />
-          <span>Receipt Settings</span>
-        </button>
-
-        <button
-          onClick={() => setActiveTab('settings')}
-          className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl transition-all whitespace-nowrap ${
-            activeTab === 'settings'
-              ? 'bg-slate-700 text-white shadow-sm'
-              : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-dark-card'
-          }`}
-        >
-          <Building className="w-4 h-4" />
-          <span>Hospital Parameters</span>
-        </button>
-      </div>
 
       {/* TAB 1: USERS & ROLES */}
       {activeTab === 'users' && (
