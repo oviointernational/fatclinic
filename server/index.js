@@ -28,10 +28,10 @@ const DIST = path.join(ROOT, 'dist');
 
 const PORT = Number(process.env.PORT || 3001);
 
-// Railway Postgres: prefer the private-network URL variable.
+// Railway Postgres: DATABASE_URL first, then the private-network variable.
 const CONNECTION_STRING =
-  process.env.DATABASE_PRIVATE_URL ||
   process.env.DATABASE_URL ||
+  process.env.DATABASE_PRIVATE_URL ||
   'postgresql://postgres:postgres@localhost:5432/fatclinic';
 
 const USE_SSL =
