@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Production build output
+dist/
+dist-ssr/
+
+# Runtime logs
+dev.log
+*.log
+npm-debug.log*
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Editor & OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local Vite cache
+node_modules/.vite/
