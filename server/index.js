@@ -1,10 +1,10 @@
 /**
- * FatClinic EHR — Railway service entry point.
+ * FatClinic EHR — Node service entry point.
  *
  * Single service that:
- *  1. Connects to Postgres using DATABASE_PRIVATE_URL
- *     (Railway: reference it as ${{ Postgres.DATABASE_PRIVATE_URL }}),
- *     falling back to DATABASE_URL, then local defaults.
+ *  1. Connects to external Postgres (Supabase) using DATABASE_URL
+ *     (also accepts DATABASE_PUBLIC_URL / DATABASE_PRIVATE_URL),
+ *     falling back to local defaults.
  *  2. Auto-applies database/fatclinic.sql (idempotent) on boot.
  *  3. Exposes a generic /api REST layer over the allow-listed tables.
  *  4. Serves the Vite production build (dist/) + SPA fallback.
@@ -28,15 +28,15 @@ const DIST = path.join(ROOT, 'dist');
 
 const PORT = Number(process.env.PORT || 3001);
 
-// Railway Postgres: DATABASE_URL, then DATABASE_PUBLIC_URL, then the
-// private-network variable, then local defaults.
+// External Postgres (Supabase): DATABASE_URL first, then alternates,
+// then local defaults.
 const CONNECTION_STRING =
   process.env.DATABASE_URL ||
   process.env.DATABASE_PUBLIC_URL ||
   process.env.DATABASE_PRIVATE_URL ||
   'postgresql://postgres:postgres@localhost:5432/fatclinic';
 
-// SSL: Railway's public hostnames require it; private/internal and
+// SSL: public hosts (Supabase, etc.) require it; private/internal and
 // localhost do not. Override explicitly with PG_SSL=true/false.
 const _isPrivateHost = /railway\.internal|localhost|127\.0\.0\.1/.test(CONNECTION_STRING);
 const _sslEnv = String(process.env.PG_SSL || '').toLowerCase();
