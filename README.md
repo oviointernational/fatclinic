@@ -180,29 +180,40 @@ hostname.
 
 ## Deploying
 
-`npm run deploy` builds and publishes the static bundle to Cloudflare Pages.
-There is nothing to run server-side. Run `npx wrangler login` once.
+`npm run deploy` builds locally and publishes the static bundle to Cloudflare
+Workers Static Assets. Run `npx wrangler login` once first.
 
-Set these as build-time variables on the Pages project (**Settings → Environment
-variables**), not in a committed file:
+**Do not add variables to the Cloudflare project.** A Static Assets project has
+no Worker script, so there is nothing for a Cloudflare-side variable to bind to
+and the dashboard rejects it with *"Variables cannot be added to a Worker that
+only has static assets."* Nothing is missing: Vite inlines `VITE_*` into the
+JavaScript at build time, and the build happens on your machine, so the project
+URL and the anon key are already inside `dist/assets/index-*.js` when wrangler
+uploads them. There is no server-side build step that would need them later.
 
-| Variable | Where to get it |
-|---|---|
-| `VITE_SUPABASE_URL` | Project Settings → API → Project URL |
-| `VITE_SUPABASE_ANON_KEY` | Project Settings → API → anon public |
+| Variable | Where it comes from | Where it is used |
+|---|---|---|
+| `VITE_SUPABASE_URL` | `.env`, from Project Settings → API → Project URL | inlined into the bundle at build time |
+| `VITE_SUPABASE_ANON_KEY` | `.env`, from Project Settings → API → anon public | inlined into the bundle at build time |
 
 The anon key is designed to be public, so it is safe in the bundle **only**
 because Row Level Security is enabled and forced on all 34 tables. Do not set
-`SUPABASE_SERVICE_ROLE_KEY` here — it bypasses RLS entirely, and a build variable
-ends up in the published JavaScript.
+`SUPABASE_SERVICE_ROLE_KEY` here — it bypasses RLS entirely, and any `VITE_`
+variable ends up in the published JavaScript.
+
+Because those values are baked in at build time, `npm run build` **fails** if
+they are missing or still contain a `[YOUR-…]` placeholder. Without that check a
+build without `.env` would deploy cleanly, render the sign-in screen, and be
+unable to authenticate — with nothing in the logs to explain it. `npm run dev`
+stays permissive and falls back to local-only mode.
 
 `SUPABASE_SERVICE_ROLE_KEY` belongs in `.env` on an administrator's machine, for
 the `staff:*` and `db:check-orphan` commands only. It is gitignored and must
-never be pasted into chat, committed, or added to the Pages project. Note that
-`wrangler dev` reads `.env` and exposes every value in it as an environment
+never be pasted into chat, committed, or added to the Cloudflare project. Note
+that `wrangler dev` reads `.env` and exposes every value in it as an environment
 binding, so if a Worker is ever added to this project, that key becomes
 reachable from server-side code by accident. `wrangler deploy` publishes only the
-`dist` assets, so nothing in `.env` is uploaded today.
+`dist` assets, so nothing in `.env` is uploaded.
 
 To test the built bundle exactly as it will be served — same SPA fallback, same
 headers, no dev server in the way:
