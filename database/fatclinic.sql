@@ -1022,7 +1022,7 @@ CREATE TRIGGER trg_invoice_discount_math
 -- why such a deployment must never be exposed to a network.
 -- ============================================================================
 
--- The three helper functions below (app_user_role, app_is_admin,
+-- The helper functions below (app_user_role, app_is_admin, app_is_staff,
 -- app_current_staff_id) are created INSIDE the guard below rather than here,
 -- because they call auth.jwt(). PostgreSQL validates a LANGUAGE sql function
 -- body at CREATE time, so declaring them unconditionally would abort the whole
@@ -1075,7 +1075,25 @@ BEGIN
     $body$ LANGUAGE sql STABLE
   $fn$;
 
+  -- TRUE only for a session that maps to an active public.users row.
+  --
+  -- This exists because "authenticated" and "is a member of staff" are different
+  -- things. A Supabase auth account can exist with no public.users row: created
+  -- by an admin in the dashboard, left behind after a profile was deleted, or
+  -- made by anyone at all while email self-signup is on. app_user_role() returns
+  -- NULL for those, and NULL is not FALSE - so `USING (app_user_role() =
+  -- 'ADMINISTRATOR')` denies by accident, while `USING (true)` does not deny at
+  -- all. Gating on this function is what makes an orphaned token worthless: it
+  -- resolves to FALSE, not NULL, and reads nothing.
+  EXECUTE $fn$
+    CREATE OR REPLACE FUNCTION public.app_is_staff() RETURNS BOOLEAN AS $body$
+      SELECT public.app_current_staff_id() IS NOT NULL;
+    $body$ LANGUAGE sql STABLE
+  $fn$;
+
   -- The signed-in staff member's public.users id, for audit attribution.
+  -- Defined before app_is_staff() in this file, but SQL resolves function bodies
+  -- at call time, not at CREATE time, so the order here is for readability only.
   EXECUTE $fn$
     CREATE OR REPLACE FUNCTION public.app_current_staff_id() RETURNS TEXT AS $body$
       SELECT u.id
@@ -1089,6 +1107,9 @@ BEGIN
   COMMENT ON FUNCTION public.app_user_role() IS
     'App role of the signed-in staff member, matched from the Supabase JWT email. NULL when signed out or unrecognised.';
 
+  COMMENT ON FUNCTION public.app_is_staff() IS
+    'TRUE only when the JWT email matches an active public.users row. Never NULL, so it denies an orphaned auth account by evaluating FALSE rather than by accident.';
+
   FOREACH t IN ARRAY staff_tables LOOP
     IF to_regclass('public.' || quote_ident(t)) IS NULL THEN CONTINUE; END IF;
     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
@@ -1097,10 +1118,10 @@ BEGIN
     EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_insert', t);
     EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_update', t);
     EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_delete', t);
-    EXECUTE format('CREATE POLICY %I ON public.%I FOR SELECT TO authenticated USING (true)', t || '_select', t);
-    EXECUTE format('CREATE POLICY %I ON public.%I FOR INSERT TO authenticated WITH CHECK (true)', t || '_insert', t);
-    EXECUTE format('CREATE POLICY %I ON public.%I FOR UPDATE TO authenticated USING (true) WITH CHECK (true)', t || '_update', t);
-    EXECUTE format('CREATE POLICY %I ON public.%I FOR DELETE TO authenticated USING (true)', t || '_delete', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR SELECT TO authenticated USING (public.app_is_staff())', t || '_select', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR INSERT TO authenticated WITH CHECK (public.app_is_staff())', t || '_insert', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR UPDATE TO authenticated USING (public.app_is_staff()) WITH CHECK (public.app_is_staff())', t || '_update', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR DELETE TO authenticated USING (public.app_is_staff())', t || '_delete', t);
   END LOOP;
 
   FOREACH t IN ARRAY admin_tables LOOP
@@ -1111,7 +1132,7 @@ BEGIN
     EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_insert', t);
     EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_update', t);
     EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_delete', t);
-    EXECUTE format('CREATE POLICY %I ON public.%I FOR SELECT TO authenticated USING (true)', t || '_select', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR SELECT TO authenticated USING (public.app_is_staff())', t || '_select', t);
     EXECUTE format('CREATE POLICY %I ON public.%I FOR INSERT TO authenticated WITH CHECK (public.app_is_admin())', t || '_insert', t);
     EXECUTE format('CREATE POLICY %I ON public.%I FOR UPDATE TO authenticated USING (public.app_is_admin()) WITH CHECK (public.app_is_admin())', t || '_update', t);
     EXECUTE format('CREATE POLICY %I ON public.%I FOR DELETE TO authenticated USING (public.app_is_admin())', t || '_delete', t);
@@ -1125,8 +1146,8 @@ BEGIN
     DROP POLICY IF EXISTS audit_logs_insert ON audit_logs;
     DROP POLICY IF EXISTS audit_logs_update ON audit_logs;
     DROP POLICY IF EXISTS audit_logs_delete ON audit_logs;
-    CREATE POLICY audit_logs_select ON audit_logs FOR SELECT TO authenticated USING (true);
-    CREATE POLICY audit_logs_insert ON audit_logs FOR INSERT TO authenticated WITH CHECK (true);
+    CREATE POLICY audit_logs_select ON audit_logs FOR SELECT TO authenticated USING (public.app_is_staff());
+    CREATE POLICY audit_logs_insert ON audit_logs FOR INSERT TO authenticated WITH CHECK (public.app_is_staff());
   END IF;
 
   -- RLS is the real gate; these grants make the intent explicit and cut the anon
@@ -1141,14 +1162,17 @@ BEGIN
   -- directly, so EXECUTE is revoked from PUBLIC and regranted narrowly.
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_user_role() FROM PUBLIC';
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_is_admin() FROM PUBLIC';
+  EXECUTE 'REVOKE ALL ON FUNCTION public.app_is_staff() FROM PUBLIC';
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_current_staff_id() FROM PUBLIC';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_admin() TO authenticated';
+  EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_staff() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO authenticated';
 
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_admin() TO service_role';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_staff() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO service_role';
   END IF;
 

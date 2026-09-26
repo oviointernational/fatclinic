@@ -24,3 +24,6 @@ Thumbs.db
 
 # Local Vite cache
 node_modules/.vite/
+
+# Wrangler local dev state (miniflare sqlite caches and build temp)
+.wrangler/

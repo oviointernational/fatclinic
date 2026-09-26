@@ -18,6 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { resolveConnection, shouldUseSsl, connectWithRetry, resolveHost } from './db-config.mjs';
+import { DEMO_STAFF_EMAILS } from './demo-staff.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -227,45 +228,57 @@ const { rows: auditTrigger } = await client.query(`
 `);
 if (!auditTrigger[0].n) problems.push('audit immutability trigger is missing');
 
-// Invoice arithmetic is the other piece of real logic, so exercise it. The
-// probe runs in a transaction that is always rolled back, so a verification run
-// cannot leave test rows in a clinical database even if it fails midway.
-const mathResults = await client.query(`
-  BEGIN;
-  DO $$
-  DECLARE
-    v_probe TEXT := 'VERIFY-PROBE-' || substr(md5(random()::text), 1, 8);
-  BEGIN
-    INSERT INTO patients (id, first_name, last_name, dob, age, sex, phone)
-    VALUES (v_probe, 'Schema', 'Probe', CURRENT_DATE, 30, 'Male', '000');
-    INSERT INTO visits (id, patient_id, visit_date, visit_type, status)
-    VALUES ('VIS-' || v_probe, v_probe, CURRENT_DATE, 'Routine', 'Completed');
-    INSERT INTO invoices (id, visit_id, patient_id) VALUES (v_probe, 'VIS-' || v_probe, v_probe);
+// Invoice arithmetic is the other piece of real logic, so exercise it.
+//
+// The probe must be undone, and the transaction has to be managed one
+// client.query() at a time. Sending "BEGIN; <statements>" as a single
+// parameterless query does NOT work: node-postgres then uses the simple query
+// protocol, and PostgreSQL wraps the whole message in an implicit transaction
+// that COMMITS at the end. The trailing ROLLBACK then arrives with no
+// transaction open, raises "there is no transaction in progress", and used to be
+// swallowed by a .catch(() => {}) - so every db:apply run left a fake
+// "Schema Probe" patient, visit and invoice in the clinical tables. The assertion
+// at the end of this block is what turned that from silent into visible.
+let probeRows = [];
+await client.query('BEGIN');
+try {
+  await client.query(`
+    DO $$
+    DECLARE
+      v_probe TEXT := 'VERIFY-PROBE-' || substr(md5(random()::text), 1, 8);
+    BEGIN
+      INSERT INTO patients (id, first_name, last_name, dob, age, sex, phone)
+      VALUES (v_probe, 'Schema', 'Probe', CURRENT_DATE, 30, 'Male', '000');
+      INSERT INTO visits (id, patient_id, visit_date, visit_type, status)
+      VALUES ('VIS-' || v_probe, v_probe, CURRENT_DATE, 'Routine', 'Completed');
+      INSERT INTO invoices (id, visit_id, patient_id) VALUES (v_probe, 'VIS-' || v_probe, v_probe);
 
-    -- Line items but no payments. This is the case the old trigger skipped: it
-    -- tested IF NOT FOUND after the payments SELECT, and FOUND is false for a
-    -- query that matched no rows, so subtotal and total stayed at zero.
-    INSERT INTO invoice_items (id, invoice_id, service_category, description, quantity, unit_price, total_price)
-    VALUES ('II-' || v_probe, v_probe, 'Consultation', 'Probe', 2, 500, 1000);
-  END $$;
+      -- Line items but no payments. This is the case the old trigger skipped: it
+      -- tested IF NOT FOUND after the payments SELECT, and FOUND is false for a
+      -- query that matched no rows, so subtotal and total stayed at zero.
+      INSERT INTO invoice_items (id, invoice_id, service_category, description, quantity, unit_price, total_price)
+      VALUES ('II-' || v_probe, v_probe, 'Consultation', 'Probe', 2, 500, 1000);
+    END $$;
+  `);
 
-  -- A discount edit with no child-row change, which the old schema never
-  -- recalculated: the trigger only fired from invoice_items and payments.
-  UPDATE invoices SET discount = 200 WHERE id LIKE 'VERIFY-PROBE-%';
+  // A discount edit with no child-row change, which the old schema never
+  // recalculated: the trigger only fired from invoice_items and payments.
+  await client.query(`UPDATE invoices SET discount = 200 WHERE id LIKE 'VERIFY-PROBE-%'`);
 
-  -- Part-payment then moves the status along.
-  INSERT INTO payments (id, invoice_id, receipt_number, amount, payment_method)
-  SELECT 'PM-' || id, id, 'RCPT-' || id, 400, 'Cash' FROM invoices WHERE id LIKE 'VERIFY-PROBE-%';
+  // Part-payment then moves the status along.
+  await client.query(`
+    INSERT INTO payments (id, invoice_id, receipt_number, amount, payment_method)
+    SELECT 'PM-' || id, id, 'RCPT-' || id, 400, 'Cash' FROM invoices WHERE id LIKE 'VERIFY-PROBE-%'
+  `);
 
-  SELECT subtotal, discount, total, paid_amount, balance, payment_status
-    FROM invoices WHERE id LIKE 'VERIFY-PROBE-%';
-`);
-
-// node-postgres returns one Result per statement in a multi-statement query;
-// the SELECT is the last one. Taking rows from the DO block's Result is why an
-// earlier version of this check saw no rows at all.
-const probeRows = mathResults[mathResults.length - 1].rows;
-await client.query('ROLLBACK').catch(() => {});
+  const { rows } = await client.query(
+    `SELECT subtotal, discount, total, paid_amount, balance, payment_status
+       FROM invoices WHERE id LIKE 'VERIFY-PROBE-%'`,
+  );
+  probeRows = rows;
+} finally {
+  await client.query('ROLLBACK');
+}
 
 if (!probeRows.length) {
   problems.push('invoice probe produced no rows');
@@ -280,6 +293,45 @@ if (!probeRows.length) {
   console.log(
     `  invoice math       : subtotal ${p.subtotal}, discount ${p.discount}, total ${p.total}, ` +
       `paid ${p.paid_amount}, balance ${p.balance}, status ${p.payment_status}`,
+  );
+}
+
+// The rollback above is the whole reason this probe is safe to run against a
+// database of real patient records, so it is asserted rather than assumed. A
+// probe row surviving means the rollback silently failed, and every future run
+// would add another one.
+const { rows: leftover } = await client.query(
+  `SELECT c.relname AS table, n.nspname
+     FROM pg_class c
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind = 'r'
+      AND c.relname = ANY($1::text[])
+      AND EXISTS (SELECT 1 FROM pg_attribute a
+                   WHERE a.attrelid = c.oid AND a.attname = 'id' AND a.attnum > 0)`,
+  [['patients', 'visits', 'invoices', 'invoice_items', 'payments']],
+);
+let strays = 0;
+for (const t of leftover) {
+  // The probe prefixes its own ids ('VIS-', 'II-', 'PM-'), so the marker is
+  // matched anywhere in the id rather than at the start. A leading-anchored LIKE
+  // quietly reported "clean" while three probe rows sat in the database.
+  const { rows: found } = await client.query(
+    `SELECT count(*)::int AS n FROM public."${t.table}" WHERE id LIKE '%VERIFY-PROBE-%'`,
+  );
+  if (found[0].n) {
+    console.log(`    ${found[0].n} probe row(s) left in ${t.table} - the rollback did not take`);
+    strays += found[0].n;
+  }
+}
+if (strays) {
+  problems.push(
+    `${strays} invoice-probe row(s) survived the rollback, so db:apply is writing test data `
+    + 'into the clinical tables. Delete them by hand before go-live:\n'
+    + "    DELETE FROM payments       WHERE id LIKE '%VERIFY-PROBE-%';\n"
+    + "    DELETE FROM invoice_items  WHERE id LIKE '%VERIFY-PROBE-%';\n"
+    + "    DELETE FROM invoices       WHERE id LIKE '%VERIFY-PROBE-%';\n"
+    + "    DELETE FROM visits         WHERE id LIKE '%VERIFY-PROBE-%';\n"
+    + "    DELETE FROM patients       WHERE id LIKE '%VERIFY-PROBE-%';",
   );
 }
 
@@ -315,8 +367,27 @@ console.log(
 );
 if (c.settings !== 1) problems.push('system_settings seed missing');
 if (c.wards === 0) problems.push('wards seed missing');
-if (c.users === 0) problems.push('staff seed missing');
 if (c.permission_nodes === 0) problems.push('permission_nodes seed missing');
+
+// The staff count is deliberately NOT asserted. Zero is the correct state: the
+// schema no longer seeds accounts, because a seeded account is a credential that
+// ships to production. This used to check `users === 0` and call it a missing
+// seed, which is the same condition as the correct one - so after the demo
+// profiles were removed, a healthy database reported itself as broken. What is
+// worth checking is that no invented clinician came back.
+const { rows: demoRows } = await client.query(
+  `SELECT id, email FROM users
+    WHERE lower(email) = ANY($1::text[])
+    ORDER BY id`,
+  [DEMO_STAFF_EMAILS],
+);
+if (demoRows.length) {
+  for (const d of demoRows) console.log(`    demo staff row still present: ${d.id} ${d.email}`);
+  problems.push(
+    `${demoRows.length} retired demo staff profile(s) are still in the users table. `
+    + 'Run: npm run staff:clean-demo',
+  );
+}
 
 // No plaintext credentials may exist in the schema.
 const { rows: pwCols } = await client.query(`
@@ -344,11 +415,14 @@ if (problems.length) {
 
 console.log('\n[fatclinic] schema verified.\n');
 if (isSupabase) {
-  console.log('  Next: turn OFF "Enable email signup" in Supabase -> Authentication');
-  console.log('        -> Providers -> Email. Until you do, anyone can sign up and');
-  console.log('        read every patient record, because the policies grant full');
-  console.log('        clinical access to any authenticated session.');
-  console.log('        Then create an Auth account for each of the seeded staff emails.\n');
+  console.log('  Next:');
+  console.log('    npm run db:check-rls      anon is blocked, and email self-signup is off');
+  console.log('    npm run db:check-orphan  a valid session with no staff profile reads nothing');
+  console.log('    npm run staff:add -- --name "..." --email ... --role ADMINISTRATOR');
+  console.log('');
+  console.log('  The schema seeds no staff accounts on purpose. A seeded account is a');
+  console.log('  credential that ships to production, so sign-in accounts are created');
+  console.log('  one at a time, by an administrator, with the service_role key.\n');
 } else {
   console.log('  WARNING: Row Level Security was not applied. Do not expose this database.\n');
 }

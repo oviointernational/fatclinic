@@ -123,7 +123,50 @@ if (problems.length) {
 }
 
 console.log('[fatclinic] RLS is holding: the anon key cannot read or write anything.');
+
+// --- email self-signup --------------------------------------------------------
+//
+// This used to be the one thing the scripts could not check, and it was the most
+// dangerous single setting in the project: the policies grant any authenticated
+// session full clinical access, so "anyone can sign up" equals "anyone can read
+// every patient record". /auth/v1/settings is readable with the anon key, so
+// there is no reason to leave this to a human who might forget to look.
+console.log('\n[fatclinic] email self-signup');
+const settings = await fetch(`${url}/auth/v1/settings`, {
+  headers: { apikey: anonKey },
+}).catch(() => null);
+
+if (!settings || !settings.ok) {
+  console.log('  could not read /auth/v1/settings - verify this by hand in');
+  console.log('  Supabase -> Authentication -> Providers -> Email.');
+} else {
+  const cfg = await settings.json();
+  const signupOff = cfg.disable_signup === true;
+  const providers = Object.entries(cfg.external || {})
+    .filter(([k, v]) => v === true && !['email', 'phone', 'anonymous_users'].includes(k))
+    .map(([k]) => k);
+
+  console.log(`  disable_signup  = ${cfg.disable_signup}`);
+  console.log(`  autoconfirm     = ${cfg.mailer_autoconfirm} (no verification email is sent)`);
+  console.log(`  other providers = ${providers.length ? providers.join(', ') : 'none'}`);
+
+  if (!signupOff) {
+    console.log('\n  EMAIL SIGNUP IS ENABLED. Anyone can create an account and then read');
+    console.log('  every patient record. Turn it off in Supabase -> Authentication ->');
+    console.log('  -> Providers -> Email before going live.\n');
+    process.exit(1);
+  }
+  // A social provider is a second front door to the same problem, so it is
+  // reported rather than passed over: it may be deliberate, but it should not be
+  // a surprise.
+  if (providers.length) {
+    console.log(`\n  ${providers.length} non-email provider(s) can create accounts: ${providers.join(', ')}`);
+    console.log('  Each one is another way in. If that is not deliberate, disable it in');
+    console.log('  Supabase -> Authentication -> Providers.');
+  }
+  console.log('  email self-signup is off - correct.');
+}
+
 console.log('');
-console.log('  Reminder: the policies grant an AUTHENTICATED session full clinical');
-console.log('  access, so email self-signup must be off in Supabase -> Authentication');
-console.log('  -> Providers -> Email. This script cannot verify that setting.\n');
+console.log('  An account with no matching public.users row still cannot read anything:');
+console.log('  npm run db:check-orphan\n');

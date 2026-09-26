@@ -21,20 +21,20 @@
  * USAGE
  * -----
  *   # First administrator. Creates the auth account and the profile together.
- *   node scripts/provision-staff.mjs \
+ *   npm run staff:add -- \
  *     --name "Dr. Sarah Alabi" \
  *     --email alabi@fatclinic.health \
  *     --role ADMINISTRATOR \
  *     --password 'choose-something-long'
  *
  *   # A profile that already exists (created in the app's admin screen).
- *   node scripts/provision-staff.mjs --link USR-003 --password '...'
+ *   npm run staff:add -- --link USR-003 --password '...'
  *
  *   # Reset a forgotten password.
- *   node scripts/provision-staff.mjs --link USR-003 --password '...'
+ *   npm run staff:add -- --link USR-003 --password '...'
  *
  *   # Disable an account. Leaves the profile (and its audit history) intact.
- *   node scripts/provision-staff.mjs --disable USR-003
+ *   npm run staff:add -- --disable USR-003
  *
  * FLAGS
  * -----
@@ -73,7 +73,20 @@ const C = {
 const say = (...a) => console.log(...a);
 const ok = (m) => say(`${C.green}OK${C.reset}   ${m}`);
 const warn = (m) => say(`${C.yellow}!!${C.reset}   ${m}`);
-const die = (m) => { say(`${C.red}FAIL${C.reset} ${m}`); process.exit(1); };
+const die = (m) => { say(`${C.red}FAIL${C.reset} ${m}`); bail(1); };
+
+/**
+ * Stop without calling process.exit().
+ *
+ * process.exit() aborts with 0xC0000409 on Windows when supabase-js still holds
+ * a socket: libuv trips an assertion in src\win\async.c while tearing the
+ * handle down. The command has already done its job, but the exit code reports a
+ * crash - and for --link, which prints a password once, that is bad enough to
+ * make people re-run it. Setting exitCode and returning lets the event loop
+ * drain, which returns the right code because undici's sockets are unref'd.
+ */
+class Stop extends Error {}
+function bail(code) { process.exitCode = code; throw new Stop(); }
 
 // --- arguments ---------------------------------------------------------------
 
@@ -92,6 +105,7 @@ function parseArgs(argv) {
   return out;
 }
 
+async function main() {
 const args = parseArgs(process.argv.slice(2));
 
 /** The header comment, reused as the help text so the two cannot disagree. */
@@ -106,7 +120,7 @@ const usage = () =>
 if (args.help || (!args.link && !args.email && !args.list)) {
   say(usage());
   if (!args.help) say('\nRun with --help for the full reference.\n');
-  process.exit(args.help ? 0 : 1);
+  bail(args.help ? 0 : 1);
 }
 
 // --- environment -------------------------------------------------------------
@@ -128,7 +142,7 @@ if (!serviceKey) {
   say('');
   say('Keep it out of git. .env is already ignored; never commit it or paste it into chat.');
   say('The service_role key is a full bypass of every access rule in this database.');
-  process.exit(1);
+  bail(1);
 }
 
 // A JWT, so an obviously wrong value fails here with a clear message instead of
@@ -160,8 +174,8 @@ if (args.list) {
   if (error) die(`could not read users: ${error.message}`);
   if (!data?.length) {
     say('\nNo staff profiles exist yet. Create the first administrator:\n');
-    say('  node scripts/provision-staff.mjs --name "..." --email ... --role ADMINISTRATOR\n');
-    process.exit(0);
+    say('  npm run staff:add -- --name "..." --email ... --role ADMINISTRATOR\n');
+    return;
   }
   say('');
   say(`${C.bold}ID       NAME                     EMAIL                      ROLE             CAN SIGN IN${C.reset}`);
@@ -175,7 +189,7 @@ if (args.list) {
     );
   }
   say('');
-  process.exit(0);
+  return;
 }
 
 // --- disable -----------------------------------------------------------------
@@ -190,7 +204,7 @@ if (args.disable) {
   if (isDryRun) {
     say(`\n${C.bold}DRY RUN${C.reset} would disable ${profile.name} <${profile.email}> and revoke its sign-in.`);
     say('The profile row is kept, so its audit history stays attributable.\n');
-    process.exit(0);
+    return;
   }
 
   const { error: updErr } = await db.from('users').update({ active: false }).eq('id', id);
@@ -206,7 +220,7 @@ if (args.disable) {
   }
 
   ok(`${profile.name} can no longer sign in. The profile and its audit history are intact.`);
-  process.exit(0);
+  return;
 }
 
 // --- create or link ----------------------------------------------------------
@@ -277,7 +291,7 @@ if (args.link) {
     say(`  department ${args.department || '(none)'}`);
     say(`  pin        ${pin}   ${C.dim}(workstation screen lock, not a credential)${C.reset}`);
     say(`  password   ${generated ? '(generated at run time)' : '(from --password)'}\n`);
-    process.exit(0);
+    return;
   }
 
   const { error: insErr } = await db.from('users').insert({
@@ -300,7 +314,7 @@ const targetId = String(args.link);
 
 if (isDryRun) {
   say(`\n${C.bold}DRY RUN${C.reset} would create a Supabase Auth account for ${targetId} and link it.\n`);
-  process.exit(0);
+  return;
 }
 
 // Does an auth user already exist for this address? Supabase enforces uniqueness
@@ -366,4 +380,11 @@ say('');
 say('They sign in with the email above. The workstation PIN is a screen lock, not a');
 say('credential, and does not need to match the password.');
 say('');
-process.exit(0);
+}
+
+// No process.exit() above, deliberately - see the bail() comment. A genuine
+// unexpected throw is a bug and must stay loud, so it is rethrown, not swallowed.
+main().catch((e) => {
+  if (e instanceof Stop) return;
+  throw e;
+});

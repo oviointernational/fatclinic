@@ -34,6 +34,7 @@
  */
 import { createClient } from '@supabase/supabase-js';
 import { config as loadEnv } from 'dotenv';
+import { DEMO_STAFF_EMAILS } from './demo-staff.mjs';
 
 loadEnv();
 
@@ -42,29 +43,40 @@ const C = {
   red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m',
 };
 const say = (...a) => console.log(...a);
-const die = (m) => { say(`${C.red}FAIL${C.reset} ${m}`); process.exit(1); };
+
+/**
+ * Control flow for "stop here, this is not a crash".
+ *
+ * This used to call process.exit() directly, which aborts the process with
+ * 0xC0000409 on Windows: supabase-js leaves a socket handle referenced, and
+ * process.exit() tears it down mid-close, so libuv trips an assertion in
+ * src\win\async.c. The work finished correctly and the exit code still said
+ * failure, which is the worst possible outcome for a deletion script. Letting the
+ * process end on its own returns 0 correctly, because undici's sockets are
+ * unref'd and the event loop drains.
+ */
+class Stop extends Error {}
+const die = (m) => {
+  say(`${C.red}FAIL${C.reset} ${m}`);
+  process.exitCode = 1;
+  throw new Stop();
+};
+const bail = (code) => { process.exitCode = code; throw new Stop(); };
 
 /**
  * Exactly the addresses the retired seed inserted. This list is the whole safety
- * mechanism, so it is an exact set and never a `like` filter.
+ * mechanism, so it is an exact set and never a `like` filter. It lives in
+ * demo-staff.mjs because apply-schema.mjs needs the same list to prove the seed
+ * has not come back.
  */
-const DEMO_EMAILS = [
-  'adeleke@fatclinic.health',
-  'alabi@fatclinic.health',
-  'ngozi@fatclinic.health',
-  'ibrahim@fatclinic.health',
-  'kemi@fatclinic.health',
-  'tayo@fatclinic.health',
-  'emeka@fatclinic.health',
-  'chinedu.rad@fatclinic.health',
-  'amina.pt@fatclinic.health',
-];
+const DEMO_EMAILS = DEMO_STAFF_EMAILS;
 
+async function main() {
 const args = process.argv.slice(2);
 const isDryRun = args.includes('--dry-run');
 if (args.some((a) => a !== '--dry-run')) {
   say('Usage: node scripts/remove-demo-staff.mjs [--dry-run]');
-  process.exit(args.includes('--help') ? 0 : 1);
+  bail(args.includes('--help') ? 0 : 1);
 }
 
 const url = (process.env.VITE_SUPABASE_URL || '').trim();
@@ -80,7 +92,7 @@ if (!serviceKey) {
   say("  .env:  SUPABASE_SERVICE_ROLE_KEY='paste-it-here'");
   say('');
   say('Keep it out of git. It is a full bypass of every access rule in this database.');
-  process.exit(1);
+  bail(1);
 }
 if (!/^[\w-]+\.[\w-]+\.[\w-]+$/.test(serviceKey)) {
   die('SUPABASE_SERVICE_ROLE_KEY does not look like a JWT. Copy the whole "service_role" value, not the anon key.');
@@ -105,7 +117,7 @@ if (!rows.length) {
   say('');
   say(`${C.green}Nothing to do.${C.reset} No demo staff profiles are present.`);
   say('');
-  process.exit(0);
+  return;
 }
 
 // Every row found must be one this script knows about. `in` already guarantees
@@ -129,7 +141,7 @@ say('');
 if (isDryRun) {
   say(`${C.bold}DRY RUN${C.reset} - nothing was changed. Re-run without --dry-run to delete these ${rows.length} profile(s).`);
   say('');
-  process.exit(0);
+  return;
 }
 
 // Auth accounts first. Deleting a profile while its credential survives would
@@ -171,16 +183,23 @@ if (delErr) {
   say('  node scripts/db-verify.mjs');
   say('or check the foreign keys reported above, reassign the records to a real');
   say('staff member, then re-run this script.');
-  process.exit(1);
+  bail(1);
 }
 
 say(`${C.green}OK${C.reset}   deleted ${deleted?.length ?? 0} staff profile(s)`);
 say('');
 say('Next:');
-say('  1. node scripts/provision-staff.mjs --list      (confirm the table is clean)');
-say('  2. node scripts/provision-staff.mjs --name "..." --email ... --role ADMINISTRATOR');
+say('  1. npm run staff:list                          (confirm the table is clean)');
+say('  2. npm run staff:add -- --name "..." --email ... --role ADMINISTRATOR');
 say('');
 say('Until step 2 is done, nobody can sign in. That is the correct state for a');
 say('system holding real patient records: closed until deliberately opened.');
 say('');
-process.exit(0);
+}
+
+// No process.exit() anywhere above, deliberately: see the Stop comment. An
+// unexpected throw is a real bug and should be loud, so it is not swallowed.
+main().catch((e) => {
+  if (e instanceof Stop) return;
+  throw e;
+});
