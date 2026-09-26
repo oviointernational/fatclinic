@@ -8,15 +8,29 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TARGET = path.join(ROOT, 'src', 'services', 'sync.ts');
-const BACKUP = path.join(os.tmpdir(), 'sync.ts.bak');
-// Restored byte for byte. Matching happens on a line-ending-normalised copy, so
-// a snippet written here with \n still finds its target in a CRLF source file.
-const ORIGINAL_RAW = fs.readFileSync(BACKUP, 'utf8');
+
+/**
+ * The pristine source, captured from the file itself at the start of THIS run.
+ *
+ * Held in memory, deliberately. An earlier version of this script kept the
+ * backup in a temp file and only read it, on the assumption that something else
+ * refreshed it. Nothing did, so the "backup" froze at whatever sync.ts looked
+ * like the first time it ran - and `restore()` then overwrote the real file with
+ * that stale copy, silently discarding every edit made since. It cost a set of
+ * uncommitted changes to this data layer, which is exactly the kind of loss this
+ * suite exists to prevent.
+ *
+ * Reading the target in-process removes the whole class of problem: there is no
+ * second copy to go stale, nothing left behind on disk, and the bytes restored
+ * are provably the bytes that were there before the first defect went in.
+ */
+const ORIGINAL_RAW = fs.readFileSync(TARGET, 'utf8');
+// Matching happens on a line-ending-normalised copy, so a snippet written here
+// with \n still finds its target in a CRLF source file.
 const ORIGINAL = ORIGINAL_RAW.replaceAll('\r\n', '\n');
 
 const DEFECTS = [
@@ -76,6 +90,50 @@ const DEFECTS = [
     to: '    dbOwned: [],',
     count: 1,
   },
+  {
+    name: 'a staff email is written without normalising its case',
+    // The regression this guards is subtle and total: the sign-in lookup is an
+    // exact case-insensitive match, RLS resolves the caller with lower(email),
+    // and uniqueness is on lower(email). A row stored as typed would be one the
+    // clinician can authenticate as but never find, and the app would report
+    // "no staff profile" to someone who plainly has one.
+    from: "      email: String(m.email ?? '').trim().toLowerCase(),",
+    to: '      email: String(m.email ?? \'\').trim(),',
+    count: 1,
+  },
+  {
+    name: 'the normaliser is declared but stops normalising',
+    // Catches the exemption being claimed without the behaviour. If
+    // `normalises: ['email']` can be declared on a mapper that does nothing,
+    // the round-trip guarantee silently stops existing for that field.
+    from: "    normalises: ['email'],",
+    to: '    normalises: [\'name\'],',
+    count: 1,
+  },
+  {
+    name: 'a stored password is blanked instead of dropped',
+    // The pre-auth shape: `password: ''` on the model. A field that exists but
+    // is always empty is one any later screen will happily fill in, and
+    // localStorage will then keep the credential.
+    from: `      pin: text(r.pin),
+      customRoleId: optText(r.custom_role_id),`,
+    to: `      pin: text(r.pin),
+      password: '',
+      customRoleId: optText(r.custom_role_id),`,
+    count: 1,
+  },
+  {
+    name: 'the users map is filed under a different key than the one db.ts persists',
+    // db.ts persists the staff collection under USERS_STORAGE_KEY and auth.ts
+    // looks the mapper up by the same constant, so the two can only disagree if
+    // the map is filed under a literal. Then saveStorage finds no map, every
+    // staff change is silently never synced, and resolveProfile returns nothing
+    // so every sign-in reports "no staff profile" - with the app otherwise
+    // looking perfectly healthy.
+    from: '    key: USERS_STORAGE_KEY,',
+    to: "    key: 'fatclinic_staff',",
+    count: 1,
+  },
 ];
 
 function run() {
@@ -93,6 +151,15 @@ function run() {
 
 function restore() {
   fs.writeFileSync(TARGET, ORIGINAL_RAW, 'utf8');
+  // Byte-for-byte, not "close enough". A restore that silently differs - a
+  // trimmed newline, a lost BOM - would leave the tree in a state nobody
+  // committed, which is how a real edit goes missing without anybody noticing.
+  const now = fs.readFileSync(TARGET, 'utf8');
+  if (now !== ORIGINAL_RAW) {
+    console.error('  [defect injection] FATAL: restore did not reproduce the original bytes.');
+    console.error(`    expected ${ORIGINAL_RAW.length} bytes, wrote ${now.length}`);
+    process.exit(1);
+  }
 }
 
 let survived = 0;

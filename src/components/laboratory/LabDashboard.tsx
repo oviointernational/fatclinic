@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { LabRequest, LabCategory, LabTestOrder, Patient } from '../../types';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { pdfService } from '../../services/pdfService';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import {
@@ -27,7 +27,7 @@ export const LabDashboard: React.FC<LabDashboardProps> = ({
   initialStatus,
   alertsOnly = false,
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   useSyncDb();
   const [selectedCategory, setSelectedCategory] = useState<LabCategory | 'ALL'>(initialCategory || 'ALL');
   const [statusFilter, setStatusFilter] = useState<string>(initialStatus || 'ALL');

@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
-import { useAuth } from '../../context/AuthContext';
+import { useAuth, useCurrentUser } from '../../context/AuthContext';
 import { Lock, ShieldCheck, Delete, ArrowRight } from 'lucide-react';
 
 export const PinLockModal: React.FC = () => {
-  const { isSleeping, wakeUpWithPin, currentUser } = useAuth();
+  const { isSleeping, wakeUpWithPin } = useAuth();
+  const currentUser = useCurrentUser();
   const [pin, setPin] = useState<string>('');
   const [error, setError] = useState<string>('');
 

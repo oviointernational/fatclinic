@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { Patient, Visit, ClinicalDiagnosis, LabCategory, LabInvestigationDefinition, Medication, wardName } from '../../types';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { aiService } from '../../services/aiService';
 import { AdmitDialog } from './AdmitDialog';
@@ -101,7 +101,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   onToggleWideMode,
   activeSubNav
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   const syncTick = useSyncDb();
 
   const allPatients = db.getPatients();

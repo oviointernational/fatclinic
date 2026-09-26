@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Patient, Visit } from '../../types';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { 
   Calendar, 
@@ -30,7 +30,7 @@ export const VisitTabsView: React.FC<VisitTabsViewProps> = ({
   onOpenConsultation,
   onOpenNursingStation,
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   useSyncDb();
   const visits = db.getVisits(patient.id);
   // Front Desk cannot create visits in Encounter Tabs (clinical staff only).

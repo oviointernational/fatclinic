@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { ClinicalConsumable } from '../../types';
 import { AlertTriangle, CheckCircle2, Package, Search, X } from 'lucide-react';
@@ -25,7 +25,7 @@ export const SectionConsumablesPanel: React.FC<SectionConsumablesPanelProps> = (
   subtitle,
   accentClass = 'bg-emerald-600 hover:bg-emerald-700',
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   useSyncDb();
   const [search, setSearch] = useState('');
   const [usageItem, setUsageItem] = useState<ClinicalConsumable | null>(null);

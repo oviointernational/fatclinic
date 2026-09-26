@@ -57,6 +57,7 @@ registerHooks({
 const {
   TABLES,
   TABLE_BY_KEY,
+  USERS_STORAGE_KEY,
   pushDiff,
   queueDiff,
   whenDrained,
@@ -519,7 +520,19 @@ for (const map of TABLES) {
 }
 
 await block('credentials never leave the browser', async () => {
-  const users = TABLE_BY_KEY.get('fatclinic_users');
+  const users = TABLE_BY_KEY.get(USERS_STORAGE_KEY);
+  // Asserted before use, and with a message that says what breaks. auth.ts
+  // resolves a session through this same lookup, so a map filed under any other
+  // key means every sign-in reports "no staff profile" and every staff change is
+  // silently never synced - while the app looks entirely healthy.
+  check('the users table map exists under USERS_STORAGE_KEY', Boolean(users));
+  check(
+    'the users map is filed under the key db.ts persists it under',
+    users?.key === USERS_STORAGE_KEY,
+    users ? `map is filed under ${JSON.stringify(users.key)}` : 'map not found',
+  );
+  if (!users) throw new Error('users map missing; the checks below cannot run');
+
   const row = users.modelToRow(users.rowToModel(syntheticRow('users')));
   check(
     'users row carries no password column',
@@ -530,8 +543,37 @@ await block('credentials never leave the browser', async () => {
     'users row carries no auth_user_id (Supabase owns it)',
     !('auth_user_id' in row),
   );
+
+  // Stronger than "the value is blank". The previous build carried
+  // `password: ''` on the model, which meant a field existed that any later
+  // screen could assign a real password to - and localStorage would keep it.
+  // The type no longer has the field, so hydration must not reintroduce it.
   const hydrated = users.rowToModel({ ...syntheticRow('users'), password: 'hunter2' });
-  check('users hydrate does not surface a stored password', hydrated.password === '');
+  check(
+    'a stored password is dropped entirely, not blanked',
+    !('password' in hydrated),
+    Object.keys(hydrated).filter((k) => /pass/i.test(k)).join(', ') || undefined,
+  );
+
+  // The sign-in lookup is an exact, case-insensitive match against this column,
+  // and uq_users_email_lower is unique on lower(email). A row written with
+  // mixed case would be one the clinician can authenticate as but never find.
+  const cases = ['Dr@FatClinic.Health', '  Ngozi@FatClinic.Health  ', 'ALABI@FATALCLINIC.HEALTH'];
+  const written = cases.map((e) => users.modelToRow({ ...users.rowToModel(syntheticRow('users')), email: e }).email);
+  check(
+    'every written staff email is trimmed and lowercased',
+    written.every((e) => e === e.trim() && e === e.toLowerCase() && e.length > 0),
+    written.join(' | '),
+  );
+  check(
+    'the lowercased form is what the self-test expects to look up',
+    written[0] === 'dr@fatclinic.health' && written[1] === 'ngozi@fatclinic.health',
+    written.join(' | '),
+  );
+  check(
+    'a model with no email does not throw on save',
+    users.modelToRow({ ...users.rowToModel(syntheticRow('users')), email: undefined }).email === '',
+  );
 });
 
 await block('database-owned columns are never sent by the client', async () => {
@@ -629,6 +671,11 @@ for (const { label, table, map, child } of allMaps()) {
   for (const c of child?.children ?? []) skip.add(c.property);
   for (const c of map?.children ?? []) skip.add(c.property);
 
+  // A field the mapper declares it canonicalises is exempt from byte-identity -
+  // but only if it actually normalises, which is asserted separately below, so a
+  // mapper cannot claim the exemption to silence a real round-trip failure.
+  for (const field of map?.normalises ?? []) skip.add(field);
+
   const lost = [];
   for (const [field, value] of Object.entries(model)) {
     if (skip.has(field) || value === undefined) continue;
@@ -653,6 +700,47 @@ for (const { label, table, map, child } of allMaps()) {
     .map(([f, v]) => `${f} = ${JSON.stringify(v)}`);
   check(`${label}: absent fields do not leak placeholders`, leaked.length === 0, leaked.slice(0, 6));
 }
+
+// A `normalises` entry buys a field an exemption from the round-trip check, so
+// it has to earn it: the declared field must actually change when given a value
+// that needs canonicalising. Otherwise a mapper could list every field it likes
+// and the round-trip guarantee would quietly stop existing.
+await block('declared normalisers really normalise', async () => {
+  const declared = allMaps().filter((m) => !m.child && m.map.normalises?.length);
+  check(
+    'at least one mapper declares a normaliser (the check is not vacuous)',
+    declared.length > 0,
+    'if this is genuinely empty, delete this block rather than leave it passing',
+  );
+
+  for (const { label, table, map } of declared) {
+    const model = map.rowToModel(syntheticRow(table));
+    for (const field of map.normalises) {
+      // Uppercase and pad, which is enough to trip trim() or toLowerCase().
+      const dirty = { ...model, [field]: `  ${String(model[field]).toUpperCase()}  ` };
+      const written = map.modelToRow(dirty)[field];
+      const isText = typeof written === 'string';
+      check(
+        `${label}: ${field} is canonicalised on write`,
+        isText ? written !== dirty[field] && written === written.trim() : false,
+        isText ? `"${dirty[field]}" -> "${written}"` : `wrote ${typeof written}`,
+      );
+    }
+  }
+
+  // And a field the mapper does NOT declare must survive untouched, or the
+  // round-trip check would be the only thing noticing clinical text being
+  // rewritten.
+  const clinical = TABLE_BY_KEY.get('fatclinic_patients');
+  const patient = clinical.rowToModel(syntheticRow('patients'));
+  const shouted = { ...patient, firstName: '  ada  ', lastName: 'LOVELACE ' };
+  const row = clinical.modelToRow(shouted);
+  check(
+    'patient names are sent exactly as typed, spaces and all',
+    row.first_name === '  ada  ' && row.last_name === 'LOVELACE ',
+    `first_name=${JSON.stringify(row.first_name)} last_name=${JSON.stringify(row.last_name)}`,
+  );
+});
 
 await block('fidelity: nested objects are rebuilt, not flattened away', async () => {
   // Consultation.physicalExamination is one nested object in the model and seven

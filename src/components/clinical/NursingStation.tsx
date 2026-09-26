@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Patient, Visit, Vitals, wardName } from '../../types';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import {
   CheckCircle2,
@@ -48,7 +48,7 @@ export const NursingStation: React.FC<NursingStationProps> = ({
   onVitalsSaved,
   activeSubNav,
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   const syncTick = useSyncDb();
 
   const allPatients = db.getPatients();

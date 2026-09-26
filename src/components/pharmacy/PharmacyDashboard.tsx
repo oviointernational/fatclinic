@@ -3,7 +3,7 @@ import { Prescription, PrescriptionItem, Medication } from '../../types';
 import { SectionConsumablesPanel } from '../common/SectionConsumablesPanel';
 import { MedicationRequestsPanel } from './MedicationRequestsPanel';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import {
   Package,
@@ -22,7 +22,7 @@ type PharmacyTab = 'queue' | 'inventory' | 'consumables' | 'dispensed' | 'reques
 export const PharmacyDashboard: React.FC<PharmacyDashboardProps> = ({
   initialTab = 'queue',
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   useSyncDb();
   const [activeTab, setActiveTab] = useState<PharmacyTab>(initialTab);
   const [search, setSearch] = useState('');

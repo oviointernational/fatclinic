@@ -44,22 +44,19 @@ export const initialReceiptSettings: import('../types').ReceiptSettings = {
   showThankYou: true
 };
 
-// Production seed: administrator only. All other staff accounts are created
-// by the administrator inside the app. Change this password on first sign-in.
-export const initialUsers: User[] = [
-  {
-    id: 'USR-002',
-    name: 'Dr. Sarah Alabi',
-    email: 'alabi@fatclinic.health',
-    role: 'ADMINISTRATOR',
-    department: 'Executive Administration & Quality Assurance',
-    avatar: '👩‍💼',
-    pin: '1234',
-    password: 'FatClinic123',
-    mustChangePassword: true,
-    active: true
-  }
-];
+// No staff are seeded.
+//
+// A seeded account is a credential that ships to production, and a literal
+// password in this file is one that ships in the JavaScript bundle, readable by
+// anyone who opens devtools. It also cannot be rotated without a redeploy.
+//
+// The first administrator is created from the command line instead:
+//
+//     node scripts/provision-staff.mjs --name "Dr. Sarah Alabi" \
+//       --email you@fatclinic.health --role ADMINISTRATOR
+//
+// See database/fatclinic.sql for the same note on the SQL side.
+export const initialUsers: User[] = [];
 
 export const initialLabInvestigations: LabInvestigationDefinition[] = [
   // 1. HEMATOLOGY

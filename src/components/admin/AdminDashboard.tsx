@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { db } from '../../services/db';
 import { useSyncDb } from '../../hooks/useSyncDb';
-import { useAuth } from '../../context/AuthContext';
+import { useAuth, useCurrentUser } from '../../context/AuthContext';
 import { 
   User, 
   UserRole, 
@@ -50,7 +50,8 @@ const AVAILABLE_ROLES: UserRole[] = [
 ];
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'users' }) => {
-  const { currentUser, allUsers } = useAuth();
+  const { allUsers } = useAuth();
+  const currentUser = useCurrentUser();
   useSyncDb();
 
   const [activeTab, setActiveTab] = useState<AdminTab>(initialTab);
@@ -107,7 +108,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
     department: 'General Medicine',
     avatar: '👨‍⚕️',
     pin: '1234',
-    password: 'FatClinic123',
     customRoleId: '',
     active: true
   });
@@ -156,7 +156,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
 
   // Modal States: Assign staff password (Administration sets a new password)
   const [passwordTarget, setPasswordTarget] = useState<User | null>(null);
-  const [newStaffPassword, setNewStaffPassword] = useState('');
 
   // Modal States: Custom Role
   const [showCustomRoleModal, setShowCustomRoleModal] = useState(false);
@@ -205,7 +204,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
       department: userForm.department,
       avatar: userForm.avatar,
       pin: userForm.pin || '1234',
-      password: userForm.password || 'FatClinic123',
       customRoleId: userForm.customRoleId || undefined,
       active: userForm.active
     }, currentUser);
@@ -218,11 +216,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
       department: 'General Medicine',
       avatar: '👨‍⚕️',
       pin: '1234',
-      password: 'FatClinic123',
       customRoleId: '',
       active: true
     });
-    showNotification(`Staff account created! Login password: ${created.password}`);
+    // The profile is saved and synced, but the account cannot sign in yet: the
+    // password lives in Supabase Auth, and creating an auth user needs the
+    // service_role key, which must never be in a browser. So the one remaining
+    // step is a command on the machine that holds that key, and the exact
+    // command is shown rather than described - an administrator should not have
+    // to work out the flags.
+    showNotification(
+      `Staff profile created for ${created.name}. ` +
+        `They cannot sign in until you run: node scripts/provision-staff.mjs --link ${created.id}`
+    );
   };
 
   const handleUpdateUser = (e: React.FormEvent) => {
@@ -538,7 +544,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
                         <Edit2 className="w-3.5 h-3.5" />
                       </button>
                       <button
-                        onClick={() => { setPasswordTarget(user); setNewStaffPassword(''); }}
+                        onClick={() => setPasswordTarget(user)}
                         className="p-1.5 rounded-lg hover:bg-amber-50 dark:hover:bg-amber-950/40 text-amber-600"
                         title="Assign a new login password to this staff member"
                       >
@@ -1425,17 +1431,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
                 </div>
               </div>
 
+              <div className="p-2.5 rounded-xl bg-slate-50 dark:bg-dark-surface border border-dashed border-slate-300 dark:border-dark-border text-[11px] text-slate-500 leading-relaxed">
+                No sign-in password is set here. Passwords belong to Supabase Auth and cannot be
+                written from a browser, so once this profile is saved you run{' '}
+                <code className="font-mono text-slate-600 dark:text-slate-300">
+                  node scripts/provision-staff.mjs --link &lt;id&gt;
+                </code>{' '}
+                to create the account they sign in with. The exact command, with the real id
+                filled in, is shown when the profile is saved.
+              </div>
+
               <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-bold mb-1">Login Password:</label>
-                  <input
-                    type="text"
-                    value={userForm.password}
-                    onChange={e => setUserForm({ ...userForm, password: e.target.value })}
-                    className="w-full px-3 py-2 rounded-xl border bg-slate-50 dark:bg-dark-surface font-mono"
-                    placeholder="Min 6 characters"
-                  />
-                </div>
                 <div>
                   <label className="block font-bold mb-1">4-Digit Device PIN:</label>
                   <input
@@ -1446,6 +1452,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
                     className="w-full px-3 py-2 rounded-xl border bg-slate-50 dark:bg-dark-surface font-mono"
                   />
                 </div>
+                <div />
               </div>
 
               <div>
@@ -2143,42 +2150,39 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
         </div>
       )}
 
-      {/* Assign Staff Password Dialog */}
+      {/* Reset Staff Password — instructs, does not collect */}
       {passwordTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-slate-900/60" onClick={() => setPasswordTarget(null)} />
-          <form
-            onSubmit={e => {
-              e.preventDefault();
-              try {
-                db.assignUserPassword(passwordTarget.id, newStaffPassword, currentUser);
-                showNotification(`New password assigned to ${passwordTarget.name}: ${newStaffPassword}`);
-                setPasswordTarget(null);
-                setNewStaffPassword('');
-              } catch (err: any) {
-                alert(err.message);
-              }
-            }}
-            className="relative bg-white dark:bg-dark-card rounded-2xl shadow-2xl w-full max-w-sm border p-5 space-y-3 text-xs"
-          >
+          <div className="relative bg-white dark:bg-dark-card rounded-2xl shadow-2xl w-full max-w-lg border p-5 space-y-4 text-xs">
             <div className="flex items-center justify-between">
-              <h3 className="font-extrabold text-sm">Assign New Password — {passwordTarget.name}</h3>
+              <h3 className="font-extrabold text-sm">Set a sign-in password — {passwordTarget.name}</h3>
               <button type="button" onClick={() => setPasswordTarget(null)} className="p-1.5 rounded-lg hover:bg-slate-100"><X className="w-4 h-4" /></button>
             </div>
-            <p className="text-slate-500">Type the new login password for this staff member (min 6 characters). Share it with them directly.</p>
-            <input
-              type="text"
-              autoFocus
-              value={newStaffPassword}
-              onChange={e => setNewStaffPassword(e.target.value)}
-              placeholder="e.g. NurseEze2026"
-              className="w-full px-3 py-2 rounded-xl bg-slate-50 border font-mono"
-            />
-            <div className="flex justify-end space-x-2">
-              <button type="button" onClick={() => setPasswordTarget(null)} className="px-4 py-2 rounded-xl border font-bold">Cancel</button>
-              <button type="submit" className="px-5 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold">Assign Password</button>
+
+            <p className="text-slate-600 dark:text-slate-300 leading-relaxed">
+              Passwords are held by Supabase Auth, not by this application, and they cannot be
+              set from a browser: doing so needs the <code className="font-mono">service_role</code>{' '}
+              key, which would then be readable in the page by anyone who opened devtools.
+              So this screen cannot do it, and showing a field here that quietly saved a
+              local password is exactly the bug this replaced.
+            </p>
+
+            <div className="p-3 rounded-xl bg-slate-900 text-emerald-300 font-mono text-[11px] break-all select-text">
+              node scripts/provision-staff.mjs --link {passwordTarget.id} --password &lt;new-password&gt;
             </div>
-          </form>
+
+            <p className="text-slate-500 leading-relaxed">
+              Run it on a machine whose <code className="font-mono">.env</code> holds{' '}
+              <code className="font-mono">SUPABASE_SERVICE_ROLE_KEY</code>. The password is
+              read from the command you typed, not stored on disk by this script. The staff
+              member is then asked to change it themselves on first sign-in.
+            </p>
+
+            <div className="flex justify-end">
+              <button type="button" onClick={() => setPasswordTarget(null)} className="px-4 py-2 rounded-xl border font-bold">Close</button>
+            </div>
+          </div>
         </div>
       )}
 

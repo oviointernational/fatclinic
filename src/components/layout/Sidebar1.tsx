@@ -12,7 +12,7 @@ import {
   Radio,
   Activity
 } from 'lucide-react';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { MainNavId } from '../../types';
 
 export type { MainNavId };
@@ -32,7 +32,7 @@ interface Sidebar1Props {
 }
 
 export const Sidebar1: React.FC<Sidebar1Props> = ({ activeNav, onSelectNav }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   const [isExpanded, setIsExpanded] = useState(false);
 
   const menuItems: MenuItem[] = [

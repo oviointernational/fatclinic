@@ -28,7 +28,7 @@ export const App: React.FC = () => {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
   const [isRegistrationOpen, setIsRegistrationOpen] = useState<boolean>(false);
 
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, isResolvingSession } = useAuth();
 
   // Audit Log Modal State
   const [auditLogModalOpen, setAuditLogModalOpen] = useState<boolean>(false);
@@ -96,7 +96,20 @@ export const App: React.FC = () => {
     setAuditLogModalOpen(true);
   };
 
-  // Signed-out gate: workstation locked until staff sign in again.
+  // Waiting for the boot-time session check, so a clinician with a valid session
+  // is not flashed the "you are signed out" card for a frame on every refresh.
+  // Without this, isAuthenticated starts false and the gate below would render
+  // before Supabase has been asked whether anyone is signed in.
+  if (isResolvingSession) {
+    return (
+      <div className="w-screen h-screen flex items-center justify-center bg-light-bg dark:bg-dark-bg">
+        <div className="w-8 h-8 rounded-full border-2 border-emerald-500 border-t-transparent animate-spin" />
+      </div>
+    );
+  }
+
+  // Signed-out gate: nothing below this line renders without a session, which is
+  // what lets every clinical screen treat `useCurrentUser()` as total.
   if (!isAuthenticated) {
     return (
       <div className="w-screen h-screen overflow-hidden flex items-center justify-center bg-light-bg dark:bg-dark-bg p-6">

@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { SectionConsumablesPanel } from '../common/SectionConsumablesPanel';
 import {
@@ -10,7 +10,7 @@ import {
 import { LabStockItem } from '../../types';
 
 export const LabStockManagement: React.FC = () => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   useSyncDb();
 
   const [activeTab, setActiveTab] = useState<'inventory' | 'consumables' | 'requests'>('inventory');

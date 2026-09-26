@@ -1,6 +1,6 @@
 import React from 'react';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { Patient, Visit } from '../../types';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import {
@@ -40,7 +40,7 @@ export const ExecutiveDashboard: React.FC<ExecutiveDashboardProps> = ({
   onSelectPatient,
   onOpenClinicalGroup,
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   useSyncDb();
 
   const patients = db.getPatients();

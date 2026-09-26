@@ -1263,7 +1263,15 @@ END $$;
 -- 14. SEED DATA
 -- ============================================================================
 -- Reference data only: wards, permissions, settings and a starter catalogue.
--- All inserts are idempotent. No demo patient records and no passwords.
+-- All inserts are idempotent. No demo patient records, no demo staff, and no
+-- passwords of any kind.
+--
+-- The absence of seeded staff is deliberate, not an oversight. A seeded account
+-- is a credential that ships to production, and a literal password in this file
+-- would also ship in the JavaScript bundle, where it is readable by anyone who
+-- loads the page and cannot be rotated without a redeploy. The first
+-- administrator is created from the command line instead; see the note above the
+-- users table.
 -- ============================================================================
 
 INSERT INTO wards (code, name, capacity) VALUES
@@ -1304,19 +1312,25 @@ VALUES
    'RCP', TRUE, TRUE, TRUE, TRUE, TRUE, TRUE)
 ON CONFLICT (id) DO NOTHING;
 
--- Staff profiles. No password column: provision the matching Supabase Auth
--- account with scripts/provision-staff.mjs (needs SUPABASE_SERVICE_ROLE_KEY).
-INSERT INTO users (id, name, email, role, department, avatar, pin, active) VALUES
-  ('USR-001','Dr. Johnathan Adeleke','adeleke@fatclinic.health','PHYSICIAN','Internal Medicine & Clinical Care','👨‍⚕️','1234',TRUE),
-  ('USR-002','Dr. Sarah Alabi','alabi@fatclinic.health','ADMINISTRATOR','Executive Administration & Quality Assurance','👩‍💼','1234',TRUE),
-  ('USR-003','Nurse Ngozi Eze','ngozi@fatclinic.health','NURSE','Triage & Inpatient Nursing','👩‍⚕️','1234',TRUE),
-  ('USR-004','Scientist Ibrahim Bello, MLS','ibrahim@fatclinic.health','LAB_SCIENTIST','Diagnostic Laboratory Services','🔬','1234',TRUE),
-  ('USR-005','Pharm. Kemi Ojo, BPharm','kemi@fatclinic.health','PHARMACIST','Clinical Pharmacy & Therapeutics','💊','1234',TRUE),
-  ('USR-006','Tayo Ogundipe','tayo@fatclinic.health','FRONT_DESK','Patient Services & Admissions','📋','1234',TRUE),
-  ('USR-007','Emeka Nwosu','emeka@fatclinic.health','BILLING_OFFICER','Accounts & Revenue Cycle','💳','1234',TRUE),
-  ('USR-008','Dr. Chinedu Okafor','chinedu.rad@fatclinic.health','RADIOLOGIST','Radiology & Imaging','🩻','1234',TRUE),
-  ('USR-009','PT. Amina Yusuf, BPT','amina.pt@fatclinic.health','PHYSIOTHERAPIST','Physiotherapy & Rehabilitation','🏃‍♀️','1234',TRUE)
-ON CONFLICT (id) DO NOTHING;
+-- Staff profiles are NOT seeded.
+--
+-- There are deliberately no demo accounts. A seeded account is a credential
+-- that ships to production, and one that everyone already knows the password
+-- to, which is worse than having no account at all.
+--
+-- The `users` table starts empty. A staff profile and its Supabase Auth
+-- account are created together, by an administrator:
+--
+--     npm run staff:add -- --name "Dr. ..." --email ... --role ADMINISTRATOR
+--
+-- That creates the auth user and links the two by `auth_user_id`. Until it has
+-- been run there is nobody who can sign in, which is the correct state for a
+-- system holding real patient records: closed until deliberately opened.
+--
+-- A profile created later from the app's admin screen has no auth account yet;
+-- `npm run staff:add -- --link USR-003` adds one. That split is not an
+-- oversight either - making an account needs the service_role key, which must
+-- never be in a browser, so it cannot be done from a page.
 
 -- Permission hierarchy. Parents before children, because parent_key is a
 -- self-referencing FK. Mirrors src/services/permissions.ts exactly.
@@ -1447,9 +1461,12 @@ ON CONFLICT (key) DO NOTHING;
 
 -- Example granular role: a histopathology scientist who may do everything in
 -- histopathology except entering results.
+--
+-- created_by is NULL: the users table is not seeded, and a demo role attributed
+-- to a demo administrator would be an attribution to nobody.
 INSERT INTO custom_roles (id, name, description, created_by) VALUES
   ('ROLE-HISTO-VIEWER','Histopathology (No Result Entry)',
-   'Everything in Histopathology except entering results.', 'USR-002')
+   'Everything in Histopathology except entering results.', NULL)
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO role_permissions (role_id, permission_key) VALUES

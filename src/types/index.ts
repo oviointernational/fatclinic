@@ -21,21 +21,22 @@ export interface CustomRole {
 export interface User {
   id: string;
   name: string;
+  /** Always stored lowercase: see the `users` mapper in sync.ts. */
   email: string;
   role: UserRole;
   department: string;
   avatar: string;
   pin: string; // 4-digit device PIN: a screen lock, not a login credential
-  /**
-   * @deprecated Legacy local-mode password. It exists only in localStorage and is
-   * NEVER synced to Postgres: `public.users` has no password column, because
-   * credentials belong to Supabase Auth. Login is moving to `supabase.auth`, and
-   * this field, along with db.assignUserPassword / db.changeOwnPassword, will be
-   * removed with the auth rewrite. Do not read it in the sync layer.
-   */
-  password: string;
   customRoleId?: string; // assigned granular access-control role (Admin assigns)
-  mustChangePassword?: boolean; // advisory flag for the sign-in UI
+  /**
+   * Advisory flag for the sign-in UI. The password it originally referred to
+   * belongs to Supabase Auth, which is the only place a credential now lives -
+   * so there is nothing for the app to compare or store. `User` deliberately has
+   * no `password` field: `public.users` has no such column, and a field that
+   * cannot be written to the database is a field that will end up in
+   * localStorage instead. Use `supabase.auth` (see src/services/auth.ts).
+   */
+  mustChangePassword?: boolean;
   active: boolean;
 }
 

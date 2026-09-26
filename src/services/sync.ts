@@ -35,7 +35,9 @@
  *   whatever the browser believed, which is the wrong direction of trust for
  *   money.
  * - `users.password` does not exist in the schema. Credentials belong to
- *   Supabase Auth, so the field is dropped on the way out and never hydrated.
+ *   Supabase Auth, so there is no such field on the model to send or to hydrate.
+ *   The `User` type no longer carries one, which is what stops a password being
+ *   reintroduced into localStorage by a future screen.
  *
  * ORDERING
  * --------
@@ -77,6 +79,16 @@ import type {
   Vitals,
 } from '../types';
 import { getSupabase } from './supabase';
+
+/**
+ * localStorage key for the staff collection.
+ *
+ * Exported because two modules now need it and neither should hard-code the
+ * string: the table map, and `auth.ts`, which reuses the `users` row mapper to
+ * turn a session into a staff profile. Two literals that have to agree are two
+ * chances not to.
+ */
+export const USERS_STORAGE_KEY = 'fatclinic_users';
 
 // ---------------------------------------------------------------------------
 // Coercion helpers
@@ -195,6 +207,20 @@ interface TableMap {
    * is removed would be clamped away and never restored.
    */
   settle?: string[];
+  /**
+   * Model fields this mapper canonicalises on the way out, so a value read back
+   * is deliberately not byte-identical to the one written.
+   *
+   * Declared rather than left implicit because the round-trip test in
+   * scripts/sync-selftest.mjs asserts that a model survives
+   * model -> row -> model unchanged. That assertion is worth keeping for every
+   * other field, so a normaliser has to be listed to be exempt - which means
+   * adding one is a deliberate act that shows up in review, and cannot quietly
+   * start rewriting clinical text. The suite also checks that each declared
+   * field genuinely normalises, so the exemption cannot be claimed to silence a
+   * real round-trip failure.
+   */
+  normalises?: string[];
 }
 
 const SERVER_MANAGED = ['created_at', 'updated_at'];
@@ -283,13 +309,14 @@ export const TABLES: TableMap[] = [
   },
 
   {
-    key: 'fatclinic_users',
+    key: USERS_STORAGE_KEY,
     table: 'users',
     order: 30,
     // `password` is deliberately absent: public.users has no such column and
     // credentials belong to Supabase Auth. Reading it back would also be a
     // silent failure, because the column does not exist to read.
     omit: [...SERVER_MANAGED, 'auth_user_id'],
+    normalises: ['email'],
     rowToModel: (r): User => ({
       id: text(r.id),
       name: text(r.name),
@@ -298,9 +325,6 @@ export const TABLES: TableMap[] = [
       department: text(r.department),
       avatar: text(r.avatar),
       pin: text(r.pin),
-      // Supabase owns the password, so there is nothing truthful to put here.
-      // AuthContext reads the session, not this field.
-      password: '',
       customRoleId: optText(r.custom_role_id),
       mustChangePassword: Boolean(r.must_change_password),
       active: Boolean(r.active),
@@ -308,7 +332,17 @@ export const TABLES: TableMap[] = [
     modelToRow: (m: User) => ({
       id: m.id,
       name: m.name,
-      email: m.email,
+      // Lowercased here, at the only place a staff row is written, so the
+      // invariant holds no matter which screen created the profile. It has to
+      // hold: the sign-in lookup matches on the address, RLS resolves the
+      // caller with `lower(email) = lower(jwt.email)`, and the unique index is on
+      // `lower(email)`. A row stored as "Dr@Clinic.Health" would be one the
+      // clinician can authenticate as but never find.
+      //
+      // Coerced rather than assumed: a hand-built model with no email would
+      // otherwise throw here, inside a save the clinician did not cause, and
+      // take the whole screen down with it.
+      email: String(m.email ?? '').trim().toLowerCase(),
       role: m.role,
       department: m.department ?? '',
       avatar: m.avatar ?? '',
@@ -1774,9 +1808,16 @@ let draining: Promise<void> | null = null;
 /** Rows with a push still outstanding, so hydration does not overwrite them. */
 const inFlight = new Set<string>();
 
-/** Keys currently waiting to be written, for diagnostics and tests. */
+/**
+ * Collections with a write still waiting, deduplicated.
+ *
+ * The queue can hold the same collection more than once - two saves to
+ * `patients` before the first drains - so this reports distinct collections
+ * rather than queue length. That is also the useful number for a clinician: it
+ * is how many things they have entered that the database has not acknowledged.
+ */
 export function pendingKeys(): string[] {
-  return queue.map((q) => q.map.key);
+  return [...new Set(queue.map((q) => q.map.key))];
 }
 
 /**

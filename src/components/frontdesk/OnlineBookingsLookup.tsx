@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { OnlineBooking, Patient } from '../../types';
 import {
@@ -21,7 +21,7 @@ export const OnlineBookingsLookup: React.FC<OnlineBookingsLookupProps> = ({
   onPatientRegistered,
   onOpenProfile
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   useSyncDb();
   const [codeQuery, setCodeQuery] = useState('');
   const [selectedBooking, setSelectedBooking] = useState<OnlineBooking | null>(null);

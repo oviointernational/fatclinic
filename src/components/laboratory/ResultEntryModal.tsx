@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { LabRequest, LabTestOrder, LabResultValue } from '../../types';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { X, CheckCircle2, AlertTriangle, FlaskConical, Save, ShieldAlert } from 'lucide-react';
 
 interface ResultEntryModalProps {
@@ -19,7 +19,7 @@ export const ResultEntryModal: React.FC<ResultEntryModalProps> = ({
   onSave,
   readOnly = false
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   const testDef = db.getLabInvestigationById(testOrder.testDefinitionId);
   const patient = db.getPatientById(request.patientId);
 

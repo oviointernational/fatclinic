@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { pdfService } from '../../services/pdfService';
 import { Invoice, PaymentRecord, Patient } from '../../types';
@@ -38,7 +38,7 @@ const BILL_TABS: Array<{ id: BillTab; label: string; icon: React.ReactNode }> = 
 ];
 
 export const FrontDeskCashier: React.FC<FrontDeskCashierProps> = ({ onOpenProfile }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   const syncTick = useSyncDb();
   const isController = (['FRONT_DESK', 'BILLING_OFFICER', 'ADMINISTRATOR'] as const).includes(currentUser.role as any);
 

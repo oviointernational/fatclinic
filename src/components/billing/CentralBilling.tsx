@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Invoice, PaymentRecord, Patient } from '../../types';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { pdfService } from '../../services/pdfService';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import {
@@ -18,7 +18,7 @@ interface CentralBillingProps {
 export const CentralBilling: React.FC<CentralBillingProps> = ({ 
   initialTab = 'invoices',
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   const syncTick = useSyncDb();
   const [activeTab, setActiveTab] = useState<'invoices' | 'pricing'>(initialTab);
   const [search, setSearch] = useState('');

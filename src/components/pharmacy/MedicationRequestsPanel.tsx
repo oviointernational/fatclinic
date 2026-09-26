@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { Medication } from '../../types';
 import { AlertTriangle, CheckCircle2, Package, X } from 'lucide-react';
@@ -11,7 +11,7 @@ import { AlertTriangle, CheckCircle2, Package, X } from 'lucide-react';
  * adds the quantity back into formulary stock.
  */
 export const MedicationRequestsPanel: React.FC = () => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   useSyncDb();
 
   const [requestMed, setRequestMed] = useState<Medication | null>(null);

@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { RadiologyOrder, Patient } from '../../types';
 import { SectionConsumablesPanel } from '../common/SectionConsumablesPanel';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { 
   Radio, 
@@ -28,7 +28,7 @@ export const RadiologyDashboard: React.FC<RadiologyDashboardProps> = ({
   initialTab = 'queue',
   onSelectPatient
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   useSyncDb();
 
   const [activeTab, setActiveTab] = useState<'queue' | 'stock' | 'pricing'>(initialTab);

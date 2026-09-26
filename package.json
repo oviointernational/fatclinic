@@ -7,7 +7,6 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "start": "node server/index.js",
     "deploy": "npm run build && wrangler deploy",
     "deploy:dry": "wrangler deploy --dry-run",
     "db:lint": "node scripts/lint-schema.mjs",
@@ -19,18 +18,18 @@
     "db:apply": "node scripts/apply-schema.mjs",
     "db:check-rls": "node scripts/check-rls.mjs",
     "db:check-api": "node scripts/check-api.mjs",
-    "db:verify": "npm run db:lint && npm run db:sync:test && npm run db:check-rls && npm run db:check-api"
+    "db:verify": "npm run db:lint && npm run db:sync:test && npm run db:check-rls && npm run db:check-api",
+    "staff:list": "node scripts/provision-staff.mjs --list",
+    "staff:add": "node scripts/provision-staff.mjs",
+    "staff:disable": "node scripts/provision-staff.mjs --disable",
+    "staff:clean-demo": "node scripts/remove-demo-staff.mjs"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.2",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.21.2",
     "lucide-react": "^1.16.0",
-    "pg": "^8.13.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -39,6 +38,8 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.7.0",
     "autoprefixer": "^10.4.20",
+    "dotenv": "^16.4.5",
+    "pg": "^8.13.1",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.15",
     "typescript": "~5.6.3",

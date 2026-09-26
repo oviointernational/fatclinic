@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { db } from '../../services/db';
 import { Patient } from '../../types';
 import { UserPlus, X, Check, AlertCircle } from 'lucide-react';
@@ -15,7 +15,7 @@ export const PatientRegistration: React.FC<PatientRegistrationProps> = ({
   onClose,
   onSuccess
 }) => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
 
   const [firstName, setFirstName] = useState('');
   const [middleName, setMiddleName] = useState('');

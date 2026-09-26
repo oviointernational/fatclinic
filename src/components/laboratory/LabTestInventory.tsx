@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { db } from '../../services/db';
-import { useAuth } from '../../context/AuthContext';
+import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import {
   Search,
@@ -11,7 +11,7 @@ import {
 import { LabInvestigationDefinition } from '../../types';
 
 export const LabTestInventory: React.FC = () => {
-  const { currentUser } = useAuth();
+  const currentUser = useCurrentUser();
   useSyncDb();
   // Only Administration can change prices / edit investigations — all sections are read-only.
   const canEditPrice = currentUser.role === 'ADMINISTRATOR';

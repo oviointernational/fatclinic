@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useAuth } from '../../context/AuthContext';
+import { useAuth, useCurrentUser } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
 import { 
   Sun, 
@@ -14,21 +14,53 @@ import {
   CalendarPlus
 } from 'lucide-react';
 import { db } from '../../services/db';
+import { getSupabase, isSupabaseConfigured } from '../../services/supabase';
+import { pendingKeys } from '../../services/sync';
 import { Patient, UserRole } from '../../types';
 import { OnlineBookingModal } from '../frontdesk/OnlineBookingModal';
 import { AccountModal } from '../common/AccountModal';
 
-/** Postgres API reachability dot (Railway DATABASE_PRIVATE_URL wiring). */
-const ServerStatus: React.FC = () => {
-  const [state, setState] = useState<'checking' | 'online' | 'offline'>('checking');
+/**
+ * Is this browser's data actually reaching Postgres?
+ *
+ * The previous version of this dot asked `fetch('/api/health')` and trusted
+ * `res.ok`. That was worse than having no indicator at all, because it was
+ * confidently wrong: `wrangler.jsonc` sets `not_found_handling:
+ * "single-page-application"`, so Cloudflare Pages answers *any* unmatched path -
+ * including `/api/health` - with `index.html` and HTTP 200. The dot rendered
+ * green, permanently, while every write was being rejected. A clinician had no
+ * way to tell that a patient's records existed in exactly one browser.
+ *
+ * So the check now goes where the data goes. A one-row read against `wards`
+ * proves three things at once, and all three have to hold: DNS resolves, the
+ * project answers, and the signed-in session satisfies RLS. `wards` is chosen
+ * because it is tiny, seeded, and behind RLS like everything else.
+ *
+ * The second half of the indicator is the one that matters most. "Connected" only
+ * says a read worked; what a clinician needs to know is whether *their* last
+ * entries are saved, so unsaved collections are surfaced separately and take
+ * priority over the connection colour.
+ */
+type SyncState = 'local-only' | 'checking' | 'connected' | 'offline';
 
+const ServerStatus: React.FC = () => {
+  const [state, setState] = useState<SyncState>(isSupabaseConfigured ? 'checking' : 'local-only');
+  const [unsaved, setUnsaved] = useState<number>(0);
+
+  // Network reachability: cheap, but not free, so once a minute.
   React.useEffect(() => {
+    if (!isSupabaseConfigured) return;
+    const client = getSupabase();
+    if (!client) return;
+
     let cancelled = false;
     const ping = async () => {
       try {
-        const res = await fetch('/api/health', { cache: 'no-store' });
-        if (!cancelled) setState(res.ok ? 'online' : 'offline');
+        const { error } = await client.from('wards').select('code').limit(1);
+        if (!cancelled) setState(error ? 'offline' : 'connected');
       } catch {
+        // A thrown fetch means DNS or the network failed, not that the row is
+        // absent. Either way it is not connected.
         if (!cancelled) setState('offline');
       }
     };
@@ -40,19 +72,68 @@ const ServerStatus: React.FC = () => {
     };
   }, []);
 
+  // Outstanding writes: an in-memory read, so it can be polled often enough for
+  // the badge to appear while a clinician is still looking at the screen.
+  React.useEffect(() => {
+    const refresh = () => setUnsaved(pendingKeys().length);
+    refresh();
+    const timer = setInterval(refresh, 2500);
+    return () => clearInterval(timer);
+  }, []);
+
+  const title = unsaved
+    ? `${unsaved} change${unsaved === 1 ? '' : 's'} not yet saved to the server. They are safe in this browser and will be retried.`
+    : state === 'connected'
+    ? 'Connected: entries are being saved to the clinic database.'
+    : state === 'offline'
+    ? 'The clinic database is unreachable. Entries are being kept in this browser only and have NOT reached the server.'
+    : state === 'local-only'
+    ? 'This build has no database connection configured. Entries are kept in this browser only and are not backed up anywhere.'
+    : 'Checking the clinic database…';
+
+  // Unsaved work outranks connection state: a green light next to a pending
+  // write would be the exact false all-clear this component exists to remove.
+  const tone =
+    unsaved || state === 'offline' || state === 'local-only'
+      ? state === 'offline' || state === 'local-only'
+        ? 'bad'
+        : 'warn'
+      : state === 'connected'
+      ? 'good'
+      : 'wait';
+
+  const label =
+    unsaved > 0
+      ? `${unsaved} unsaved`
+      : tone === 'bad'
+      ? 'Not saving'
+      : state === 'connected'
+      ? 'Server DB'
+      : '…';
+
+  const tones: Record<string, string> = {
+    good:
+      'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800',
+    warn: 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-800',
+    bad: 'bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-800',
+    wait: 'bg-slate-100 text-slate-500 border-slate-200 dark:bg-dark-surface dark:text-slate-400 dark:border-dark-border',
+  };
+  const dots: Record<string, string> = {
+    good: 'bg-emerald-500',
+    warn: 'bg-amber-500 animate-pulse',
+    bad: 'bg-rose-500 animate-pulse',
+    wait: 'bg-slate-400',
+  };
+
   return (
     <span
-      title={state === 'online' ? 'Server database: connected' : state === 'offline' ? 'Server database: unreachable (using local data)' : 'Checking server database…'}
+      title={title}
       className={`hidden sm:inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold border ${
-        state === 'online'
-          ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800'
-          : state === 'offline'
-          ? 'bg-slate-100 text-slate-500 border-slate-200 dark:bg-dark-surface dark:text-slate-400 dark:border-dark-border'
-          : 'bg-amber-50 text-amber-700 border-amber-200'
+        tones[tone]
       }`}
     >
-      <span className={`w-1.5 h-1.5 rounded-full ${state === 'online' ? 'bg-emerald-500 animate-pulse' : state === 'offline' ? 'bg-slate-400' : 'bg-amber-500 animate-pulse'}`} />
-      <span>{state === 'online' ? 'Server DB' : state === 'offline' ? 'Local data' : '…'}</span>
+      <span className={`w-1.5 h-1.5 rounded-full ${dots[tone]}`} />
+      <span>{label}</span>
     </span>
   );
 };
@@ -70,13 +151,15 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenAuditLogs,
   onNavigateHome
 }) => {
-  const { currentUser, isAuthenticated, putToSleep, signOut } = useAuth();
+  const { isAuthenticated, putToSleep, signOut } = useAuth();
+  const currentUser = useCurrentUser();
   const { theme, toggleTheme } = useTheme();
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<Patient[]>([]);
   const [showSearchResults, setShowSearchResults] = useState(false);
   const [isBookingModalOpen, setIsBookingModalOpen] = useState(false);
   const [isAccountOpen, setIsAccountOpen] = useState(false);
+  const [isSigningOut, setIsSigningOut] = useState(false);
   const [showAvatarMenu, setShowAvatarMenu] = useState(false);
 
   const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -247,10 +330,18 @@ export const Header: React.FC<HeaderProps> = ({
                     Lock workstation
                   </button>
                   <button
-                    onClick={() => { signOut(); setShowAvatarMenu(false); }}
-                    className="w-full text-left px-3 py-2 text-xs font-bold text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+                    onClick={() => {
+                      // Sign-out now waits for queued writes before revoking the
+                      // session, so it is not instant. Say so, rather than
+                    // letting a clinician click it three times and wonder.
+                      setIsSigningOut(true);
+                      void signOut().finally(() => setIsSigningOut(false));
+                      setShowAvatarMenu(false);
+                    }}
+                    disabled={isSigningOut}
+                    className="w-full text-left px-3 py-2 text-xs font-bold text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 disabled:opacity-60"
                   >
-                    Sign out
+                    {isSigningOut ? 'Signing out…' : 'Sign out'}
                   </button>
                 </div>
               )}

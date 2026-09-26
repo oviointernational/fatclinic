@@ -52,6 +52,7 @@ import {
 import {
   TABLE_BY_KEY,
   TABLES,
+  USERS_STORAGE_KEY,
   hydrateAll,
   isSyncEnabled,
   isInFlight,
@@ -60,7 +61,7 @@ import {
 
 const STORAGE_KEYS = {
   SETTINGS: 'fatclinic_settings',
-  USERS: 'fatclinic_users',
+  USERS: USERS_STORAGE_KEY,
   PATIENTS: 'fatclinic_patients',
   VISITS: 'fatclinic_visits',
   VITALS: 'fatclinic_vitals',
@@ -166,13 +167,21 @@ function saveStorage<T>(key: string, value: T): void {
 
 // Production storage version. Bumped whenever seed data is retired so stale
 // demo records on existing machines are purged and reseeded cleanly.
-const STORAGE_VERSION = 2;
+//
+// v3: the demo staff and the `FatClinic123` password are gone. Bumping the
+// version is what actually removes them from machines that already have them -
+// leaving them in localStorage would mean an account whose credential nobody,
+// including the database, still recognises.
+const STORAGE_VERSION = 3;
 const VERSION_KEY = 'fatclinic_schema_version';
 
 function ensureProductionStorage(): void {
   try {
     if (localStorage.getItem(VERSION_KEY) !== String(STORAGE_VERSION)) {
       Object.values(STORAGE_KEYS).forEach(k => localStorage.removeItem(k));
+      // The old build's fake session. Supabase Auth keeps its own token under
+      // `sb-<ref>-auth-token`; this key is only ever read by code that no longer
+      // exists, so clearing it is a one-time cleanup.
       localStorage.removeItem('fatclinic_active_user');
       localStorage.setItem(VERSION_KEY, String(STORAGE_VERSION));
     }
@@ -218,6 +227,24 @@ class FatClinicDatabase {
   public readonly ready: Promise<void>;
   private resolveReady!: () => void;
 
+  /**
+   * Re-run the reconciliation with Postgres.
+   *
+   * Needed because the constructor hydrates immediately, and on a cold load that
+   * happens before anybody has signed in - so every read is rejected by RLS and
+   * the catch in `hydrateFromServer` swallows it. Without this, signing in would
+   * leave the browser holding only its own localStorage copy forever: writes
+   * would start succeeding, but the clinician would never see a record entered
+   * at another terminal, which is the entire reason the database exists.
+   *
+   * Safe to call repeatedly. `hydrateFromServer` respects in-flight writes, so a
+   * re-hydration cannot discard something the clinician is in the middle of
+   * saving.
+   */
+  public resync(): Promise<void> {
+    return this.hydrateFromServer();
+  }
+
   constructor() {
     this.resolveReady = () => {};
     this.ready = new Promise<void>((resolve) => {
@@ -228,25 +255,6 @@ class FatClinicDatabase {
     this.settings = loadStorage(STORAGE_KEYS.SETTINGS, initialSettings);
     this.receiptSettings = { ...initialReceiptSettings, ...loadStorage(STORAGE_KEYS.RECEIPT_SETTINGS, {}) };
     this.users = loadStorage(STORAGE_KEYS.USERS, initialUsers);
-    // Merge newer seed staff + backfill DB-controlled credentials on existing installs
-    {
-      let dirty = false;
-      const knownIds = new Set(this.users.map(u => u.id));
-      initialUsers.forEach(su => {
-        if (!knownIds.has(su.id)) {
-          this.users = [...this.users, su];
-          dirty = true;
-        }
-      });
-      this.users = this.users.map(u => {
-        if (!u.password) {
-          dirty = true;
-          return { ...u, password: 'FatClinic123' };
-        }
-        return u;
-      });
-      if (dirty) saveStorage(STORAGE_KEYS.USERS, this.users);
-    }
     this.patients = loadStorage(STORAGE_KEYS.PATIENTS, initialPatients);
     this.visits = loadStorage(STORAGE_KEYS.VISITS, initialVisits);
     this.vitals = loadStorage(STORAGE_KEYS.VITALS, initialVitals);
@@ -487,44 +495,6 @@ class FatClinicDatabase {
       action: 'ASSIGN_CUSTOM_ROLE',
       category: 'ADMIN',
       details: `Assigned access-control role "${roleName}" to ${target.name}.`
-    });
-    this.notify();
-  }
-
-  /** Administration assigns a new login password to a staff member. */
-  public assignUserPassword(userId: string, newPassword: string, adminUser: User): void {
-    const target = this.users.find(u => u.id === userId);
-    if (!target) throw new Error(`User ${userId} not found`);
-    if (!newPassword || newPassword.length < 6) throw new Error('New password must be at least 6 characters.');
-    const updated: User = { ...target, password: newPassword, mustChangePassword: false };
-    this.users = this.users.map(u => u.id === userId ? updated : u);
-    saveStorage(STORAGE_KEYS.USERS, this.users);
-    this.log({
-      userId: adminUser.id,
-      userName: adminUser.name,
-      userRole: adminUser.role,
-      action: 'ASSIGN_PASSWORD',
-      category: 'ADMIN',
-      details: `Assigned a new login password to ${target.name}.`
-    });
-    this.notify();
-  }
-
-  public changeOwnPassword(userId: string, currentPassword: string, newPassword: string): void {
-    const target = this.users.find(u => u.id === userId);
-    if (!target) throw new Error(`User ${userId} not found`);
-    if ((target.password || '') !== currentPassword) throw new Error('Current password is incorrect.');
-    if (!newPassword || newPassword.length < 6) throw new Error('New password must be at least 6 characters.');
-    const updated: User = { ...target, password: newPassword, mustChangePassword: false };
-    this.users = this.users.map(u => u.id === userId ? updated : u);
-    saveStorage(STORAGE_KEYS.USERS, this.users);
-    this.log({
-      userId: target.id,
-      userName: target.name,
-      userRole: target.role,
-      action: 'CHANGE_OWN_PASSWORD',
-      category: 'ADMIN',
-      details: `${target.name} changed their login password.`
     });
     this.notify();
   }

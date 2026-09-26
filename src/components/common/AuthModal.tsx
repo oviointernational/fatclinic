@@ -8,39 +8,48 @@ interface AuthModalProps {
 }
 
 export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
-  const { allUsers, signIn } = useAuth();
+  const { signIn } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   if (!isOpen) return null;
 
-  const handleSignIn = (e: React.FormEvent) => {
+  // Credentials go to Supabase Auth and are never compared here, never stored
+  // here, and never sent anywhere but the auth endpoint. The failure message
+  // comes back from services/auth.ts, which collapses "no such address" and
+  // "wrong password" into one reply on purpose: distinguishing them would turn
+  // this form into a way to enumerate staff accounts.
+  const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
     setError(null);
-    const normalized = email.trim().toLowerCase();
-    if (!normalized) {
+
+    const address = email.trim();
+    if (!address) {
       setError('Enter your staff email address.');
       return;
     }
-    // No user list is exposed: accounts are resolved privately by email.
-    const user = allUsers.find(u => u.email.trim().toLowerCase() === normalized);
-    if (!user) {
-      setError('No active staff account matches this email. Contact Administration.');
-      return;
+
+    setIsSubmitting(true);
+    try {
+      const outcome = await signIn(address, password);
+      if (outcome.ok) {
+        setEmail('');
+        setPassword('');
+        onClose();
+        return;
+      }
+      setError(outcome.message);
+      // Never leave a typed password sitting in a field after a failure.
+      setPassword('');
+    } catch (err) {
+      console.error('[auth] sign-in failed unexpectedly:', err);
+      setError('Sign-in could not be completed. Try again, or contact Administration.');
+    } finally {
+      setIsSubmitting(false);
     }
-    if (!user.active) {
-      setError('This account has been disabled. Contact Administration.');
-      return;
-    }
-    if ((user.password || '') !== password) {
-      setError('Incorrect password. Ask Administration for a new one if you forgot yours.');
-      return;
-    }
-    signIn(user);
-    setEmail('');
-    setPassword('');
-    onClose();
   };
 
   return (
@@ -104,15 +113,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
 
             <button
               type="submit"
-              className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-md transition-all mt-4 flex items-center justify-center space-x-2"
+              disabled={isSubmitting}
+              className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold text-xs shadow-md transition-all mt-4 flex items-center justify-center space-x-2"
             >
               <LogIn className="w-3.5 h-3.5" />
-              <span>Sign In to Workstation</span>
+              <span>{isSubmitting ? 'Signing in…' : 'Sign In to Workstation'}</span>
             </button>
 
             <p className="text-[10px] text-slate-400 text-center leading-relaxed">
               Accounts are entirely database-controlled — staff cannot self-register.<br />
-              Use the email and password given to you by Administration.
+              Your password is checked by the clinic server, never stored in this browser.
             </p>
           </form>
         </div>
