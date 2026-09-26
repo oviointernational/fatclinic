@@ -1,4 +1,4 @@
-import { Patient, Visit, Consultation, Vitals, LabRequest, Prescription, Invoice, PaymentRecord, SystemSettings } from '../types';
+import { Patient, Visit, Consultation, Vitals, LabRequest, Prescription, Invoice, PaymentRecord, SystemSettings, wardName } from '../types';
 import { db } from './db';
 
 export const pdfService = {
@@ -670,7 +670,7 @@ export const pdfService = {
         : `<tr><td colspan="3" style="color: #94a3b8;">No bills raised for this visit yet.</td></tr>`;
       return `
         <h3 style="border-bottom: 1px solid #e2e8f0; padding-bottom: 6px; color: #0f172a;">
-          Visit: ${v.visitDate} (${v.visitType}) — ${v.status}${v.ward ? ` • Ward: ${v.ward}` : ''}
+          Visit: ${v.visitDate} (${v.visitType}) — ${v.status}${v.ward ? ` • Ward: ${wardName(v.ward)}` : ''}
         </h3>
         <table class="data-table">
           <thead><tr><th>Service / Item</th><th style="text-align: center;">Qty</th><th style="text-align: right;">Total</th></tr></thead>

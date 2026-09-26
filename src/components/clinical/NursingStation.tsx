@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Patient, Visit, Vitals } from '../../types';
+import { Patient, Visit, Vitals, wardName } from '../../types';
 import { db } from '../../services/db';
 import { useAuth } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
@@ -476,7 +476,7 @@ export const NursingStation: React.FC<NursingStationProps> = ({
             <button type="button" onClick={() => { if (confirm('Discharge this admitted patient?')) db.updateVisitStatus(activeVisit.id, 'Discharged', currentUser); }} className="px-2.5 py-1 rounded-lg text-[11px] font-bold bg-rose-600 hover:bg-rose-700 text-white flex items-center space-x-1"><LogOut className="w-3 h-3" /><span>Discharge</span></button>
           )}
           {activeVisit && activeVisit.status === 'Admitted' && activeVisit.ward && (
-            <span className="px-2.5 py-1 rounded-lg text-[11px] font-bold bg-indigo-100 text-indigo-700 border border-indigo-200">Ward: {activeVisit.ward}</span>
+            <span className="px-2.5 py-1 rounded-lg text-[11px] font-bold bg-indigo-100 text-indigo-700 border border-indigo-200">Ward: {wardName(activeVisit.ward)}</span>
           )}
         </div>
 

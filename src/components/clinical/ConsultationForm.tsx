@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { Patient, Visit, ClinicalDiagnosis, LabCategory, LabInvestigationDefinition, Medication } from '../../types';
+import { Patient, Visit, ClinicalDiagnosis, LabCategory, LabInvestigationDefinition, Medication, wardName } from '../../types';
 import { db } from '../../services/db';
 import { useAuth } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
@@ -701,7 +701,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
                           <span className={`w-1.5 h-1.5 rounded-full ${dotCls}`} />
                           <span className="text-[10px] font-bold text-slate-500">{latestVisit.status}</span>
                           {latestVisit.status === 'Admitted' && latestVisit.ward && (
-                            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700">Ward: {latestVisit.ward}</span>
+                            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700">Ward: {wardName(latestVisit.ward)}</span>
                           )}
                           <span className="text-[10px] text-slate-400">• {latestVisit.visitDate}</span>
                         </div>

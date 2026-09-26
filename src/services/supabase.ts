@@ -2,9 +2,11 @@
  * Supabase browser client.
  *
  * The anon key is designed to be public, so it is safe in the bundle ONLY
- * because database/rls.sql enables Row Level Security on every table. If you
- * ever remove RLS, this file hands every visitor full read/write access to all
- * patient data - do not ship that.
+ * because section 12 of database/fatclinic.sql enables Row Level Security on
+ * every table. If you ever remove RLS, this file hands every visitor full
+ * read/write access to all patient data - do not ship that. Email self-signup
+ * must also stay switched off in the Supabase dashboard, or anyone can obtain an
+ * authenticated session.
  *
  * The client is created lazily and is `null` when the environment variables are
  * absent, so a checkout without .env still boots in local-only mode rather than

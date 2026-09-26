@@ -1,7 +1,7 @@
 import React from 'react';
 import { db } from '../../services/db';
 import { useSyncDb } from '../../hooks/useSyncDb';
-import { Visit } from '../../types';
+import { Visit, wardName } from '../../types';
 import {
   Clock,
   Activity,
@@ -67,7 +67,8 @@ export function getAdmittedByWard(): Array<{ ward: string; count: number }> {
   const map = new Map<string, number>();
   db.getVisits().forEach(v => {
     if (v.status !== 'Admitted') return;
-    const w = v.ward || 'Unspecified ward';
+    // Keyed by ward CODE (what is stored); the label is resolved at render time.
+    const w = v.ward || 'UNSPECIFIED';
     map.set(w, (map.get(w) || 0) + 1);
   });
   return [...map.entries()]
@@ -183,7 +184,7 @@ export const ClinicalDashboard: React.FC<ClinicalDashboardProps> = ({ selectedGr
                       : 'bg-white dark:bg-dark-card text-indigo-800 dark:text-indigo-200 border-indigo-200 dark:border-indigo-800 hover:shadow-md'
                   }`}
                 >
-                  <span>{w.ward}</span>
+                  <span>{wardName(w.ward === 'UNSPECIFIED' ? undefined : w.ward)}</span>
                   <span className={`px-2 py-0.5 rounded-full text-[11px] font-black ${active ? 'bg-white/20 text-white' : 'bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300'}`}>
                     {w.count}
                   </span>

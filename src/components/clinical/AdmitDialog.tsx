@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { BedDouble, X } from 'lucide-react';
-import { WARDS } from '../../types';
+import { WARD_OPTIONS } from '../../types';
 
 interface AdmitDialogProps {
   title: string;
@@ -11,7 +11,7 @@ interface AdmitDialogProps {
 
 /** Admission requires a ward to be specified. */
 export const AdmitDialog: React.FC<AdmitDialogProps> = ({ title, subtitle, onClose, onConfirm }) => {
-  const [ward, setWard] = useState(WARDS[0]);
+  const [ward, setWard] = useState(WARD_OPTIONS[0].code);
   const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -45,8 +45,8 @@ export const AdmitDialog: React.FC<AdmitDialogProps> = ({ title, subtitle, onClo
             onChange={e => { setWard(e.target.value); setError(null); }}
             className="w-full px-3 py-2 rounded-xl bg-slate-50 border font-bold"
           >
-            {WARDS.map(w => (
-              <option key={w} value={w}>{w}</option>
+            {WARD_OPTIONS.map(w => (
+              <option key={w.code} value={w.code}>{w.name}</option>
             ))}
           </select>
         </div>

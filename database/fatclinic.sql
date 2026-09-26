@@ -1,61 +1,132 @@
 -- ============================================================================
--- FatClinic EHR — Complete Database Schema (PostgreSQL 14+)
+-- FatClinic EHR — Complete Database Schema
+-- Single file. Idempotent. Safe to re-run.
 -- ============================================================================
--- Single-file schema for EVERYTHING in the FatClinic workstation:
---   staff accounts (DB-controlled, no self-registration) + granular custom
---   roles & permissions tree, patients, visits/encounters (with ward
---   admission), vitals, consultations, lab (5 departments, orders, results,
---   stock), pharmacy (formulary, prescriptions, dispensing, drug reorder
---   requests), radiology, physiotherapy, clinical consumables (all sections
---   incl. Laboratory & Pharmacy) with requests + usage logs, unified billing
---   (invoices, items, payments/receipts), online bookings, audit log, system
---   settings, receipt settings, wards.
 --
--- Apply with:  psql -U <user> -d <db> -f database/fatclinic.sql
+--   psql "$DATABASE_URL" -f database/fatclinic.sql
+--   npm run db:apply
 --
--- SECURITY NOTE: passwords below are demo seeds. In production, store only
--- salted hashes (e.g. bcrypt via pgcrypto crypt()) and force rotation.
+-- CONTENTS
+--   0.  Preflight and extensions
+--   1.  Schema-level defaults
+--   2.  Identity, access control and reference data
+--   3.  Patients and clinical care
+--   4.  Laboratory
+--   5.  Pharmacy
+--   6.  Billing
+--   7.  Radiology and physiotherapy
+--   8.  Consumables
+--   9.  Audit trail and settings
+--   10. Indexes (including every foreign key)
+--   11. Functions and triggers
+--   12. Row Level Security
+--   13. Operational views
+--   14. Seed data
+--
+-- DESIGN NOTES
+--
+--   * Credentials do NOT live here. Passwords are held by Supabase Auth; this
+--     schema stores only the staff profile and links it by email / auth_user_id.
+--     There is deliberately no plaintext (or hashed) password column.
+--
+--   * Row Level Security (section 12) is mandatory, not optional. The browser
+--     ships a public Supabase anon key, so the database itself is the only thing
+--     standing between an anonymous visitor and every patient record. If you are
+--     applying this to a plain Postgres server with no Supabase `auth` schema,
+--     section 12 is skipped and the database is NOT safe to expose.
+--
+--   * Money is NUMERIC(12,2) and vitals are unit-suffixed (temperature_c,
+--     pulse_bpm, ...). The TypeScript model in src/types/index.ts uses shorter
+--     names; the translation lives in exactly one place, the row mapper, so
+--     clinical units are never ambiguous at the storage layer.
+--
+--   * `visits.ward` stores a ward CODE (e.g. 'MALE-GEN'), not a display name.
+--     Display names come from the `wards` table. src/types/index.ts exports
+--     WARD_OPTIONS and wardName() for this purpose.
+--
+--   * `audit_logs` is append-only, enforced twice: by RLS (no UPDATE/DELETE
+--     policy) and by the prevent_audit_mutation() trigger.
+--
+--   * Every foreign key is indexed. PostgreSQL does not do this for you, and an
+--     unindexed FK turns every parent DELETE into a full table scan.
+--
+--   * Invoice arithmetic is owned by the database (recalc_invoice), including
+--     when a discount changes, so the figures cannot drift from the line items.
 -- ============================================================================
 
--- NOTE: no extensions required. (pgcrypto was removed — nothing in this
--- schema uses it, and a failing CREATE EXTENSION would abort the apply.)
+
+-- ============================================================================
+-- 0. PREFLIGHT AND EXTENSIONS
+-- ============================================================================
+
+-- Fail fast and loudly rather than half-applying to the wrong database.
+DO $$
+DECLARE
+  v_missing TEXT[];
+BEGIN
+  SELECT array_agg(required)
+    INTO v_missing
+    FROM unnest(ARRAY['users','patients','visits','invoices','audit_logs']) AS required
+   WHERE to_regclass('public.' || required) IS NULL
+     AND required <> 'users';   -- 'users' is created in this script
+
+  IF v_missing IS NOT NULL THEN
+    RAISE EXCEPTION 'FatClinic schema: missing expected table(s): %', v_missing;
+  END IF;
+END $$;
+
+
+-- ============================================================================
+-- 1. SCHEMA-LEVEL DEFAULTS
+-- ============================================================================
+
+-- Everything below is written unqualified, so pin the search path rather than
+-- trusting whatever the connecting client happened to send.
+SET search_path = public;
+
+
+-- ============================================================================
+-- 2. IDENTITY, ACCESS CONTROL AND REFERENCE DATA
+-- ============================================================================
+
 -- ----------------------------------------------------------------------------
--- Lookup: wards (admission requires a ward)
+-- Wards. `code` is the stable identifier used by visits.ward; `name` is for
+-- display only and may be reworded without touching clinical records.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS wards (
   code        TEXT PRIMARY KEY,
   name        TEXT NOT NULL UNIQUE,
   capacity    INTEGER NOT NULL DEFAULT 0 CHECK (capacity >= 0),
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- ----------------------------------------------------------------------------
--- Nested access-control tree (explicit hierarchy IN the database).
--- A grant on a parent key (e.g. 'LABORATORY') implies everything beneath it;
--- revoking one leaf (e.g. 'LABORATORY.HISTOPATHOLOGY.ENTER_RESULT') keeps
--- every sibling granted. Mirrors src/services/permissions.ts.
+-- Nested access-control tree. A grant on a parent key implies every descendant,
+-- so revoking one leaf leaves its siblings intact.
+-- Mirrors src/services/permissions.ts.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS permission_nodes (
-  key         TEXT PRIMARY KEY,                        -- e.g. 'LABORATORY.HEMATOLOGY.PROCESS'
+  key         TEXT PRIMARY KEY,                       -- 'LABORATORY.HEMATOLOGY.PROCESS'
   parent_key  TEXT REFERENCES permission_nodes(key) ON DELETE CASCADE,
   label       TEXT NOT NULL,
   depth       INTEGER NOT NULL CHECK (depth BETWEEN 1 AND 4),
-  CONSTRAINT valid_permission_key CHECK (key ~ '^[A-Z][A-Z0-9]*(\.[A-Z][A-Z0-9]*)*$')
+  CONSTRAINT valid_permission_key
+    CHECK (key ~ '^[A-Z][A-Z0-9]*(\.[A-Z][A-Z0-9]*)*$')
 );
-CREATE INDEX IF NOT EXISTS idx_perm_parent ON permission_nodes(parent_key);
 
 -- ----------------------------------------------------------------------------
--- Granular custom roles + nested permission tree grants.
--- role_permissions.permission_key is FK-bound to permission_nodes, so only
--- keys that exist in the hierarchy can ever be granted.
+-- Granular custom roles. role_permissions is FK-bound to permission_nodes, so
+-- only keys that exist in the hierarchy can ever be granted.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS custom_roles (
-  id          TEXT PRIMARY KEY,                        -- e.g. 'ROLE-...'
-  name        TEXT NOT NULL UNIQUE,
-  description TEXT NOT NULL DEFAULT '',
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  created_by  TEXT,                                    -- FK to users() added below (cycle-safe)
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  id           TEXT PRIMARY KEY,                      -- 'ROLE-...'
+  name         TEXT NOT NULL UNIQUE,
+  description  TEXT NOT NULL DEFAULT '',
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_by   TEXT,                                  -- FK added below (cycle-safe)
+  updated_by   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS role_permissions (
@@ -65,43 +136,58 @@ CREATE TABLE IF NOT EXISTS role_permissions (
   granted_by     TEXT,
   PRIMARY KEY (role_id, permission_key)
 );
-CREATE INDEX IF NOT EXISTS idx_role_permissions_key ON role_permissions(permission_key);
 
 -- ----------------------------------------------------------------------------
--- Staff accounts — entirely database controlled.
--- No self-registration: rows are inserted by direct SQL or by Administration.
+-- Staff accounts. Database-controlled: there is no self-registration path.
+--
+--   pin                  4-digit workstation screen-lock PIN. NOT a login
+--                        credential and NOT a secret - it only gates the screen
+--                        on a shared ward terminal.
+--   auth_user_id         Supabase Auth user this profile signs in as.
+--   must_change_password Advisory flag for the sign-in UI.
+--
+-- There is intentionally no password column: passwords belong to Supabase Auth.
+-- See section 12 for how the two are linked.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS users (
-  id                   TEXT PRIMARY KEY,               -- e.g. 'USR-001'
+  id                   TEXT PRIMARY KEY,              -- 'USR-001'
   name                 TEXT NOT NULL,
-  email                TEXT NOT NULL UNIQUE,
+  email                TEXT NOT NULL,
   role                 TEXT NOT NULL CHECK (role IN (
                          'ADMINISTRATOR','PHYSICIAN','NURSE','LAB_SCIENTIST',
                          'PHARMACIST','RADIOLOGIST','PHYSIOTHERAPIST',
                          'FRONT_DESK','BILLING_OFFICER')),
   department           TEXT NOT NULL DEFAULT '',
   avatar               TEXT NOT NULL DEFAULT '',
-  pin                  CHAR(4) NOT NULL DEFAULT '1234' CHECK (pin ~ '^[0-9]{4}$'),
-  password             TEXT NOT NULL,                  -- demo seed; hash in prod
+  pin                  TEXT NOT NULL DEFAULT '1234' CHECK (pin ~ '^[0-9]{4}$'),
   custom_role_id       TEXT REFERENCES custom_roles(id) ON DELETE SET NULL,
   must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
   active               BOOLEAN NOT NULL DEFAULT TRUE,
+  auth_user_id         UUID,
   created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_users_role   ON users(role);
-CREATE INDEX IF NOT EXISTS idx_users_active ON users(active);
+
+-- Case-insensitive uniqueness: staff sign in with whatever case they type.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email_lower ON users (lower(email));
+
+
+-- ============================================================================
+-- 3. PATIENTS AND CLINICAL CARE
+-- ============================================================================
 
 -- ----------------------------------------------------------------------------
--- Patients
+-- Patients. `age` is denormalised alongside `dob` because the front desk
+-- registers walk-ins faster than a trigger round-trip; treat `dob` as truth and
+-- recompute age on read if the two ever disagree.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS patients (
-  id                TEXT PRIMARY KEY,                  -- hospital number e.g. 'FC-2026-00101'
+  id                TEXT PRIMARY KEY,                 -- hospital number 'FC-2026-00101'
   first_name        TEXT NOT NULL,
   middle_name       TEXT,
   last_name         TEXT NOT NULL,
   dob               DATE NOT NULL,
-  age               INTEGER NOT NULL CHECK (age >= 0),
+  age               INTEGER NOT NULL CHECK (age BETWEEN 0 AND 130),
   sex               TEXT NOT NULL CHECK (sex IN ('Male','Female','Other')),
   phone             TEXT NOT NULL,
   email             TEXT,
@@ -113,16 +199,16 @@ CREATE TABLE IF NOT EXISTS patients (
   genotype          TEXT,
   allergies         TEXT[] NOT NULL DEFAULT '{}',
   alerts            TEXT[] NOT NULL DEFAULT '{}',
-  registered_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+  registered_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_patients_name  ON patients(last_name, first_name);
-CREATE INDEX IF NOT EXISTS idx_patients_phone ON patients(phone);
 
 -- ----------------------------------------------------------------------------
--- Visits / encounter tabs (ward admission lives here)
+-- Visits / encounters. Ward admission lives here.
+-- `ward` holds a wards.code value.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS visits (
-  id                     TEXT PRIMARY KEY,             -- e.g. 'VIS-2026-001'
+  id                     TEXT PRIMARY KEY,            -- 'VIS-2026-001'
   patient_id             TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
   visit_date             DATE NOT NULL,
   visit_time             TEXT NOT NULL DEFAULT '00:00',
@@ -140,48 +226,51 @@ CREATE TABLE IF NOT EXISTS visits (
   admitted_by            TEXT,
   discharged_at          TIMESTAMPTZ,
   created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT admitted_requires_ward CHECK (
-    status <> 'Admitted' OR ward IS NOT NULL
-  )
+  updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- An admission must name a ward; a discharge must clear it.
+  CONSTRAINT admitted_requires_ward
+    CHECK (status <> 'Admitted' OR ward IS NOT NULL)
 );
-CREATE INDEX IF NOT EXISTS idx_visits_patient ON visits(patient_id, visit_date DESC);
-CREATE INDEX IF NOT EXISTS idx_visits_status  ON visits(status, visit_date DESC);
-CREATE INDEX IF NOT EXISTS idx_visits_ward    ON visits(ward) WHERE status = 'Admitted';
 
 -- ----------------------------------------------------------------------------
--- Vitals
+-- Vitals. Unit suffixes are deliberate: a naked `spo2` invites a mix-up between
+-- percent and fraction. Ranges are wide enough for real clinical outliers.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS vitals (
-  id                TEXT PRIMARY KEY,
-  visit_id          TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
-  patient_id        TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
-  recorded_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-  nurse_id          TEXT REFERENCES users(id) ON DELETE SET NULL,
-  nurse_name        TEXT NOT NULL DEFAULT '',
-  temperature_c     NUMERIC(4,1) NOT NULL,
-  systolic_bp       INTEGER NOT NULL,
-  diastolic_bp      INTEGER NOT NULL,
-  pulse_bpm         INTEGER NOT NULL,
-  respiratory_rate  INTEGER NOT NULL,
-  spo2_pct          INTEGER NOT NULL CHECK (spo2_pct BETWEEN 0 AND 100),
-  weight_kg         NUMERIC(5,1) NOT NULL,
-  height_m          NUMERIC(4,2) NOT NULL,
-  bmi               NUMERIC(4,1) NOT NULL,
-  bmi_category      TEXT NOT NULL,
-  pain_score        INTEGER CHECK (pain_score BETWEEN 0 AND 10),
-  nursing_notes     TEXT,
-  nursing_care_plan TEXT,
+  id                 TEXT PRIMARY KEY,
+  visit_id           TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
+  patient_id         TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+  recorded_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  nurse_id           TEXT REFERENCES users(id) ON DELETE SET NULL,
+  nurse_name         TEXT NOT NULL DEFAULT '',
+  temperature_c      NUMERIC(4,1) NOT NULL CHECK (temperature_c BETWEEN 25 AND 45),
+  systolic_bp        INTEGER NOT NULL CHECK (systolic_bp BETWEEN 40 AND 300),
+  diastolic_bp       INTEGER NOT NULL CHECK (diastolic_bp BETWEEN 20 AND 200),
+  pulse_bpm          INTEGER NOT NULL CHECK (pulse_bpm BETWEEN 20 AND 250),
+  respiratory_rate   INTEGER NOT NULL CHECK (respiratory_rate BETWEEN 4 AND 80),
+  spo2_pct           INTEGER NOT NULL CHECK (spo2_pct BETWEEN 0 AND 100),
+  weight_kg          NUMERIC(5,1) NOT NULL CHECK (weight_kg > 0),
+  height_m           NUMERIC(4,2) NOT NULL CHECK (height_m > 0),
+  bmi                NUMERIC(4,1) NOT NULL CHECK (bmi >= 0),
+  bmi_category       TEXT NOT NULL CHECK (bmi_category IN (
+                       'Underweight','Normal','Overweight',
+                       'Obese Class I','Obese Class II','Obese Class III')),
+  pain_score         INTEGER CHECK (pain_score BETWEEN 0 AND 10),
+  nursing_notes      TEXT,
+  nursing_care_plan  TEXT,
   nursing_procedures TEXT[] NOT NULL DEFAULT '{}',
-  alerts            TEXT[] NOT NULL DEFAULT '{}'
+  alerts             TEXT[] NOT NULL DEFAULT '{}',
+  -- Diastolic must not exceed systolic.
+  CONSTRAINT bp_ordering CHECK (diastolic_bp <= systolic_bp)
 );
-CREATE INDEX IF NOT EXISTS idx_vitals_visit ON vitals(visit_id);
 
 -- ----------------------------------------------------------------------------
--- Consultations + ICD-10 diagnoses
+-- Consultations. The examination is flattened into six columns (the front end
+-- nests it); ICD-10 diagnoses live in clinical_diagnoses.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS consultations (
   id                          TEXT PRIMARY KEY,
-  visit_id                    TEXT NOT NULL UNIQUE REFERENCES visits(id) ON DELETE CASCADE,
+  visit_id                    TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
   patient_id                  TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
   physician_id                TEXT REFERENCES users(id) ON DELETE SET NULL,
   physician_name              TEXT NOT NULL DEFAULT '',
@@ -205,23 +294,27 @@ CREATE TABLE IF NOT EXISTS consultations (
   assessment                  TEXT NOT NULL DEFAULT '',
   plan                        TEXT NOT NULL DEFAULT '',
   follow_up_date              DATE,
-  clinical_notes              TEXT NOT NULL DEFAULT ''
+  clinical_notes              TEXT NOT NULL DEFAULT '',
+  created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS clinical_diagnoses (
-  id             TEXT PRIMARY KEY,
+  id              TEXT PRIMARY KEY,
   consultation_id TEXT NOT NULL REFERENCES consultations(id) ON DELETE CASCADE,
-  code           TEXT NOT NULL,                             -- ICD-10 e.g. 'B50.9'
-  description    TEXT NOT NULL,
-  diag_type      TEXT NOT NULL CHECK (diag_type IN ('Primary','Secondary'))
+  code            TEXT NOT NULL,                      -- ICD-10, e.g. 'B50.9'
+  description     TEXT NOT NULL,
+  diag_type       TEXT NOT NULL CHECK (diag_type IN ('Primary','Secondary'))
 );
-CREATE INDEX IF NOT EXISTS idx_diagnoses_consult ON clinical_diagnoses(consultation_id);
 
--- ----------------------------------------------------------------------------
--- Laboratory catalogue (5 departments), parameters, orders, results
--- ----------------------------------------------------------------------------
+
+-- ============================================================================
+-- 4. LABORATORY
+-- ============================================================================
+
+-- Catalogue: 5 departments, priced.
 CREATE TABLE IF NOT EXISTS lab_investigations (
-  id              TEXT PRIMARY KEY,                        -- e.g. 'LAB-HEM-01'
+  id              TEXT PRIMARY KEY,                   -- 'LAB-HEM-01'
   code            TEXT NOT NULL UNIQUE,
   name            TEXT NOT NULL,
   category        TEXT NOT NULL CHECK (category IN (
@@ -231,9 +324,10 @@ CREATE TABLE IF NOT EXISTS lab_investigations (
   sample_type     TEXT NOT NULL DEFAULT '',
   turnaround_time TEXT NOT NULL DEFAULT '',
   description     TEXT,
-  active          BOOLEAN NOT NULL DEFAULT TRUE
+  active          BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_lab_inv_category ON lab_investigations(category);
 
 CREATE TABLE IF NOT EXISTS lab_parameters (
   id               TEXT PRIMARY KEY,
@@ -245,41 +339,45 @@ CREATE TABLE IF NOT EXISTS lab_parameters (
   options          TEXT[] NOT NULL DEFAULT '{}'
 );
 
+-- One request per physician order; the individual tests are lab_test_orders.
 CREATE TABLE IF NOT EXISTS lab_requests (
-  id                 TEXT PRIMARY KEY,
-  visit_id           TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
-  patient_id         TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
-  physician_id       TEXT REFERENCES users(id) ON DELETE SET NULL,
-  physician_name     TEXT NOT NULL DEFAULT '',
-  requested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-  priority           TEXT NOT NULL CHECK (priority IN ('Routine','Urgent','STAT')),
+  id                  TEXT PRIMARY KEY,
+  visit_id            TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
+  patient_id          TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+  physician_id        TEXT REFERENCES users(id) ON DELETE SET NULL,
+  physician_name      TEXT NOT NULL DEFAULT '',
+  requested_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  priority            TEXT NOT NULL CHECK (priority IN ('Routine','Urgent','STAT')),
   clinical_indication TEXT,
-  payment_status     TEXT NOT NULL DEFAULT 'Unpaid' CHECK (payment_status IN ('Unpaid','Paid')),
-  total_price        NUMERIC(12,2) NOT NULL DEFAULT 0
+  payment_status      TEXT NOT NULL DEFAULT 'Unpaid' CHECK (payment_status IN ('Unpaid','Paid')),
+  total_price         NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (total_price >= 0),
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_lab_req_patient ON lab_requests(patient_id);
-CREATE INDEX IF NOT EXISTS idx_lab_req_visit   ON lab_requests(visit_id);
 
 CREATE TABLE IF NOT EXISTS lab_test_orders (
-  id               TEXT PRIMARY KEY,
-  request_id       TEXT NOT NULL REFERENCES lab_requests(id) ON DELETE CASCADE,
+  id                TEXT PRIMARY KEY,
+  request_id        TEXT NOT NULL REFERENCES lab_requests(id) ON DELETE CASCADE,
   test_definition_id TEXT REFERENCES lab_investigations(id) ON DELETE SET NULL,
-  test_name        TEXT NOT NULL,
-  category         TEXT NOT NULL,
-  price            NUMERIC(12,2) NOT NULL,
-  sample_type      TEXT NOT NULL DEFAULT '',
-  status           TEXT NOT NULL CHECK (status IN (
-                     'Requested','Paid','Sample Collected','Processing',
-                     'Result Entered','Verified','Released')),
-  collected_at     TIMESTAMPTZ,
-  scientist_id     TEXT REFERENCES users(id) ON DELETE SET NULL,
-  scientist_name   TEXT,
-  verified_by      TEXT,
-  released_at      TIMESTAMPTZ,
-  comments         TEXT,
-  critical_alert   BOOLEAN NOT NULL DEFAULT FALSE
+  test_name         TEXT NOT NULL,
+  category          TEXT NOT NULL CHECK (category IN (
+                      'HEMATOLOGY','MICROBIOLOGY','CHEMICAL_PATHOLOGY',
+                      'HISTOPATHOLOGY','MOLECULAR')),
+  price             NUMERIC(12,2) NOT NULL CHECK (price >= 0),
+  sample_type       TEXT NOT NULL DEFAULT '',
+  status            TEXT NOT NULL CHECK (status IN (
+                      'Requested','Paid','Sample Collected','Processing',
+                      'Result Entered','Verified','Released')),
+  collected_at      TIMESTAMPTZ,
+  scientist_id      TEXT REFERENCES users(id) ON DELETE SET NULL,
+  scientist_name    TEXT,
+  verified_by       TEXT,
+  released_at       TIMESTAMPTZ,
+  comments          TEXT,
+  critical_alert    BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_lab_orders_status ON lab_test_orders(status, category);
 
 CREATE TABLE IF NOT EXISTS lab_results (
   id              TEXT PRIMARY KEY,
@@ -292,22 +390,25 @@ CREATE TABLE IF NOT EXISTS lab_results (
   flag            TEXT NOT NULL CHECK (flag IN ('Normal','Low','High','Critical','Abnormal'))
 );
 
--- ----------------------------------------------------------------------------
--- Pharmacy: formulary + prescriptions + dispensing
--- ----------------------------------------------------------------------------
+
+-- ============================================================================
+-- 5. PHARMACY
+-- ============================================================================
+
 CREATE TABLE IF NOT EXISTS medications (
-  id              TEXT PRIMARY KEY,                        -- e.g. 'MED-001'
-  name            TEXT NOT NULL,
-  generic_name    TEXT NOT NULL,
-  category        TEXT NOT NULL DEFAULT '',
-  dosage_form     TEXT NOT NULL DEFAULT '',
-  strength        TEXT NOT NULL DEFAULT '',
-  unit_price      NUMERIC(12,2) NOT NULL CHECK (unit_price >= 0),
-  current_stock   INTEGER NOT NULL DEFAULT 0 CHECK (current_stock >= 0),
-  min_stock_alert INTEGER NOT NULL DEFAULT 0,
-  dispensing_unit TEXT NOT NULL DEFAULT ''
+  id               TEXT PRIMARY KEY,                  -- 'MED-001'
+  name             TEXT NOT NULL,
+  generic_name     TEXT NOT NULL,
+  category         TEXT NOT NULL DEFAULT '',
+  dosage_form      TEXT NOT NULL DEFAULT '',
+  strength         TEXT NOT NULL DEFAULT '',
+  unit_price       NUMERIC(12,2) NOT NULL CHECK (unit_price >= 0),
+  current_stock    INTEGER NOT NULL DEFAULT 0 CHECK (current_stock >= 0),
+  min_stock_alert  INTEGER NOT NULL DEFAULT 0 CHECK (min_stock_alert >= 0),
+  dispensing_unit  TEXT NOT NULL DEFAULT '',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_meds_name ON medications(name);
 
 CREATE TABLE IF NOT EXISTS prescriptions (
   id             TEXT PRIMARY KEY,
@@ -317,31 +418,42 @@ CREATE TABLE IF NOT EXISTS prescriptions (
   physician_name TEXT NOT NULL DEFAULT '',
   prescribed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   status         TEXT NOT NULL CHECK (status IN ('Pending','Partially Dispensed','Completed','Cancelled')),
-  total_price    NUMERIC(12,2) NOT NULL DEFAULT 0
+  total_price    NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (total_price >= 0),
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_rx_patient ON prescriptions(patient_id);
 
+-- dispensed_at was missing from the original schema even though the application
+-- tracks it; without it, "when was this last dispensed?" is unanswerable.
 CREATE TABLE IF NOT EXISTS prescription_items (
-  id                   TEXT PRIMARY KEY,
-  prescription_id      TEXT NOT NULL REFERENCES prescriptions(id) ON DELETE CASCADE,
-  medication_id        TEXT REFERENCES medications(id) ON DELETE SET NULL,
-  medication_name      TEXT NOT NULL,
-  dosage               TEXT NOT NULL DEFAULT '',
-  route                TEXT NOT NULL DEFAULT '',
-  frequency            TEXT NOT NULL DEFAULT '',
-  duration             TEXT NOT NULL DEFAULT '',
-  quantity_prescribed  INTEGER NOT NULL CHECK (quantity_prescribed > 0),
-  quantity_dispensed   INTEGER NOT NULL DEFAULT 0,
-  unit_price           NUMERIC(12,2) NOT NULL,
-  total_price          NUMERIC(12,2) NOT NULL,
-  instructions         TEXT NOT NULL DEFAULT '',
-  dispense_status      TEXT NOT NULL CHECK (dispense_status IN ('Pending','Dispensed','Partially Dispensed','Out of Stock')),
-  pharmacist_notes     TEXT
+  id                  TEXT PRIMARY KEY,
+  prescription_id     TEXT NOT NULL REFERENCES prescriptions(id) ON DELETE CASCADE,
+  medication_id       TEXT REFERENCES medications(id) ON DELETE SET NULL,
+  medication_name     TEXT NOT NULL,
+  dosage              TEXT NOT NULL DEFAULT '',
+  route               TEXT NOT NULL DEFAULT '',
+  frequency           TEXT NOT NULL DEFAULT '',
+  duration            TEXT NOT NULL DEFAULT '',
+  quantity_prescribed INTEGER NOT NULL CHECK (quantity_prescribed > 0),
+  quantity_dispensed  INTEGER NOT NULL DEFAULT 0 CHECK (quantity_dispensed >= 0),
+  unit_price          NUMERIC(12,2) NOT NULL CHECK (unit_price >= 0),
+  total_price         NUMERIC(12,2) NOT NULL CHECK (total_price >= 0),
+  instructions        TEXT NOT NULL DEFAULT '',
+  dispense_status     TEXT NOT NULL CHECK (dispense_status IN ('Pending','Dispensed','Partially Dispensed','Out of Stock')),
+  pharmacist_notes    TEXT,
+  dispensed_at        TIMESTAMPTZ,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- You can never dispense more than was prescribed.
+  CONSTRAINT dispensed_within_prescribed
+    CHECK (quantity_dispensed <= quantity_prescribed)
 );
 
--- ----------------------------------------------------------------------------
--- Service price list (Master Pricing Matrix — Administration only)
--- ----------------------------------------------------------------------------
+
+-- ============================================================================
+-- 6. BILLING
+-- ============================================================================
+
 CREATE TABLE IF NOT EXISTS service_prices (
   id             TEXT PRIMARY KEY,
   name           TEXT NOT NULL,
@@ -349,104 +461,63 @@ CREATE TABLE IF NOT EXISTS service_prices (
                    'Consultation','Laboratory','Pharmacy','Nursing','Procedure','Other')),
   price          NUMERIC(12,2) NOT NULL CHECK (price >= 0),
   active         BOOLEAN NOT NULL DEFAULT TRUE,
-  effective_date DATE NOT NULL DEFAULT CURRENT_DATE
+  effective_date DATE NOT NULL DEFAULT CURRENT_DATE,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- ----------------------------------------------------------------------------
--- Unified billing: one invoice per visit, part payments, receipts
--- ----------------------------------------------------------------------------
+-- One invoice per visit (enforced by UNIQUE below). The money columns are
+-- maintained by recalc_invoice(); write `discount` and the line items, and let
+-- the database do the arithmetic.
 CREATE TABLE IF NOT EXISTS invoices (
-  id              TEXT PRIMARY KEY,                        -- e.g. 'FC-INV-2026-001'
-  visit_id        TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
-  patient_id      TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
-  invoice_date    DATE NOT NULL DEFAULT CURRENT_DATE,
-  subtotal        NUMERIC(12,2) NOT NULL DEFAULT 0,
-  discount        NUMERIC(12,2) NOT NULL DEFAULT 0,
-  total           NUMERIC(12,2) NOT NULL DEFAULT 0,
-  paid_amount     NUMERIC(12,2) NOT NULL DEFAULT 0,
-  balance         NUMERIC(12,2) NOT NULL DEFAULT 0,
-  payment_status  TEXT NOT NULL CHECK (payment_status IN ('Unpaid','Partially Paid','Paid','Refunded')),
+  id                 TEXT PRIMARY KEY,               -- 'FC-INV-2026-001'
+  visit_id           TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
+  patient_id         TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+  invoice_date       DATE NOT NULL DEFAULT CURRENT_DATE,
+  subtotal           NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (subtotal >= 0),
+  discount           NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (discount >= 0),
+  total              NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (total >= 0),
+  paid_amount        NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (paid_amount >= 0),
+  balance            NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (balance >= 0),
+  payment_status     TEXT NOT NULL DEFAULT 'Unpaid'
+                       CHECK (payment_status IN ('Unpaid','Partially Paid','Paid','Refunded')),
   require_prepayment BOOLEAN NOT NULL DEFAULT FALSE,
-  UNIQUE (visit_id)
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_invoices_patient ON invoices(patient_id);
-CREATE INDEX IF NOT EXISTS idx_invoices_status  ON invoices(payment_status);
 
 CREATE TABLE IF NOT EXISTS invoice_items (
   id               TEXT PRIMARY KEY,
   invoice_id       TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
-  service_category TEXT NOT NULL,
+  service_category TEXT NOT NULL CHECK (service_category IN (
+                     'Consultation','Laboratory','Pharmacy','Nursing','Procedure','Other')),
   description      TEXT NOT NULL,
   quantity         INTEGER NOT NULL CHECK (quantity > 0),
-  unit_price       NUMERIC(12,2) NOT NULL,
-  total_price      NUMERIC(12,2) NOT NULL,
-  reference_id     TEXT
+  unit_price       NUMERIC(12,2) NOT NULL CHECK (unit_price >= 0),
+  total_price      NUMERIC(12,2) NOT NULL CHECK (total_price >= 0),
+  reference_id     TEXT,                             -- source order/test id
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON invoice_items(invoice_id);
 
+-- Payments are a receipt trail: append-only, never edited or removed.
 CREATE TABLE IF NOT EXISTS payments (
-  id                    TEXT PRIMARY KEY,                  -- e.g. 'PMT-...'
+  id                    TEXT PRIMARY KEY,           -- 'PMT-...'
   invoice_id            TEXT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
-  receipt_number        TEXT NOT NULL UNIQUE,              -- e.g. 'RCP-2026-1001'
+  receipt_number        TEXT NOT NULL UNIQUE,       -- 'RCP-2026-1001'
   paid_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
   amount                NUMERIC(12,2) NOT NULL CHECK (amount > 0),
   payment_method        TEXT NOT NULL CHECK (payment_method IN ('Cash','Transfer','POS','Card','Insurance')),
   received_by           TEXT NOT NULL DEFAULT '',
   bank_name             TEXT,
-  transaction_reference TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id);
-
--- ----------------------------------------------------------------------------
--- Online bookings / pre-registration codes
--- ----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS online_bookings (
-  id                    TEXT PRIMARY KEY,
-  patient_code          TEXT NOT NULL UNIQUE,              -- e.g. 'REG-7821'
-  first_name            TEXT NOT NULL,
-  middle_name           TEXT,
-  last_name             TEXT NOT NULL,
-  dob                   DATE NOT NULL,
-  age                   INTEGER NOT NULL,
-  sex                   TEXT NOT NULL,
-  phone                 TEXT NOT NULL,
-  email                 TEXT,
-  address               TEXT NOT NULL DEFAULT '',
-  reason_for_appointment TEXT NOT NULL DEFAULT '',
-  preferred_date        DATE NOT NULL,
-  preferred_time        TEXT NOT NULL DEFAULT '',
-  booked_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-  status                TEXT NOT NULL CHECK (status IN ('Pending Arrival','Completed','Cancelled'))
+  transaction_reference TEXT,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- ----------------------------------------------------------------------------
--- Laboratory bench stock (reagents, tubes, kits, stains)
--- ----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS lab_stock_items (
-  id              TEXT PRIMARY KEY,
-  name            TEXT NOT NULL,
-  category        TEXT NOT NULL CHECK (category IN ('Reagents','Consumables','Tubes','Kits','Stains')),
-  current_stock   INTEGER NOT NULL DEFAULT 0 CHECK (current_stock >= 0),
-  unit            TEXT NOT NULL DEFAULT '',
-  unit_cost       NUMERIC(12,2) NOT NULL DEFAULT 0,
-  min_alert_level INTEGER NOT NULL DEFAULT 0,
-  last_used_at    TIMESTAMPTZ
-);
 
-CREATE TABLE IF NOT EXISTS lab_stock_requests (
-  id                 TEXT PRIMARY KEY,
-  item_id            TEXT REFERENCES lab_stock_items(id) ON DELETE SET NULL,
-  item_name          TEXT NOT NULL,
-  quantity_requested INTEGER NOT NULL CHECK (quantity_requested > 0),
-  requested_by       TEXT NOT NULL DEFAULT '',
-  requested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-  status             TEXT NOT NULL CHECK (status IN ('Pending','Approved','Dispatched')),
-  urgency            TEXT NOT NULL CHECK (urgency IN ('Routine','Urgent'))
-);
+-- ============================================================================
+-- 7. RADIOLOGY AND PHYSIOTHERAPY
+-- ============================================================================
 
--- ----------------------------------------------------------------------------
--- Radiology + Physiotherapy orders
--- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS radiology_orders (
   id                 TEXT PRIMARY KEY,
   visit_id           TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
@@ -462,85 +533,86 @@ CREATE TABLE IF NOT EXISTS radiology_orders (
   reported_at        TIMESTAMPTZ,
   film_size          TEXT,
   contrast_used      BOOLEAN NOT NULL DEFAULT FALSE,
-  price              NUMERIC(12,2) NOT NULL,
+  price              NUMERIC(12,2) NOT NULL CHECK (price >= 0),
   status             TEXT NOT NULL CHECK (status IN ('Requested','Completed','Report Ready')),
-  invoice_id         TEXT REFERENCES invoices(id) ON DELETE SET NULL
+  invoice_id         TEXT REFERENCES invoices(id) ON DELETE SET NULL,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_radio_patient ON radiology_orders(patient_id);
 
 CREATE TABLE IF NOT EXISTS physiotherapy_orders (
-  id                 TEXT PRIMARY KEY,
-  visit_id           TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
-  patient_id         TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
-  ordered_by         TEXT NOT NULL DEFAULT '',
-  ordered_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-  service_name       TEXT NOT NULL,
-  category           TEXT CHECK (category IN ('Musculoskeletal','Neurological','Sports','Pediatric','General')),
-  sessions           INTEGER NOT NULL CHECK (sessions > 0),
-  sessions_completed INTEGER NOT NULL DEFAULT 0,
-  progress_notes     TEXT,
-  treated_by         TEXT,
-  last_session_date  DATE,
-  price              NUMERIC(12,2) NOT NULL,
+  id                  TEXT PRIMARY KEY,
+  visit_id            TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
+  patient_id          TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+  ordered_by          TEXT NOT NULL DEFAULT '',
+  ordered_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  service_name        TEXT NOT NULL,
+  category            TEXT CHECK (category IN ('Musculoskeletal','Neurological','Sports','Pediatric','General')),
+  sessions            INTEGER NOT NULL CHECK (sessions > 0),
+  sessions_completed  INTEGER NOT NULL DEFAULT 0 CHECK (sessions_completed >= 0),
+  progress_notes      TEXT,
+  treated_by          TEXT,
+  last_session_date   DATE,
+  price               NUMERIC(12,2) NOT NULL CHECK (price >= 0),
   clinical_indication TEXT,
-  status             TEXT NOT NULL CHECK (status IN ('Requested','In Progress','Completed')),
-  invoice_id         TEXT REFERENCES invoices(id) ON DELETE SET NULL
+  status              TEXT NOT NULL CHECK (status IN ('Requested','In Progress','Completed')),
+  invoice_id          TEXT REFERENCES invoices(id) ON DELETE SET NULL,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT sessions_completed_within_total
+    CHECK (sessions_completed <= sessions)
 );
-CREATE INDEX IF NOT EXISTS idx_physio_patient ON physiotherapy_orders(patient_id);
 
--- ----------------------------------------------------------------------------
--- Clinical consumables — every section incl. Laboratory & Pharmacy.
--- Sections request / log usage; usage subtracts stock and may bill a visit.
--- Only Administration changes prices (app-level rule).
--- ----------------------------------------------------------------------------
+
+-- ============================================================================
+-- 8. CONSUMABLES
+-- ============================================================================
+
 CREATE TABLE IF NOT EXISTS clinical_consumables (
-  id              TEXT PRIMARY KEY,                        -- e.g. 'CSM-001'
+  id              TEXT PRIMARY KEY,                   -- 'CSM-001'
   name            TEXT NOT NULL,
   category        TEXT NOT NULL CHECK (category IN (
                     'Nursing','Consultation','Surgical','Emergency','Radiology',
                     'Physiotherapy','Laboratory','Pharmacy','General')),
   unit            TEXT NOT NULL DEFAULT '',
   current_stock   INTEGER NOT NULL DEFAULT 0 CHECK (current_stock >= 0),
-  min_alert_level INTEGER NOT NULL DEFAULT 0,
+  min_alert_level INTEGER NOT NULL DEFAULT 0 CHECK (min_alert_level >= 0),
   unit_price      NUMERIC(12,2) NOT NULL CHECK (unit_price >= 0),
-  cost_price      NUMERIC(12,2) NOT NULL DEFAULT 0,
-  last_updated    TIMESTAMPTZ NOT NULL DEFAULT now()
+  cost_price      NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (cost_price >= 0),
+  last_updated    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_consumables_category ON clinical_consumables(category);
 
 CREATE TABLE IF NOT EXISTS consumable_requests (
   id                 TEXT PRIMARY KEY,
-  consumable_id      TEXT REFERENCES clinical_consumables(id) ON DELETE SET NULL,
-  consumable_name    TEXT NOT NULL,
-  section            TEXT NOT NULL DEFAULT 'General',
-  quantity_requested INTEGER NOT NULL CHECK (quantity_requested > 0),
-  requested_by       TEXT NOT NULL DEFAULT '',
-  requested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-  status             TEXT NOT NULL CHECK (status IN ('Pending','Approved','Dispatched')),
-  urgency            TEXT NOT NULL CHECK (urgency IN ('Routine','Urgent'))
+  consumable_id       TEXT REFERENCES clinical_consumables(id) ON DELETE SET NULL,
+  consumable_name     TEXT NOT NULL,
+  section             TEXT NOT NULL DEFAULT 'General',
+  quantity_requested  INTEGER NOT NULL CHECK (quantity_requested > 0),
+  requested_by        TEXT NOT NULL DEFAULT '',
+  requested_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  status              TEXT NOT NULL CHECK (status IN ('Pending','Approved','Dispatched')),
+  urgency             TEXT NOT NULL CHECK (urgency IN ('Routine','Urgent')),
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_consumable_req_status ON consumable_requests(status);
 
 CREATE TABLE IF NOT EXISTS consumable_usage (
-  id            TEXT PRIMARY KEY,
-  consumable_id TEXT REFERENCES clinical_consumables(id) ON DELETE SET NULL,
-  consumable_name TEXT NOT NULL,
-  section       TEXT NOT NULL DEFAULT 'General',
-  quantity_used INTEGER NOT NULL CHECK (quantity_used > 0),
-  unit_price    NUMERIC(12,2) NOT NULL,
-  total_charge  NUMERIC(12,2) NOT NULL,
-  used_by       TEXT NOT NULL DEFAULT '',
-  used_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-  patient_id    TEXT REFERENCES patients(id) ON DELETE SET NULL,
-  visit_id      TEXT REFERENCES visits(id) ON DELETE SET NULL,
-  invoice_id    TEXT REFERENCES invoices(id) ON DELETE SET NULL
+  id               TEXT PRIMARY KEY,
+  consumable_id    TEXT REFERENCES clinical_consumables(id) ON DELETE SET NULL,
+  consumable_name  TEXT NOT NULL,
+  section          TEXT NOT NULL DEFAULT 'General',
+  quantity_used    INTEGER NOT NULL CHECK (quantity_used > 0),
+  unit_price       NUMERIC(12,2) NOT NULL CHECK (unit_price >= 0),
+  total_charge     NUMERIC(12,2) NOT NULL CHECK (total_charge >= 0),
+  used_by          TEXT NOT NULL DEFAULT '',
+  used_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  patient_id       TEXT REFERENCES patients(id) ON DELETE SET NULL,
+  visit_id         TEXT REFERENCES visits(id) ON DELETE SET NULL,
+  invoice_id       TEXT REFERENCES invoices(id) ON DELETE SET NULL,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_consumable_usage_section ON consumable_usage(section, used_at DESC);
 
--- ----------------------------------------------------------------------------
--- Pharmacy drug reorder requests (unique Stock Requests page).
--- Dispatching adds the quantity back into formulary stock.
--- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS medication_requests (
   id                 TEXT PRIMARY KEY,
   medication_id      TEXT REFERENCES medications(id) ON DELETE SET NULL,
@@ -549,50 +621,95 @@ CREATE TABLE IF NOT EXISTS medication_requests (
   requested_by       TEXT NOT NULL DEFAULT '',
   requested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   status             TEXT NOT NULL CHECK (status IN ('Pending','Approved','Dispatched')),
-  urgency            TEXT NOT NULL CHECK (urgency IN ('Routine','Urgent'))
+  urgency            TEXT NOT NULL CHECK (urgency IN ('Routine','Urgent')),
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_medication_req_status ON medication_requests(status);
 
--- ----------------------------------------------------------------------------
--- Immutable audit log
--- ----------------------------------------------------------------------------
+
+-- ============================================================================
+-- 9. AUDIT TRAIL, SETTINGS, BOOKINGS AND BENCH STOCK
+-- ============================================================================
+
+-- Append-only. `logged_at` is the audit timestamp; the front end calls it
+-- `timestamp`, which the row mapper translates.
 CREATE TABLE IF NOT EXISTS audit_logs (
-  id          TEXT PRIMARY KEY,
-  logged_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  user_id     TEXT REFERENCES users(id) ON DELETE SET NULL,
-  user_name   TEXT NOT NULL DEFAULT '',
-  user_role   TEXT NOT NULL DEFAULT '',
-  patient_id  TEXT REFERENCES patients(id) ON DELETE SET NULL,
+  id           TEXT PRIMARY KEY,
+  logged_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  user_id      TEXT REFERENCES users(id) ON DELETE SET NULL,
+  user_name    TEXT NOT NULL DEFAULT '',
+  user_role    TEXT NOT NULL DEFAULT '',
+  patient_id   TEXT REFERENCES patients(id) ON DELETE SET NULL,
   patient_name TEXT,
-  action      TEXT NOT NULL,
-  category    TEXT NOT NULL CHECK (category IN ('PATIENT','CLINICAL','LABORATORY','PHARMACY','BILLING','ADMIN')),
-  details     TEXT NOT NULL DEFAULT '',
-  metadata    JSONB NOT NULL DEFAULT '{}'
+  action       TEXT NOT NULL,
+  category     TEXT NOT NULL CHECK (category IN ('PATIENT','CLINICAL','LABORATORY','PHARMACY','BILLING','ADMIN')),
+  details      TEXT NOT NULL DEFAULT '',
+  metadata     JSONB NOT NULL DEFAULT '{}'
 );
-CREATE INDEX IF NOT EXISTS idx_audit_patient ON audit_logs(patient_id, logged_at DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_action  ON audit_logs(action, logged_at DESC);
 
--- ----------------------------------------------------------------------------
--- System settings (single row)
--- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS online_bookings (
+  id                     TEXT PRIMARY KEY,
+  patient_code           TEXT NOT NULL UNIQUE,       -- 'REG-7821'
+  first_name             TEXT NOT NULL,
+  middle_name            TEXT,
+  last_name              TEXT NOT NULL,
+  dob                    DATE NOT NULL,
+  age                    INTEGER NOT NULL CHECK (age BETWEEN 0 AND 130),
+  sex                    TEXT NOT NULL CHECK (sex IN ('Male','Female','Other')),
+  phone                  TEXT NOT NULL,
+  email                  TEXT,
+  address                TEXT NOT NULL DEFAULT '',
+  reason_for_appointment TEXT NOT NULL DEFAULT '',
+  preferred_date         DATE NOT NULL,
+  preferred_time         TEXT NOT NULL DEFAULT '',
+  booked_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  status                 TEXT NOT NULL CHECK (status IN ('Pending Arrival','Completed','Cancelled')),
+  created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS lab_stock_items (
+  id              TEXT PRIMARY KEY,
+  name            TEXT NOT NULL,
+  category        TEXT NOT NULL CHECK (category IN ('Reagents','Consumables','Tubes','Kits','Stains')),
+  current_stock   INTEGER NOT NULL DEFAULT 0 CHECK (current_stock >= 0),
+  unit            TEXT NOT NULL DEFAULT '',
+  unit_cost       NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (unit_cost >= 0),
+  min_alert_level INTEGER NOT NULL DEFAULT 0 CHECK (min_alert_level >= 0),
+  last_used_at    TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS lab_stock_requests (
+  id                 TEXT PRIMARY KEY,
+  item_id            TEXT REFERENCES lab_stock_items(id) ON DELETE SET NULL,
+  item_name          TEXT NOT NULL,
+  quantity_requested INTEGER NOT NULL CHECK (quantity_requested > 0),
+  requested_by       TEXT NOT NULL DEFAULT '',
+  requested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  status             TEXT NOT NULL CHECK (status IN ('Pending','Approved','Dispatched')),
+  urgency            TEXT NOT NULL CHECK (urgency IN ('Routine','Urgent')),
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Single-row tables: id is pinned to 1 by a CHECK.
 CREATE TABLE IF NOT EXISTS system_settings (
-  id                       INTEGER PRIMARY KEY CHECK (id = 1),
-  hospital_name            TEXT NOT NULL DEFAULT 'FatClinic & Medical Specialties',
-  tagline                  TEXT NOT NULL DEFAULT '',
-  address                  TEXT NOT NULL DEFAULT '',
-  phone                    TEXT NOT NULL DEFAULT '',
-  email                    TEXT NOT NULL DEFAULT '',
-  currency                 TEXT NOT NULL DEFAULT '₦',
-  currency_code            TEXT NOT NULL DEFAULT 'NGN',
-  invoice_prefix           TEXT NOT NULL DEFAULT 'FC-INV',
-  patient_prefix           TEXT NOT NULL DEFAULT 'FC',
-  inactivity_timeout_minutes INTEGER NOT NULL DEFAULT 5
+  id                         INTEGER PRIMARY KEY CHECK (id = 1),
+  hospital_name              TEXT NOT NULL DEFAULT 'FatClinic & Medical Specialties',
+  tagline                    TEXT NOT NULL DEFAULT '',
+  address                    TEXT NOT NULL DEFAULT '',
+  phone                      TEXT NOT NULL DEFAULT '',
+  email                      TEXT NOT NULL DEFAULT '',
+  currency                   TEXT NOT NULL DEFAULT '₦',
+  currency_code              TEXT NOT NULL DEFAULT 'NGN',
+  invoice_prefix             TEXT NOT NULL DEFAULT 'FC-INV',
+  patient_prefix             TEXT NOT NULL DEFAULT 'FC',
+  inactivity_timeout_minutes INTEGER NOT NULL DEFAULT 5 CHECK (inactivity_timeout_minutes > 0),
+  updated_at                 TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- ----------------------------------------------------------------------------
--- Receipt settings (single row) — every printed receipt/invoice detail.
--- Edited in Administration → Receipt Settings; consumed by all print outputs.
--- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS receipt_settings (
   id                    INTEGER PRIMARY KEY CHECK (id = 1),
   hospital_name         TEXT NOT NULL DEFAULT '',
@@ -612,87 +729,245 @@ CREATE TABLE IF NOT EXISTS receipt_settings (
   updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Cycle-safe foreign keys, added after every table exists.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_custom_roles_created_by') THEN
+    ALTER TABLE custom_roles ADD CONSTRAINT fk_custom_roles_created_by
+      FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_custom_roles_updated_by') THEN
+    ALTER TABLE custom_roles ADD CONSTRAINT fk_custom_roles_updated_by
+      FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+
 -- ============================================================================
--- DATABASE AUTOMATION — timestamps, immutability, integrity, invoice maths.
--- Guarantees that anything entered (app or direct SQL) is stored cleanly.
+-- 10. INDEXES
+-- ============================================================================
+-- Covers the columns the dashboards actually filter and sort on, plus every
+-- foreign key (PostgreSQL creates none for you).
 -- ============================================================================
 
--- updated_at columns (idempotent for existing installs)
-ALTER TABLE patients            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE visits              ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE consultations       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE medications         ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE lab_investigations  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE service_prices      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE invoices            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE clinical_consumables ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE lab_stock_items     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE prescriptions       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE lab_requests        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE receipt_settings    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- Identity
+CREATE INDEX IF NOT EXISTS idx_perm_nodes_parent        ON permission_nodes(parent_key);
+CREATE INDEX IF NOT EXISTS idx_role_permissions_key     ON role_permissions(permission_key);
+CREATE INDEX IF NOT EXISTS idx_role_permissions_granted ON role_permissions(granted_by);
+CREATE INDEX IF NOT EXISTS idx_custom_roles_created_by  ON custom_roles(created_by);
+CREATE INDEX IF NOT EXISTS idx_users_role               ON users(role);
+CREATE INDEX IF NOT EXISTS idx_users_active             ON users(active);
+CREATE INDEX IF NOT EXISTS idx_users_custom_role        ON users(custom_role_id);
+CREATE INDEX IF NOT EXISTS idx_users_auth_user          ON users(auth_user_id) WHERE auth_user_id IS NOT NULL;
 
--- Auto-touch updated_at on every change
+-- Patients
+CREATE INDEX IF NOT EXISTS idx_patients_name        ON patients(last_name, first_name);
+CREATE INDEX IF NOT EXISTS idx_patients_phone       ON patients(phone);
+CREATE INDEX IF NOT EXISTS idx_patients_registered  ON patients(registered_at DESC);
+
+-- Visits
+CREATE INDEX IF NOT EXISTS idx_visits_patient   ON visits(patient_id, visit_date DESC);
+CREATE INDEX IF NOT EXISTS idx_visits_status    ON visits(status, visit_date DESC);
+CREATE INDEX IF NOT EXISTS idx_visits_ward      ON visits(ward) WHERE status = 'Admitted';
+CREATE INDEX IF NOT EXISTS idx_visits_created   ON visits(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_visits_physician ON visits(attending_physician_id);
+CREATE INDEX IF NOT EXISTS idx_visits_nurse     ON visits(attending_nurse_id);
+
+-- Vitals
+CREATE INDEX IF NOT EXISTS idx_vitals_visit  ON vitals(visit_id);
+CREATE INDEX IF NOT EXISTS idx_vitals_patient ON vitals(patient_id, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vitals_nurse  ON vitals(nurse_id);
+
+-- Consultations
+CREATE INDEX IF NOT EXISTS idx_consultations_patient   ON consultations(patient_id, consultation_date DESC);
+CREATE INDEX IF NOT EXISTS idx_consultations_visit     ON consultations(visit_id);
+CREATE INDEX IF NOT EXISTS idx_consultations_physician ON consultations(physician_id);
+CREATE INDEX IF NOT EXISTS idx_diagnoses_consult       ON clinical_diagnoses(consultation_id);
+CREATE INDEX IF NOT EXISTS idx_diagnoses_code          ON clinical_diagnoses(code);
+
+-- Laboratory
+CREATE INDEX IF NOT EXISTS idx_lab_inv_category      ON lab_investigations(category);
+CREATE INDEX IF NOT EXISTS idx_lab_inv_active        ON lab_investigations(active);
+CREATE INDEX IF NOT EXISTS idx_lab_params_invest     ON lab_parameters(investigation_id);
+CREATE INDEX IF NOT EXISTS idx_lab_req_patient       ON lab_requests(patient_id);
+CREATE INDEX IF NOT EXISTS idx_lab_req_visit         ON lab_requests(visit_id);
+CREATE INDEX IF NOT EXISTS idx_lab_req_physician     ON lab_requests(physician_id);
+CREATE INDEX IF NOT EXISTS idx_lab_orders_status    ON lab_test_orders(status, category);
+CREATE INDEX IF NOT EXISTS idx_lab_orders_request   ON lab_test_orders(request_id);
+CREATE INDEX IF NOT EXISTS idx_lab_orders_scientist ON lab_test_orders(scientist_id);
+CREATE INDEX IF NOT EXISTS idx_lab_orders_critical  ON lab_test_orders(request_id) WHERE critical_alert;
+CREATE INDEX IF NOT EXISTS idx_lab_results_order    ON lab_results(test_order_id);
+
+-- Pharmacy
+CREATE INDEX IF NOT EXISTS idx_meds_name     ON medications(name);
+CREATE INDEX IF NOT EXISTS idx_rx_patient    ON prescriptions(patient_id);
+CREATE INDEX IF NOT EXISTS idx_rx_visit      ON prescriptions(visit_id);
+CREATE INDEX IF NOT EXISTS idx_rx_physician  ON prescriptions(physician_id);
+CREATE INDEX IF NOT EXISTS idx_rx_items_rx   ON prescription_items(prescription_id);
+CREATE INDEX IF NOT EXISTS idx_rx_items_med  ON prescription_items(medication_id);
+CREATE INDEX IF NOT EXISTS idx_med_req_status ON medication_requests(status);
+CREATE INDEX IF NOT EXISTS idx_med_req_med    ON medication_requests(medication_id);
+
+-- Billing
+CREATE INDEX IF NOT EXISTS idx_invoices_patient ON invoices(patient_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_visit   ON invoices(visit_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_status  ON invoices(payment_status);
+CREATE INDEX IF NOT EXISTS idx_invoices_date    ON invoices(invoice_date DESC);
+CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON invoice_items(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_invoice_items_ref     ON invoice_items(reference_id) WHERE reference_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_payments_invoice  ON payments(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_payments_paid_at  ON payments(paid_at DESC);
+CREATE INDEX IF NOT EXISTS idx_service_prices_cat ON service_prices(category, active);
+
+-- Imaging and physiotherapy
+CREATE INDEX IF NOT EXISTS idx_radio_patient   ON radiology_orders(patient_id);
+CREATE INDEX IF NOT EXISTS idx_radio_visit     ON radiology_orders(visit_id);
+CREATE INDEX IF NOT EXISTS idx_radio_status    ON radiology_orders(status);
+CREATE INDEX IF NOT EXISTS idx_radio_invoice   ON radiology_orders(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_physio_patient  ON physiotherapy_orders(patient_id);
+CREATE INDEX IF NOT EXISTS idx_physio_visit    ON physiotherapy_orders(visit_id);
+CREATE INDEX IF NOT EXISTS idx_physio_status   ON physiotherapy_orders(status);
+CREATE INDEX IF NOT EXISTS idx_physio_invoice  ON physiotherapy_orders(invoice_id);
+
+-- Consumables
+CREATE INDEX IF NOT EXISTS idx_consumables_category  ON clinical_consumables(category);
+CREATE INDEX IF NOT EXISTS idx_consumable_req_status ON consumable_requests(status);
+CREATE INDEX IF NOT EXISTS idx_consumable_req_item   ON consumable_requests(consumable_id);
+CREATE INDEX IF NOT EXISTS idx_consumable_use_section ON consumable_usage(section, used_at DESC);
+CREATE INDEX IF NOT EXISTS idx_consumable_use_pt     ON consumable_usage(patient_id);
+
+-- Audit, bookings, bench stock
+CREATE INDEX IF NOT EXISTS idx_audit_patient  ON audit_logs(patient_id, logged_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_action   ON audit_logs(action, logged_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logged   ON audit_logs(logged_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_category ON audit_logs(category, logged_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bookings_status ON online_bookings(status, preferred_date);
+CREATE INDEX IF NOT EXISTS idx_lab_stock_status ON lab_stock_requests(status);
+CREATE INDEX IF NOT EXISTS idx_lab_stock_item   ON lab_stock_requests(item_id);
+
+
+-- ============================================================================
+-- 11. FUNCTIONS AND TRIGGERS
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- touch_updated_at(): keep updated_at honest for every table that has one.
+-- Driven by a catalog scan, so a new table with updated_at is covered without
+-- editing this file.
+-- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger AS $$
 BEGIN
   NEW.updated_at := now();
   RETURN NEW;
-END; $$ LANGUAGE plpgsql;
+END;
+$$ LANGUAGE plpgsql;
 
-DO $$ DECLARE t TEXT; BEGIN
-  FOREACH t IN ARRAY ARRAY['users','patients','visits','consultations','medications',
-    'lab_investigations','service_prices','invoices','clinical_consumables',
-    'lab_stock_items','prescriptions','lab_requests','custom_roles','receipt_settings'] LOOP
-    EXECUTE format('DROP TRIGGER IF EXISTS trg_touch_%s ON %I', t, t);
-    EXECUTE format('CREATE TRIGGER trg_touch_%s BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION touch_updated_at()', t, t);
+DO $$
+DECLARE
+  t TEXT;
+BEGIN
+  FOR t IN
+    SELECT c.relname
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_attribute a ON a.attrelid = c.oid
+     WHERE n.nspname = 'public'
+       AND c.relkind = 'r'
+       AND a.attname = 'updated_at'
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+  LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS trg_touch_updated_at ON public.%I', t);
+    EXECUTE format(
+      'CREATE TRIGGER trg_touch_updated_at BEFORE UPDATE ON public.%I
+         FOR EACH ROW EXECUTE FUNCTION touch_updated_at()', t);
   END LOOP;
 END $$;
 
--- Audit log is immutable: no UPDATE or DELETE, ever
+-- ----------------------------------------------------------------------------
+-- prevent_audit_mutation(): the audit trail is append-only, full stop.
+-- Belt to the RLS braces in section 12.
+-- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION prevent_audit_mutation() RETURNS trigger AS $$
 BEGIN
-  RAISE EXCEPTION 'audit_logs is immutable: rows can only be INSERTed (attempted % on id=%)', TG_OP, COALESCE(OLD.id, NEW.id);
+  RAISE EXCEPTION 'audit_logs is append-only; % is not permitted', TG_OP;
   RETURN NULL;
-END; $$ LANGUAGE plpgsql;
+END;
+$$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_audit_immutable ON audit_logs;
 CREATE TRIGGER trg_audit_immutable
   BEFORE UPDATE OR DELETE ON audit_logs
   FOR EACH ROW EXECUTE FUNCTION prevent_audit_mutation();
 
--- Invoice maths in the database (mirrors the app formula exactly):
--- subtotal = SUM(items), total = subtotal - discount,
--- paid = SUM(payments), balance = total - paid, status derived.
+-- ----------------------------------------------------------------------------
+-- recalc_invoice(): the database owns invoice arithmetic.
+--
+-- Fixes a defect in the previous version, which tested `IF NOT FOUND` after the
+-- payments SELECT. An invoice with line items but no payments yet made that
+-- SELECT return zero rows, so recalculation returned early and subtotal/total
+-- were never populated. Existence is now checked explicitly.
+-- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION recalc_invoice(p_invoice_id TEXT) RETURNS void AS $$
 DECLARE
-  v_sub    NUMERIC(12,2);
-  v_disc   NUMERIC(12,2);
-  v_paid   NUMERIC(12,2);
-  v_total  NUMERIC(12,2);
-  v_bal    NUMERIC(12,2);
-  v_status TEXT;
+  v_exists   BOOLEAN;
+  v_sub      NUMERIC(12,2);
+  v_disc     NUMERIC(12,2);
+  v_paid     NUMERIC(12,2);
+  v_total    NUMERIC(12,2);
+  v_balance  NUMERIC(12,2);
+  v_status   TEXT;
+  v_current  TEXT;
 BEGIN
+  SELECT true, discount, payment_status
+    INTO v_exists, v_disc, v_current
+    FROM invoices
+   WHERE id = p_invoice_id;
+
+  -- Unknown invoice: nothing to do. (FOUND would be false for a valid invoice
+  -- that simply has no payments, which is the normal state for a new invoice.)
+  IF NOT COALESCE(v_exists, false) THEN
+    RETURN;
+  END IF;
+
   SELECT COALESCE(SUM(total_price), 0) INTO v_sub  FROM invoice_items WHERE invoice_id = p_invoice_id;
-  SELECT COALESCE(discount, 0)          INTO v_disc FROM invoices      WHERE id = p_invoice_id;
-  SELECT COALESCE(SUM(amount), 0)       INTO v_paid FROM payments       WHERE invoice_id = p_invoice_id;
-  IF NOT FOUND THEN RETURN; END IF;
-  v_total  := GREATEST(0, v_sub - v_disc);
-  v_bal    := GREATEST(0, v_total - v_paid);
+  SELECT COALESCE(SUM(amount), 0)       INTO v_paid FROM payments      WHERE invoice_id = p_invoice_id;
+  v_disc    := LEAST(COALESCE(v_disc, 0), v_sub);
+  v_total   := GREATEST(0, v_sub - v_disc);
+  v_balance := GREATEST(0, v_total - v_paid);
+
+  -- A refunded invoice keeps its status; the amounts still get corrected.
   v_status := CASE
-                WHEN v_paid >= v_total AND v_total > 0 THEN 'Paid'
-                WHEN v_paid > 0 THEN 'Partially Paid'
+                WHEN v_current = 'Refunded'            THEN 'Refunded'
+                WHEN v_total <= 0                      THEN 'Paid'
+                WHEN v_paid >= v_total                 THEN 'Paid'
+                WHEN v_paid > 0                        THEN 'Partially Paid'
                 ELSE 'Unpaid'
               END;
-  UPDATE invoices
-     SET subtotal = v_sub, total = v_total, paid_amount = v_paid,
-         balance = v_bal, payment_status = v_status
-   WHERE id = p_invoice_id;
-END; $$ LANGUAGE plpgsql;
 
+  UPDATE invoices
+     SET subtotal       = v_sub,
+         discount       = v_disc,
+         total          = v_total,
+         paid_amount    = v_paid,
+         balance        = v_balance,
+         payment_status = v_status
+   WHERE id = p_invoice_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Line items and payments both feed the totals. On a DELETE, NEW is an
+-- unassigned record in PL/pgSQL, so the row identity must come from a
+-- TG_OP switch rather than COALESCE(NEW.x, OLD.x).
 CREATE OR REPLACE FUNCTION trg_invoice_child_changed() RETURNS trigger AS $$
+DECLARE
+  v_invoice_id TEXT;
 BEGIN
-  PERFORM recalc_invoice(COALESCE(NEW.invoice_id, OLD.invoice_id));
-  RETURN COALESCE(NEW, OLD);
-END; $$ LANGUAGE plpgsql;
+  v_invoice_id := CASE TG_OP WHEN 'DELETE' THEN OLD.invoice_id ELSE NEW.invoice_id END;
+  PERFORM recalc_invoice(v_invoice_id);
+  RETURN NULL;   -- AFTER trigger: the return value is ignored.
+END;
+$$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_invoice_items_math ON invoice_items;
 CREATE TRIGGER trg_invoice_items_math
@@ -704,106 +979,276 @@ CREATE TRIGGER trg_payments_math
   AFTER INSERT OR UPDATE OR DELETE ON payments
   FOR EACH ROW EXECUTE FUNCTION trg_invoice_child_changed();
 
--- Extra domain CHECKs (idempotent)
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_invoice_items_category') THEN
-    ALTER TABLE invoice_items ADD CONSTRAINT chk_invoice_items_category
-      CHECK (service_category IN ('Consultation','Laboratory','Pharmacy','Nursing','Procedure','Other'));
+-- The previous schema only recalculated when a child row changed, so editing a
+-- discount left the totals stale. This closes that gap. The WHEN clause keeps it
+-- to one extra pass: recalc_invoice rewrites `discount` too, and the second pass
+-- finds it unchanged and stops.
+CREATE OR REPLACE FUNCTION trg_invoice_discount_math() RETURNS trigger AS $$
+BEGIN
+  PERFORM recalc_invoice(NEW.id);
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_invoice_discount_math ON invoices;
+CREATE TRIGGER trg_invoice_discount_math
+  AFTER UPDATE OF discount ON invoices
+  FOR EACH ROW WHEN (OLD.discount IS DISTINCT FROM NEW.discount)
+  EXECUTE FUNCTION trg_invoice_discount_math();
+
+
+-- ============================================================================
+-- 12. ROW LEVEL SECURITY
+-- ============================================================================
+-- MANDATORY. The browser ships a public anon key, so these policies are the only
+-- thing preventing an anonymous visitor from reading every patient record.
+--
+-- Skipped automatically on a plain Postgres server (no `auth` schema), which is
+-- why such a deployment must never be exposed to a network.
+-- ============================================================================
+
+-- The three helper functions below (app_user_role, app_is_admin,
+-- app_current_staff_id) are created INSIDE the guard below rather than here,
+-- because they call auth.jwt(). PostgreSQL validates a LANGUAGE sql function
+-- body at CREATE time, so declaring them unconditionally would abort the whole
+-- apply on a plain Postgres server that has no auth schema.
+
+DO $$
+DECLARE
+  t TEXT;
+  -- Clinical and operational data: any authenticated staff member may work.
+  staff_tables TEXT[] := ARRAY[
+    'wards', 'patients', 'visits', 'vitals', 'consultations', 'clinical_diagnoses',
+    'lab_investigations', 'lab_parameters', 'lab_requests', 'lab_test_orders',
+    'lab_results', 'medications', 'prescriptions', 'prescription_items',
+    'invoices', 'invoice_items', 'payments', 'online_bookings',
+    'lab_stock_items', 'lab_stock_requests', 'radiology_orders',
+    'physiotherapy_orders', 'clinical_consumables', 'consumable_requests',
+    'consumable_usage', 'medication_requests'
+  ];
+  -- Configuration and access control: readable by all, writable by admins only.
+  admin_tables TEXT[] := ARRAY[
+    'users', 'custom_roles', 'role_permissions', 'permission_nodes',
+    'system_settings', 'receipt_settings', 'service_prices'
+  ];
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'auth') THEN
+    RAISE NOTICE 'auth schema absent - SKIPPING Row Level Security. This database is NOT safe to expose.';
+    RETURN;
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_lab_orders_category') THEN
-    ALTER TABLE lab_test_orders ADD CONSTRAINT chk_lab_orders_category
-      CHECK (category IN ('HEMATOLOGY','MICROBIOLOGY','CHEMICAL_PATHOLOGY','HISTOPATHOLOGY','MOLECULAR'));
+
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    RAISE EXCEPTION 'role "authenticated" is missing; is this a Supabase project?';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_rx_item_qty') THEN
-    ALTER TABLE prescription_items ADD CONSTRAINT chk_rx_item_qty
-      CHECK (quantity_dispensed >= 0 AND quantity_dispensed <= quantity_prescribed);
+
+  -- The signed-in staff member's app role, resolved from the JWT email.
+  -- SECURITY DEFINER because policies evaluate as the calling role, which cannot
+  -- read public.users (itself behind RLS) without recursing.
+  EXECUTE $fn$
+    CREATE OR REPLACE FUNCTION public.app_user_role() RETURNS TEXT AS $body$
+      SELECT u.role
+        FROM public.users u
+       WHERE lower(u.email) = lower(auth.jwt() ->> 'email')
+         AND u.active
+       LIMIT 1;
+    $body$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+  $fn$;
+
+  EXECUTE $fn$
+    CREATE OR REPLACE FUNCTION public.app_is_admin() RETURNS BOOLEAN AS $body$
+      SELECT public.app_user_role() = 'ADMINISTRATOR';
+    $body$ LANGUAGE sql STABLE
+  $fn$;
+
+  -- The signed-in staff member's public.users id, for audit attribution.
+  EXECUTE $fn$
+    CREATE OR REPLACE FUNCTION public.app_current_staff_id() RETURNS TEXT AS $body$
+      SELECT u.id
+        FROM public.users u
+       WHERE lower(u.email) = lower(auth.jwt() ->> 'email')
+         AND u.active
+       LIMIT 1;
+    $body$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+  $fn$;
+
+  COMMENT ON FUNCTION public.app_user_role() IS
+    'App role of the signed-in staff member, matched from the Supabase JWT email. NULL when signed out or unrecognised.';
+
+  FOREACH t IN ARRAY staff_tables LOOP
+    IF to_regclass('public.' || quote_ident(t)) IS NULL THEN CONTINUE; END IF;
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('ALTER TABLE public.%I FORCE ROW LEVEL SECURITY', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_select', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_insert', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_update', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_delete', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR SELECT TO authenticated USING (true)', t || '_select', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR INSERT TO authenticated WITH CHECK (true)', t || '_insert', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR UPDATE TO authenticated USING (true) WITH CHECK (true)', t || '_update', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR DELETE TO authenticated USING (true)', t || '_delete', t);
+  END LOOP;
+
+  FOREACH t IN ARRAY admin_tables LOOP
+    IF to_regclass('public.' || quote_ident(t)) IS NULL THEN CONTINUE; END IF;
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('ALTER TABLE public.%I FORCE ROW LEVEL SECURITY', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_select', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_insert', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_update', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_delete', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR SELECT TO authenticated USING (true)', t || '_select', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR INSERT TO authenticated WITH CHECK (public.app_is_admin())', t || '_insert', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR UPDATE TO authenticated USING (public.app_is_admin()) WITH CHECK (public.app_is_admin())', t || '_update', t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR DELETE TO authenticated USING (public.app_is_admin())', t || '_delete', t);
+  END LOOP;
+
+  -- audit_logs: SELECT and INSERT only. No UPDATE/DELETE policy is ever created.
+  IF to_regclass('public.audit_logs') IS NOT NULL THEN
+    ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE public.audit_logs FORCE ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS audit_logs_select ON audit_logs;
+    DROP POLICY IF EXISTS audit_logs_insert ON audit_logs;
+    DROP POLICY IF EXISTS audit_logs_update ON audit_logs;
+    DROP POLICY IF EXISTS audit_logs_delete ON audit_logs;
+    CREATE POLICY audit_logs_select ON audit_logs FOR SELECT TO authenticated USING (true);
+    CREATE POLICY audit_logs_insert ON audit_logs FOR INSERT TO authenticated WITH CHECK (true);
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_booking_sex') THEN
-    ALTER TABLE online_bookings ADD CONSTRAINT chk_booking_sex
-      CHECK (sex IN ('Male','Female','Other'));
+
+  -- RLS is the real gate; these grants make the intent explicit and cut the anon
+  -- role off from the tables entirely.
+  GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon';
+    EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon';
   END IF;
-  -- Cycle-safe FK: custom_roles.created_by -> users(id)
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_custom_roles_created_by') THEN
-    ALTER TABLE custom_roles ADD CONSTRAINT fk_custom_roles_created_by
-      FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
+
+  -- Policies invoke these as the table owner; clients must not call them
+  -- directly, so EXECUTE is revoked from PUBLIC and regranted narrowly.
+  EXECUTE 'REVOKE ALL ON FUNCTION public.app_user_role() FROM PUBLIC';
+  EXECUTE 'REVOKE ALL ON FUNCTION public.app_is_admin() FROM PUBLIC';
+  EXECUTE 'REVOKE ALL ON FUNCTION public.app_current_staff_id() FROM PUBLIC';
+  EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO authenticated';
+  EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_admin() TO authenticated';
+  EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO authenticated';
+
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO service_role';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_admin() TO service_role';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO service_role';
   END IF;
+
+  ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated;
+
+  -- Views run with the definer's rights, so an unprivileged role must not be
+  -- able to create replacements in this schema.
+  EXECUTE 'REVOKE CREATE ON SCHEMA public FROM anon';
+  EXECUTE 'REVOKE CREATE ON SCHEMA public FROM authenticated';
 END $$;
 
--- Extra covering indexes
-CREATE INDEX IF NOT EXISTS idx_lab_results_order   ON lab_results(test_order_id);
-CREATE INDEX IF NOT EXISTS idx_rx_items_rx         ON prescription_items(prescription_id);
-CREATE INDEX IF NOT EXISTS idx_consumable_use_pt   ON consumable_usage(patient_id);
-CREATE INDEX IF NOT EXISTS idx_lab_stock_req_status ON lab_stock_requests(status);
-CREATE INDEX IF NOT EXISTS idx_visits_created      ON visits(created_at DESC);
 
--- ----------------------------------------------------------------------------
--- Operational views
--- ----------------------------------------------------------------------------
+-- ============================================================================
+-- 13. OPERATIONAL VIEWS
+-- ============================================================================
+
 CREATE OR REPLACE VIEW v_currently_admitted AS
 SELECT v.id AS visit_id, v.patient_id,
        p.first_name || ' ' || p.last_name AS patient_name,
-       v.ward, v.admitted_at, v.admitted_by, v.visit_date
-FROM visits v JOIN patients p ON p.id = v.patient_id
-WHERE v.status = 'Admitted';
+       v.ward, w.name AS ward_name,
+       v.admitted_at, v.admitted_by, v.visit_date
+  FROM visits v
+  JOIN patients p ON p.id = v.patient_id
+  LEFT JOIN wards w ON w.code = v.ward
+ WHERE v.status = 'Admitted';
 
 CREATE OR REPLACE VIEW v_low_stock_alerts AS
-SELECT 'medication' AS kind, id, name, current_stock, min_stock_alert AS min_level, unit_price
-FROM medications WHERE current_stock <= min_stock_alert
+SELECT 'medication' AS kind, id, name, current_stock,
+       min_stock_alert AS min_level, unit_price
+  FROM medications WHERE current_stock <= min_stock_alert
 UNION ALL
 SELECT 'consumable', id, name, current_stock, min_alert_level, unit_price
-FROM clinical_consumables WHERE current_stock <= min_alert_level
+  FROM clinical_consumables WHERE current_stock <= min_alert_level
 UNION ALL
 SELECT 'lab_stock', id, name, current_stock, min_alert_level, unit_cost
-FROM lab_stock_items WHERE current_stock <= min_alert_level;
+  FROM lab_stock_items WHERE current_stock <= min_alert_level;
 
 CREATE OR REPLACE VIEW v_invoice_balances AS
 SELECT i.id, i.patient_id, i.visit_id, i.total,
        COALESCE(SUM(p.amount), 0) AS paid,
        i.total - COALESCE(SUM(p.amount), 0) AS balance,
        i.payment_status
-FROM invoices i LEFT JOIN payments p ON p.invoice_id = i.id
-GROUP BY i.id;
+  FROM invoices i
+  LEFT JOIN payments p ON p.invoice_id = i.id
+ GROUP BY i.id;
 
 CREATE OR REPLACE VIEW v_ward_census AS
-SELECT COALESCE(v.ward, 'Unspecified ward') AS ward,
+SELECT COALESCE(v.ward, 'UNSPECIFIED') AS ward_code,
+       COALESCE(w.name, 'Unspecified ward') AS ward_name,
        COUNT(*) AS inpatients,
-       MAX(w.capacity) AS capacity
-FROM visits v LEFT JOIN wards w ON w.code = v.ward
-WHERE v.status = 'Admitted'
-GROUP BY COALESCE(v.ward, 'Unspecified ward')
-ORDER BY inpatients DESC;
+       COALESCE(MAX(w.capacity), 0) AS capacity
+  FROM visits v
+  LEFT JOIN wards w ON w.code = v.ward
+ WHERE v.status = 'Admitted'
+ GROUP BY COALESCE(v.ward, 'UNSPECIFIED'), COALESCE(w.name, 'Unspecified ward')
+ ORDER BY inpatients DESC;
 
 CREATE OR REPLACE VIEW v_revenue_by_department AS
 SELECT service_category AS department,
        COUNT(*) AS lines,
        COALESCE(SUM(total_price), 0) AS billed
-FROM invoice_items
-GROUP BY service_category
-ORDER BY billed DESC;
+  FROM invoice_items
+ GROUP BY service_category
+ ORDER BY billed DESC;
 
--- Department workload snapshot (doctor / nursing / lab / pharmacy / imaging)
 CREATE OR REPLACE VIEW v_department_workload AS
-SELECT 'doctor_awaiting' AS bucket, COUNT(*) AS n FROM visits
- WHERE visit_date = CURRENT_DATE AND status IN ('With Doctor','Awaiting Physician')
-UNION ALL
-SELECT 'doctor_consulting', COUNT(*) FROM visits
- WHERE visit_date = CURRENT_DATE AND status = 'In Consultation'
-UNION ALL
-SELECT 'nursing_awaiting', COUNT(*) FROM visits
- WHERE visit_date = CURRENT_DATE AND status IN ('Awaiting Vitals','With Nurse')
-UNION ALL
-SELECT 'lab_pending', COUNT(*) FROM lab_test_orders WHERE status NOT IN ('Released','Verified')
-UNION ALL
-SELECT 'pharmacy_pending', COUNT(*) FROM prescription_items WHERE dispense_status <> 'Dispensed'
-UNION ALL
-SELECT 'radiology_pending', COUNT(*) FROM radiology_orders WHERE status = 'Requested'
-UNION ALL
-SELECT 'physio_active', COUNT(*) FROM physiotherapy_orders WHERE status = 'In Progress'
-UNION ALL
-SELECT 'admitted', COUNT(*) FROM visits WHERE status = 'Admitted';
+SELECT 'doctor_awaiting' AS bucket, COUNT(*) AS n
+  FROM visits WHERE visit_date = CURRENT_DATE AND status IN ('With Doctor','Awaiting Physician')
+UNION ALL SELECT 'doctor_consulting', COUNT(*)
+  FROM visits WHERE visit_date = CURRENT_DATE AND status = 'In Consultation'
+UNION ALL SELECT 'nursing_awaiting', COUNT(*)
+  FROM visits WHERE visit_date = CURRENT_DATE AND status IN ('Awaiting Vitals','With Nurse')
+UNION ALL SELECT 'lab_pending', COUNT(*)
+  FROM lab_test_orders WHERE status NOT IN ('Released','Verified')
+UNION ALL SELECT 'pharmacy_pending', COUNT(*)
+  FROM prescription_items WHERE dispense_status <> 'Dispensed'
+UNION ALL SELECT 'radiology_pending', COUNT(*)
+  FROM radiology_orders WHERE status = 'Requested'
+UNION ALL SELECT 'physio_active', COUNT(*)
+  FROM physiotherapy_orders WHERE status = 'In Progress'
+UNION ALL SELECT 'admitted', COUNT(*)
+  FROM visits WHERE status = 'Admitted';
+
+-- Staff roster with a link to Supabase Auth. `linked_by_id` reflects the
+-- users.auth_user_id column, which a provisioning step fills in. To confirm an
+-- Auth account actually exists, match the email against auth.users from a SQL
+-- session; that join is left out here so this file still applies to a plain
+-- Postgres server.
+CREATE OR REPLACE VIEW v_staff_auth_status AS
+SELECT u.id, u.name, u.email, u.role, u.active,
+       (u.auth_user_id IS NOT NULL) AS linked_by_id
+  FROM users u;
+
+-- The views above are read-only conveniences, but they execute with their
+-- definer's rights, which bypasses RLS. That is acceptable only because every
+-- staff table they read is already open to any signed-in member, so granting
+-- security_invoker (PostgreSQL 15+) without first re-checking that table.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    RETURN;
+  END IF;
+  GRANT SELECT ON v_currently_admitted, v_low_stock_alerts, v_invoice_balances,
+                   v_ward_census, v_revenue_by_department, v_department_workload,
+                   v_staff_auth_status
+    TO authenticated;
+END $$;
+
 
 -- ============================================================================
--- SEED DATA (demo credentials — rotate immediately in production)
+-- 14. SEED DATA
+-- ============================================================================
+-- Reference data only: wards, permissions, settings and a starter catalogue.
+-- All inserts are idempotent. No demo patient records and no passwords.
 -- ============================================================================
 
 INSERT INTO wards (code, name, capacity) VALUES
@@ -844,21 +1289,22 @@ VALUES
    'RCP', TRUE, TRUE, TRUE, TRUE, TRUE, TRUE)
 ON CONFLICT (id) DO NOTHING;
 
--- Staff accounts (DB-controlled; default password 'FatClinic123')
-INSERT INTO users (id, name, email, role, department, avatar, pin, password, active) VALUES
-  ('USR-001','Dr. Johnathan Adeleke','adeleke@fatclinic.health','PHYSICIAN','Internal Medicine & Clinical Care','👨‍⚕️','1234','FatClinic123',TRUE),
-  ('USR-002','Dr. Sarah Alabi','alabi@fatclinic.health','ADMINISTRATOR','Executive Administration & Quality Assurance','👩‍💼','1234','FatClinic123',TRUE),
-  ('USR-003','Nurse Ngozi Eze','ngozi@fatclinic.health','NURSE','Triage & Inpatient Nursing','👩‍⚕️','1234','FatClinic123',TRUE),
-  ('USR-004','Scientist Ibrahim Bello, MLS','ibrahim@fatclinic.health','LAB_SCIENTIST','Diagnostic Laboratory Services','🔬','1234','FatClinic123',TRUE),
-  ('USR-005','Pharm. Kemi Ojo, BPharm','kemi@fatclinic.health','PHARMACIST','Clinical Pharmacy & Therapeutics','💊','1234','FatClinic123',TRUE),
-  ('USR-006','Tayo Ogundipe','tayo@fatclinic.health','FRONT_DESK','Patient Services & Admissions','📋','1234','FatClinic123',TRUE),
-  ('USR-007','Emeka Nwosu','emeka@fatclinic.health','BILLING_OFFICER','Accounts & Revenue Cycle','💳','1234','FatClinic123',TRUE),
-  ('USR-008','Dr. Chinedu Okafor','chinedu.rad@fatclinic.health','RADIOLOGIST','Radiology & Imaging','🩻','1234','FatClinic123',TRUE),
-  ('USR-009','PT. Amina Yusuf, BPT','amina.pt@fatclinic.health','PHYSIOTHERAPIST','Physiotherapy & Rehabilitation','🏃‍♀️','1234','FatClinic123',TRUE)
+-- Staff profiles. No password column: provision the matching Supabase Auth
+-- account with scripts/provision-staff.mjs (needs SUPABASE_SERVICE_ROLE_KEY).
+INSERT INTO users (id, name, email, role, department, avatar, pin, active) VALUES
+  ('USR-001','Dr. Johnathan Adeleke','adeleke@fatclinic.health','PHYSICIAN','Internal Medicine & Clinical Care','👨‍⚕️','1234',TRUE),
+  ('USR-002','Dr. Sarah Alabi','alabi@fatclinic.health','ADMINISTRATOR','Executive Administration & Quality Assurance','👩‍💼','1234',TRUE),
+  ('USR-003','Nurse Ngozi Eze','ngozi@fatclinic.health','NURSE','Triage & Inpatient Nursing','👩‍⚕️','1234',TRUE),
+  ('USR-004','Scientist Ibrahim Bello, MLS','ibrahim@fatclinic.health','LAB_SCIENTIST','Diagnostic Laboratory Services','🔬','1234',TRUE),
+  ('USR-005','Pharm. Kemi Ojo, BPharm','kemi@fatclinic.health','PHARMACIST','Clinical Pharmacy & Therapeutics','💊','1234',TRUE),
+  ('USR-006','Tayo Ogundipe','tayo@fatclinic.health','FRONT_DESK','Patient Services & Admissions','📋','1234',TRUE),
+  ('USR-007','Emeka Nwosu','emeka@fatclinic.health','BILLING_OFFICER','Accounts & Revenue Cycle','💳','1234',TRUE),
+  ('USR-008','Dr. Chinedu Okafor','chinedu.rad@fatclinic.health','RADIOLOGIST','Radiology & Imaging','🩻','1234',TRUE),
+  ('USR-009','PT. Amina Yusuf, BPT','amina.pt@fatclinic.health','PHYSIOTHERAPIST','Physiotherapy & Rehabilitation','🏃‍♀️','1234',TRUE)
 ON CONFLICT (id) DO NOTHING;
 
--- Permission hierarchy seed (parents before children for the self-FK).
--- Mirrors src/services/permissions.ts exactly.
+-- Permission hierarchy. Parents before children, because parent_key is a
+-- self-referencing FK. Mirrors src/services/permissions.ts exactly.
 INSERT INTO permission_nodes (key, parent_key, label, depth) VALUES
   ('DASHBOARD', NULL, 'Executive Dashboard', 1),
   ('PATIENTS', NULL, 'Patients & Front Desk', 1),
@@ -878,7 +1324,7 @@ INSERT INTO permission_nodes (key, parent_key, label, depth) VALUES
   ('CLINICAL.PHYSICIAN', 'CLINICAL', 'Physician Consultation', 2),
   ('CLINICAL.NURSING', 'CLINICAL', 'Nursing Station & Triage', 2),
   ('CLINICAL.ALERTS', 'CLINICAL', 'Diagnostic Alerts', 2),
-  ('LABORATORY.HEMATOLOGY', 'LABORATORY', 'Hematology', 2),
+  ('LABORATORY.HEMATOLOGY', 'LABORATORY', 'Laboratory', 2),
   ('LABORATORY.MICROBIOLOGY', 'LABORATORY', 'Microbiology', 2),
   ('LABORATORY.CHEMICAL_PATHOLOGY', 'LABORATORY', 'Chemical Pathology', 2),
   ('LABORATORY.HISTOPATHOLOGY', 'LABORATORY', 'Histopathology', 2),
@@ -984,8 +1430,8 @@ INSERT INTO permission_nodes (key, parent_key, label, depth) VALUES
   ('ADMIN.ROLES.MANAGE', 'ADMIN.ROLES', 'Create / edit roles', 3)
 ON CONFLICT (key) DO NOTHING;
 
--- Example granular role: Histopathology scientist who may do everything in
--- Histopathology EXCEPT entering results.
+-- Example granular role: a histopathology scientist who may do everything in
+-- histopathology except entering results.
 INSERT INTO custom_roles (id, name, description, created_by) VALUES
   ('ROLE-HISTO-VIEWER','Histopathology (No Result Entry)',
    'Everything in Histopathology except entering results.', 'USR-002')
@@ -1001,7 +1447,7 @@ INSERT INTO role_permissions (role_id, permission_key) VALUES
   ('ROLE-HISTO-VIEWER','DASHBOARD.VIEW')
 ON CONFLICT DO NOTHING;
 
--- Sample price schedule / catalogue rows
+-- Starter catalogue.
 INSERT INTO service_prices (id, name, category, price, active) VALUES
   ('SVC-001','General Physician Consultation','Consultation',10000,TRUE),
   ('SVC-008','Registration (First Visit)','Consultation',5000,TRUE),
@@ -1032,4 +1478,6 @@ INSERT INTO clinical_consumables (id, name, category, unit, current_stock, min_a
   ('CSM-015','Pharmacy Dispensing Envelopes Small (Pack of 500)','Pharmacy','Packs',25,6,3500,2200)
 ON CONFLICT (id) DO NOTHING;
 
+-- ============================================================================
 -- End of FatClinic schema.
+-- ============================================================================

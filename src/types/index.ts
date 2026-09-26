@@ -25,10 +25,17 @@ export interface User {
   role: UserRole;
   department: string;
   avatar: string;
-  pin: string; // 4-digit device PIN
-  password: string; // workstation login password (DB-controlled; admin can regenerate)
+  pin: string; // 4-digit device PIN: a screen lock, not a login credential
+  /**
+   * @deprecated Legacy local-mode password. It exists only in localStorage and is
+   * NEVER synced to Postgres: `public.users` has no password column, because
+   * credentials belong to Supabase Auth. Login is moving to `supabase.auth`, and
+   * this field, along with db.assignUserPassword / db.changeOwnPassword, will be
+   * removed with the auth rewrite. Do not read it in the sync layer.
+   */
+  password: string;
   customRoleId?: string; // assigned granular access-control role (Admin assigns)
-  mustChangePassword?: boolean; // set when admin regenerates password
+  mustChangePassword?: boolean; // advisory flag for the sign-in UI
   active: boolean;
 }
 
@@ -82,18 +89,37 @@ export interface Visit {
   dischargedAt?: string;
 }
 
-export const WARDS: string[] = [
-  'Male General Ward',
-  'Female General Ward',
-  'Pediatric Ward',
-  'Maternity Ward',
-  'Neonatal (NICU)',
-  'Intensive Care (ICU)',
-  'Emergency Ward',
-  'Isolation Ward',
-  'Private / Single Room',
-  'Day-Care / Observation'
+/**
+ * Wards, as the database stores them.
+ *
+ * `code` is the stable identifier persisted in `visits.ward` and referenced by
+ * the `wards` table primary key; `name` is display text and may be reworded
+ * without touching clinical history. Mirrors the `wards` seed in
+ * database/fatclinic.sql.
+ */
+export const WARD_OPTIONS: ReadonlyArray<{ code: string; name: string }> = [
+  { code: 'MALE-GEN', name: 'Male General Ward' },
+  { code: 'FEM-GEN', name: 'Female General Ward' },
+  { code: 'PAED', name: 'Pediatric Ward' },
+  { code: 'MAT', name: 'Maternity Ward' },
+  { code: 'NICU', name: 'Neonatal (NICU)' },
+  { code: 'ICU', name: 'Intensive Care (ICU)' },
+  { code: 'EMR', name: 'Emergency Ward' },
+  { code: 'ISO', name: 'Isolation Ward' },
+  { code: 'PVT', name: 'Private / Single Room' },
+  { code: 'DAY', name: 'Day-Care / Observation' }
 ];
+
+/** Ward codes, for storage and comparisons. */
+export const WARDS: string[] = WARD_OPTIONS.map(w => w.code);
+
+const WARD_NAME_BY_CODE = new Map(WARD_OPTIONS.map(w => [w.code, w.name]));
+
+/** Display name for a ward code. Falls back to the code for unknown values. */
+export function wardName(code?: string | null): string {
+  if (!code) return 'Unspecified ward';
+  return WARD_NAME_BY_CODE.get(code) ?? code;
+}
 
 export interface Vitals {
   id: string;

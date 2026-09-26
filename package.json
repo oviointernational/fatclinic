@@ -10,6 +10,8 @@
     "start": "node server/index.js",
     "deploy": "npm run build && wrangler deploy",
     "deploy:dry": "wrangler deploy --dry-run",
+    "db:lint": "node scripts/lint-schema.mjs",
+    "db:lint:test": "node scripts/lint-selftest.mjs",
     "db:apply": "node scripts/apply-schema.mjs"
   },
   "engines": {

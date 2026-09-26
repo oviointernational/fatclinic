@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Patient, Visit } from '../../types';
+import { Patient, Visit, wardName } from '../../types';
 import { db } from '../../services/db';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { ClinicalDashboard, CLINICAL_GROUPS, getClinicalGroupPatientIds } from './ClinicalDashboard';
@@ -102,7 +102,7 @@ export const ClinicalDashboardPage: React.FC<ClinicalDashboardPageProps> = ({
                           <div className="text-[11px] text-slate-500 truncate">
                             {p.sex}, {p.age}y • {p.phone}
                             {latest && (
-                              <span> • <strong>{latest.status}</strong> ({latest.visitDate}{latest.status === 'Admitted' && latest.ward ? ` • Ward: ${latest.ward}` : ''})</span>
+                              <span> • <strong>{latest.status}</strong> ({latest.visitDate}{latest.status === 'Admitted' && latest.ward ? ` • Ward: ${wardName(latest.ward)}` : ''})</span>
                             )}
                           </div>
                         </div>

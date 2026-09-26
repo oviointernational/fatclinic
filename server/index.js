@@ -2,9 +2,10 @@
  * FatClinic EHR — Node service entry point.
  *
  * Single service that:
- *  1. Connects to external Postgres (Supabase) using DATABASE_URL
- *     (also accepts DATABASE_PUBLIC_URL / DATABASE_PRIVATE_URL),
- *     falling back to local defaults.
+ *  1. Connects to external Postgres (Supabase) using PGHOST/PGPASSWORD, or
+ *     DATABASE_URL as a fallback (also accepts DATABASE_PUBLIC_URL /
+ *     DATABASE_PRIVATE_URL), falling back to local defaults.
+ *     See scripts/db-config.mjs.
  *  2. Auto-applies database/fatclinic.sql (idempotent) on boot.
  *  3. Exposes a generic /api REST layer over the allow-listed tables.
  *  4. Serves the Vite production build (dist/) + SPA fallback.
@@ -28,22 +29,36 @@ const DIST = path.join(ROOT, 'dist');
 
 const PORT = Number(process.env.PORT || 3001);
 
-// External Postgres (Supabase): DATABASE_URL first, then alternates,
-// then local defaults.
+// External Postgres (Supabase). The discrete PG* form wins over any URL,
+// because a generated password containing @ or # corrupts a connection string.
 const CONNECTION_STRING =
   process.env.DATABASE_URL ||
   process.env.DATABASE_PUBLIC_URL ||
   process.env.DATABASE_PRIVATE_URL ||
   'postgresql://postgres:postgres@localhost:5432/fatclinic';
 
+function pgOptions() {
+  // Explicit parts win; otherwise pass the URL through untouched so that a
+  // provider-injected DATABASE_URL keeps working even if it is unusual.
+  if (!process.env.PGHOST) return { connectionString: CONNECTION_STRING };
+  return {
+    host: process.env.PGHOST,
+    port: Number(process.env.PGPORT || 5432),
+    user: process.env.PGUSER || 'postgres',
+    password: process.env.PGPASSWORD || '',
+    database: process.env.PGDATABASE || 'postgres',
+  };
+}
+
 // SSL: public hosts (Supabase, etc.) require it; private/internal and
 // localhost do not. Override explicitly with PG_SSL=true/false.
-const _isPrivateHost = /railway\.internal|localhost|127\.0\.0\.1/.test(CONNECTION_STRING);
 const _sslEnv = String(process.env.PG_SSL || '').toLowerCase();
+const _sslHost = process.env.PGHOST || CONNECTION_STRING;
+const _isPrivateHost = /railway\.internal|localhost|127\.0\.0\.1/.test(_sslHost);
 const USE_SSL = _sslEnv === 'true' || (_sslEnv !== 'false' && !_isPrivateHost);
 
 const pool = new pg.Pool({
-  connectionString: CONNECTION_STRING,
+  ...pgOptions(),
   ssl: USE_SSL ? { rejectUnauthorized: false } : undefined,
   max: 10,
 });
