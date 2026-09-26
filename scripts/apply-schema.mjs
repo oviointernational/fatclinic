@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { resolveConnection, shouldUseSsl } from './db-config.mjs';
+import { resolveConnection, shouldUseSsl, connectWithRetry, resolveHost } from './db-config.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -39,23 +39,72 @@ const useSsl = shouldUseSsl(connection.options, process.env);
 console.log(`[fatclinic] target : ${connection.label}  (via ${connection.source})`);
 console.log(`[fatclinic] ssl    : ${useSsl ? 'on' : 'off'}`);
 
-const client = new pg.Client({
-  ...connection.options,
-  ssl: useSsl ? { rejectUnauthorized: false } : undefined,
-});
+// A fresh Client per attempt: node-postgres refuses to reconnect one that has
+// already been used, even if the first connect failed. The host is re-resolved
+// each time, because a pinned address can be the thing that went stale.
+let pinnedNote = false;
+const makeClient = async () => {
+  const target = await resolveHost(connection.options.host);
+  if (target.pinned && !pinnedNote) {
+    pinnedNote = true;
+    console.log(`[fatclinic] note    : ${target.reason}`);
+  }
+  return new pg.Client({
+    ...connection.options,
+    host: target.host,
+    ssl: useSsl ? { rejectUnauthorized: false } : undefined,
+    // Without this a dead route hangs indefinitely instead of failing.
+    connectionTimeoutMillis: 20_000,
+  });
+};
 
+let client;
 try {
-  await client.connect();
+  client = await connectWithRetry(makeClient);
 } catch (err) {
   // Scrub anything password-shaped before it reaches the console.
   const secret = connection.options.password || '';
-  const safe = secret ? err.message.split(secret).join('***') : err.message;
-  fail(
-    `Could not connect to ${connection.label}: ${safe}\n` +
-      (secret ? '' : '') +
-      '\n  If this says "password authentication failed", the password is wrong: ' +
-      'reset it in Supabase -> Project Settings -> Database, then update .env.',
-  );
+  const message = secret ? err.message.split(secret).join('***') : err.message;
+
+  // Point at the actual cause. A single generic hint sends people off to reset
+  // a password that was fine, which is how a working setup gets broken.
+  let hint;
+  if (/password authentication failed|no pg_hba\.conf entry|role .* does not exist/i.test(message)) {
+    hint =
+      'The server rejected the credentials. Either the password is wrong, or the ' +
+      'database has been reset. Supabase -> Project Settings -> Database -> Reset ' +
+      'database password, then update PGPASSWORD in .env.';
+  } else if (/ENOTFOUND|getaddrinfo|ENOENT/i.test(message)) {
+    // A well-formed Supabase host that fails to resolve is a local DNS problem,
+    // not a URL problem. Only a hostname that does not look right suggests the
+    // password was truncated inside a URI.
+    const hostLooksRight = /^db\.[a-z0-9]+\.supabase\.co$/i.test(connection.options.host || '');
+    hint = hostLooksRight
+      ? 'The hostname is well formed but did not resolve, so this is a local DNS ' +
+        'problem rather than a configuration error. Check your connection, VPN, ' +
+        'or DNS resolver, then retry.'
+      : 'The hostname did not resolve. If the password contains @ or #, a ' +
+        'postgresql:// URL is truncated at that point and resolves to a nonsense ' +
+        'host - use the separate PGHOST / PGPASSWORD form instead.';
+  } else if (/ENETUNREACH|EHOSTUNREACH|EADDRNOTAVAIL/i.test(message)) {
+    hint =
+      'The address resolved but the network has no route to it. Supabase ' +
+      'database hosts are often IPv6-only, so this machine either lacks IPv6 ' +
+      'connectivity or cannot route it. Options: restore IPv6, or use the IPv4 ' +
+      'connection pooler from Project Settings -> Database -> Connection string ' +
+      '(the "Session pooler" row), which serves IPv4. See .env.example.';
+  } else if (/ETIMEDOUT|ECONNREFUSED/i.test(message)) {
+    hint =
+      'The connection timed out. This is usually a transient network or VPN issue ' +
+      'rather than a credentials problem. Retry; if it persists, check that port ' +
+      '5432 is reachable and that your firewall allows it.';
+  } else if (/certificate|self.signed|unable to verify/i.test(message)) {
+    hint = 'TLS failed. Set PG_SSL=false only if you are certain the host does not require TLS.';
+  } else {
+    hint = 'See the error above.';
+  }
+
+  fail(`Could not connect to ${connection.label}: ${message}\n\n  ${hint}`);
 }
 
 const { rows: target } = await client.query(
@@ -178,36 +227,61 @@ const { rows: auditTrigger } = await client.query(`
 `);
 if (!auditTrigger[0].n) problems.push('audit immutability trigger is missing');
 
-// Invoice arithmetic is the other piece of real logic, so exercise it.
-const { rows: mathProbe } = await client.query(`
+// Invoice arithmetic is the other piece of real logic, so exercise it. The
+// probe runs in a transaction that is always rolled back, so a verification run
+// cannot leave test rows in a clinical database even if it fails midway.
+const mathResults = await client.query(`
+  BEGIN;
   DO $$
   DECLARE
-    v_invoice TEXT := 'VERIFY-PROBE-' || substr(md5(random()::text), 1, 8);
+    v_probe TEXT := 'VERIFY-PROBE-' || substr(md5(random()::text), 1, 8);
   BEGIN
     INSERT INTO patients (id, first_name, last_name, dob, age, sex, phone)
-    VALUES (v_invoice, 'Schema', 'Probe', CURRENT_DATE, 30, 'Male', '000');
+    VALUES (v_probe, 'Schema', 'Probe', CURRENT_DATE, 30, 'Male', '000');
     INSERT INTO visits (id, patient_id, visit_date, visit_type, status)
-    VALUES ('VIS-' || v_invoice, v_invoice, CURRENT_DATE, 'Routine', 'Completed');
-    INSERT INTO invoices (id, visit_id, patient_id) VALUES (v_invoice, 'VIS-' || v_invoice, v_invoice);
+    VALUES ('VIS-' || v_probe, v_probe, CURRENT_DATE, 'Routine', 'Completed');
+    INSERT INTO invoices (id, visit_id, patient_id) VALUES (v_probe, 'VIS-' || v_probe, v_probe);
 
-    -- Line items only, no payments: the case the old trigger silently skipped.
+    -- Line items but no payments. This is the case the old trigger skipped: it
+    -- tested IF NOT FOUND after the payments SELECT, and FOUND is false for a
+    -- query that matched no rows, so subtotal and total stayed at zero.
     INSERT INTO invoice_items (id, invoice_id, service_category, description, quantity, unit_price, total_price)
-    VALUES ('II-' || v_invoice, v_invoice, 'Consultation', 'Probe', 2, 500, 1000);
+    VALUES ('II-' || v_probe, v_probe, 'Consultation', 'Probe', 2, 500, 1000);
   END $$;
-  SELECT total, subtotal, discount, balance, payment_status
-    FROM invoices WHERE id LIKE 'VERIFY-PROBE-%'
-`);
-if (!mathProbe.length || Number(mathProbe[0].total) !== 1000) {
-  problems.push(
-    `invoice recalculation did not run for a payment-less invoice (total=${mathProbe[0]?.total ?? 'no row'})`,
-  );
-} else if (mathProbe[0].payment_status !== 'Unpaid') {
-  problems.push(`invoice status should be Unpaid, got ${mathProbe[0].payment_status}`);
-}
 
-await client.query(`DELETE FROM invoices WHERE id LIKE 'VERIFY-PROBE-%'`).catch(() => {});
-await client.query(`DELETE FROM visits   WHERE id LIKE 'VIS-VERIFY-PROBE-%'`).catch(() => {});
-await client.query(`DELETE FROM patients WHERE id LIKE 'VERIFY-PROBE-%'`).catch(() => {});
+  -- A discount edit with no child-row change, which the old schema never
+  -- recalculated: the trigger only fired from invoice_items and payments.
+  UPDATE invoices SET discount = 200 WHERE id LIKE 'VERIFY-PROBE-%';
+
+  -- Part-payment then moves the status along.
+  INSERT INTO payments (id, invoice_id, receipt_number, amount, payment_method)
+  SELECT 'PM-' || id, id, 'RCPT-' || id, 400, 'Cash' FROM invoices WHERE id LIKE 'VERIFY-PROBE-%';
+
+  SELECT subtotal, discount, total, paid_amount, balance, payment_status
+    FROM invoices WHERE id LIKE 'VERIFY-PROBE-%';
+`);
+
+// node-postgres returns one Result per statement in a multi-statement query;
+// the SELECT is the last one. Taking rows from the DO block's Result is why an
+// earlier version of this check saw no rows at all.
+const probeRows = mathResults[mathResults.length - 1].rows;
+await client.query('ROLLBACK').catch(() => {});
+
+if (!probeRows.length) {
+  problems.push('invoice probe produced no rows');
+} else {
+  const p = probeRows[0];
+  if (Number(p.subtotal) !== 1000) problems.push(`invoice subtotal should be 1000, got ${p.subtotal}`);
+  if (Number(p.total) !== 800) problems.push(`invoice total should be 800 after a 200 discount, got ${p.total}`);
+  if (Number(p.balance) !== 400) problems.push(`invoice balance should be 400, got ${p.balance}`);
+  if (p.payment_status !== 'Partially Paid') {
+    problems.push(`invoice status should be Partially Paid, got ${p.payment_status}`);
+  }
+  console.log(
+    `  invoice math       : subtotal ${p.subtotal}, discount ${p.discount}, total ${p.total}, ` +
+      `paid ${p.paid_amount}, balance ${p.balance}, status ${p.payment_status}`,
+  );
+}
 
 // updated_at should be maintained by trigger on every table that has one.
 const { rows: stale } = await client.query(`

@@ -13,6 +13,7 @@
  * expressions or prove a trigger fires, so run both.
  */
 import fs from 'node:fs';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -214,6 +215,83 @@ while ((m = insertRe.exec(sql))) {
     if (!c) continue;
     if (!def.columns.has(c)) {
       errors.push(`line ${lineAt(m.index)}: INSERT INTO ${table} names column "${c}", which the table does not declare`);
+    }
+  }
+}
+
+// --- seed values vs the CHECK constraints that police them -----------------
+//
+// A seed can name a valid column and still be rejected by the database, which
+// is exactly what happened with permission keys containing an underscore. There
+// is no local Postgres to try these against, so read the constraint and apply it.
+
+const keyCheck = /CHECK\s*\(\s*key\s*~\s*'([^']+)'\s*\)/i.exec(sql);
+if (!keyCheck) {
+  errors.push('could not locate the permission_nodes key CHECK constraint to validate seeds against');
+} else {
+  const pattern = new RegExp(`^(?:${keyCheck[1].slice(1, -1)})$`);
+  // The seed block is terminated by ON CONFLICT, not by the first semicolon:
+  // the value list legitimately contains ')' and the semicolon only comes
+  // after DO NOTHING.
+  const nodesRe = /INSERT\s+INTO\s+permission_nodes\s*\([^)]*\)\s*VALUES\s*([\s\S]*?)\s+ON\s+CONFLICT/gi;
+  const seen = new Set();
+  let nodeCount = 0;
+
+  while ((m = nodesRe.exec(sql))) {
+    for (const literal of m[1].matchAll(/\(\s*'([^']*)'\s*,\s*(NULL|'([^']*)')/g)) {
+      const key = literal[1];
+      const parent = literal[3];
+      nodeCount++;
+      if (!pattern.test(key)) {
+        errors.push(
+          `line ${lineAt(m.index)}: permission_nodes key "${key}" violates its own CHECK constraint ${keyCheck[1]}`,
+        );
+      }
+      if (parent && !seen.has(parent)) {
+        errors.push(
+          `line ${lineAt(m.index)}: permission_nodes key "${key}" references parent "${parent}", which is not inserted before it`,
+        );
+      }
+      seen.add(key);
+    }
+  }
+  if (nodeCount === 0) errors.push('no permission_nodes seed rows found');
+}
+
+// Ward codes must agree with the TypeScript model, because visits.ward is a
+// foreign key to wards(code): a code present in only one place breaks admissions.
+const wardSeed = /INSERT\s+INTO\s+wards\s*\([^)]*\)\s*VALUES\s*([\s\S]*?)\s+ON\s+CONFLICT/i.exec(sql);
+if (!wardSeed) {
+  errors.push('no wards seed found, but visits.ward is a foreign key to wards(code)');
+} else {
+  const seededCodes = new Set([...wardSeed[1].matchAll(/\(\s*'([A-Z][A-Z0-9-]*)'/g)].map((x) => x[1]));
+  let tsCodes = null;
+  try {
+    const ts = readFileSync(path.join(ROOT, 'src', 'types', 'index.ts'), 'utf8');
+    const block = /WARD_OPTIONS[^=]*=\s*\[([\s\S]*?)\];/.exec(ts);
+    if (block) {
+      tsCodes = new Set([...block[1].matchAll(/code:\s*'([^']+)'/g)].map((x) => x[1]));
+    }
+  } catch {
+    notes.push('src/types/index.ts not readable; ward cross-check skipped');
+  }
+
+  if (tsCodes) {
+    for (const code of seededCodes) {
+      if (!tsCodes.has(code)) {
+        errors.push(
+          `wards seed has code "${code}", which is absent from WARD_OPTIONS in src/types/index.ts; ` +
+            'an admission to it would fail the visits.ward foreign key',
+        );
+      }
+    }
+    for (const code of tsCodes) {
+      if (!seededCodes.has(code)) {
+        errors.push(
+          `WARD_OPTIONS in src/types/index.ts has code "${code}", which the wards seed does not create; ` +
+            'admitting to it would fail the visits.ward foreign key',
+        );
+      }
     }
   }
 }

@@ -59,19 +59,29 @@
 -- 0. PREFLIGHT AND EXTENSIONS
 -- ============================================================================
 
--- Fail fast and loudly rather than half-applying to the wrong database.
+-- Detect a half-applied schema from an earlier, interrupted run. If ANY of the
+-- anchor tables exist but not all of them, something was left inconsistent and
+-- CREATE TABLE IF NOT EXISTS would silently preserve the broken half. An
+-- entirely empty database is the normal first-run case and is not an error.
 DO $$
 DECLARE
-  v_missing TEXT[];
+  v_present  TEXT[];
+  v_expected CONSTANT TEXT[] := ARRAY[
+    'users', 'patients', 'visits', 'vitals', 'consultations', 'lab_requests',
+    'prescriptions', 'invoices', 'payments', 'audit_logs'
+  ];
 BEGIN
-  SELECT array_agg(required)
-    INTO v_missing
-    FROM unnest(ARRAY['users','patients','visits','invoices','audit_logs']) AS required
-   WHERE to_regclass('public.' || required) IS NULL
-     AND required <> 'users';   -- 'users' is created in this script
+  SELECT array_agg(e ORDER BY e)
+    INTO v_present
+    FROM unnest(v_expected) AS e
+   WHERE to_regclass('public.' || quote_ident(e)) IS NOT NULL;
 
-  IF v_missing IS NOT NULL THEN
-    RAISE EXCEPTION 'FatClinic schema: missing expected table(s): %', v_missing;
+  IF v_present IS NOT NULL AND cardinality(v_present) < cardinality(v_expected) THEN
+    RAISE EXCEPTION
+      'FatClinic schema: partially applied. Found % of % anchor tables (%). '
+      'Refusing to continue, because CREATE TABLE IF NOT EXISTS would keep the '
+      'inconsistent half. Inspect the database, or drop these tables and re-run.',
+      cardinality(v_present), cardinality(v_expected), v_present;
   END IF;
 END $$;
 
@@ -111,8 +121,10 @@ CREATE TABLE IF NOT EXISTS permission_nodes (
   parent_key  TEXT REFERENCES permission_nodes(key) ON DELETE CASCADE,
   label       TEXT NOT NULL,
   depth       INTEGER NOT NULL CHECK (depth BETWEEN 1 AND 4),
+  -- Each dot-separated segment is an upper-case identifier. Underscores are
+  -- allowed because existing keys use them: LABORATORY.CHEMICAL_PATHOLOGY.
   CONSTRAINT valid_permission_key
-    CHECK (key ~ '^[A-Z][A-Z0-9]*(\.[A-Z][A-Z0-9]*)*$')
+    CHECK (key ~ '^[A-Z][A-Z0-9_]*(\.[A-Z][A-Z0-9_]*)*$')
 );
 
 -- ----------------------------------------------------------------------------

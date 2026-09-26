@@ -23,6 +23,35 @@ async function runLint(file) {
 }
 const cases = [
   {
+    name: 'seed key rejected by its own CHECK constraint',
+    must: /violates its own CHECK constraint/,
+    // LABORATORY.CHEMICAL_PATHOLOGY needs the underscore the constraint allows.
+    // Reverting to the original pattern is exactly the bug that was fixed.
+    mutate: (s) => s.replace(
+      "CHECK (key ~ '^[A-Z][A-Z0-9_]*(\\.[A-Z][A-Z0-9_]*)*$')",
+      () => "CHECK (key ~ '^[A-Z][A-Z0-9]*(\\.[A-Z][A-Z0-9]*)*$')",
+    ),
+  },
+  {
+    name: 'permission key inserted before its parent',
+    must: /is not inserted before it/,
+    mutate: (s) => s.replace(
+      "('CLINICAL.PHYSICIAN.VIEW', 'CLINICAL.PHYSICIAN',",
+      () => "('CLINICAL.PHYSICIAN.VIEW', 'CLINICAL.PHYSICIAN.NOPE',",
+    ),
+  },
+  {
+    // A ward code present on only one side breaks admissions: visits.ward is a
+    // foreign key to wards(code). The reverse direction (a WARD_OPTIONS code
+    // with no seed row) runs the same loop one line further down and is not
+    // separately exercised, because the linter reads the real
+    // src/types/index.ts.
+    name: 'ward code present on only one side',
+    must: /absent from WARD_OPTIONS/,
+    mutate: (s) => s.replace("('DAY','Day-Care / Observation',15)\n",
+      () => "('DAY','Day-Care / Observation',15),\n  ('LONG-STAY','Long Stay',4)\n"),
+  },
+  {
     name: 'seed names a column the table does not declare',
     must: /INSERT INTO wards names column/,
     mutate: (s) => s.replace('INSERT INTO wards (code, name, capacity)', 'INSERT INTO wards (code, name, capacty)'),

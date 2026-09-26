@@ -12,7 +12,10 @@
     "deploy:dry": "wrangler deploy --dry-run",
     "db:lint": "node scripts/lint-schema.mjs",
     "db:lint:test": "node scripts/lint-selftest.mjs",
-    "db:apply": "node scripts/apply-schema.mjs"
+    "db:config:test": "node scripts/db-config-selftest.mjs",
+    "db:test": "npm run db:lint && npm run db:lint:test && npm run db:config:test",
+    "db:apply": "node scripts/apply-schema.mjs",
+    "db:check-rls": "node scripts/check-rls.mjs"
   },
   "engines": {
     "node": ">=20"
