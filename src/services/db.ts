@@ -49,6 +49,14 @@ import {
   initialPhysiotherapyOrders,
   initialClinicalConsumables
 } from './seedData';
+import {
+  TABLE_BY_KEY,
+  TABLES,
+  hydrateAll,
+  isSyncEnabled,
+  isInFlight,
+  queueDiff,
+} from './sync';
 
 const STORAGE_KEYS = {
   SETTINGS: 'fatclinic_settings',
@@ -77,12 +85,63 @@ const STORAGE_KEYS = {
   CUSTOM_ROLES: 'fatclinic_custom_roles'
 };
 
+/**
+ * Storage key -> the class field it backs.
+ *
+ * Declared explicitly rather than derived, because the constructor assigns each
+ * field by hand and a derived name would be a guess. Hydration uses this to
+ * write a server-authoritative value into the right field.
+ */
+const STORAGE_FIELD: Record<string, string> = {
+  [STORAGE_KEYS.SETTINGS]: 'settings',
+  [STORAGE_KEYS.RECEIPT_SETTINGS]: 'receiptSettings',
+  [STORAGE_KEYS.USERS]: 'users',
+  [STORAGE_KEYS.PATIENTS]: 'patients',
+  [STORAGE_KEYS.VISITS]: 'visits',
+  [STORAGE_KEYS.VITALS]: 'vitals',
+  [STORAGE_KEYS.CONSULTATIONS]: 'consultations',
+  [STORAGE_KEYS.LAB_DEFS]: 'labDefs',
+  [STORAGE_KEYS.LAB_REQUESTS]: 'labRequests',
+  [STORAGE_KEYS.PRESCRIPTIONS]: 'prescriptions',
+  [STORAGE_KEYS.MEDICATIONS]: 'medications',
+  [STORAGE_KEYS.SERVICES]: 'services',
+  [STORAGE_KEYS.INVOICES]: 'invoices',
+  [STORAGE_KEYS.AUDIT_LOGS]: 'auditLogs',
+  [STORAGE_KEYS.ONLINE_BOOKINGS]: 'onlineBookings',
+  [STORAGE_KEYS.LAB_STOCK]: 'labStock',
+  [STORAGE_KEYS.LAB_STOCK_REQUESTS]: 'labStockRequests',
+  [STORAGE_KEYS.RADIOLOGY_ORDERS]: 'radiologyOrders',
+  [STORAGE_KEYS.PHYSIOTHERAPY_ORDERS]: 'physiotherapyOrders',
+  [STORAGE_KEYS.CLINICAL_CONSUMABLES]: 'clinicalConsumables',
+  [STORAGE_KEYS.CONSUMABLE_REQUESTS]: 'consumableRequests',
+  [STORAGE_KEYS.CONSUMABLE_USAGE]: 'consumableUsage',
+  [STORAGE_KEYS.MEDICATION_REQUESTS]: 'medicationRequests',
+  [STORAGE_KEYS.CUSTOM_ROLES]: 'customRoles'
+};
+
+/**
+ * The last value written to localStorage for each key.
+ *
+ * `saveStorage` is handed a whole collection, so the sync layer needs to know
+ * what the collection looked like *before* the change in order to work out which
+ * rows are new, which changed and which went away. That prior state is exactly
+ * what was last persisted, which is what this holds.
+ *
+ * It is also the baseline for a fresh page load: `loadStorage` seeds it, so the
+ * first save after a reload diffs against what was actually on disk rather than
+ * against an empty array (which would make every row look like a new row).
+ */
+const baseline = new Map<string, unknown>();
+
 function loadStorage<T>(key: string, fallback: T): T {
   try {
     const data = localStorage.getItem(key);
-    return data ? JSON.parse(data) : fallback;
+    const value = data ? (JSON.parse(data) as T) : fallback;
+    baseline.set(key, value);
+    return value;
   } catch (err) {
     console.error(`Error loading ${key} from storage:`, err);
+    baseline.set(key, fallback);
     return fallback;
   }
 }
@@ -93,6 +152,16 @@ function saveStorage<T>(key: string, value: T): void {
   } catch (err) {
     console.error(`Error saving ${key} to storage:`, err);
   }
+
+  // Mirror to Postgres. The diff is against the previously persisted value, so
+  // only genuinely new, changed and removed rows are sent; a save that changed
+  // nothing sends nothing at all.
+  const map = TABLE_BY_KEY.get(key);
+  const before = baseline.get(key);
+  baseline.set(key, value);
+  // Returns synchronously: the localStorage write above must not wait on the
+  // network, and a failed sync leaves the data intact on disk.
+  if (map) queueDiff(map, before, value);
 }
 
 // Production storage version. Bumped whenever seed data is retired so stale
@@ -139,7 +208,22 @@ class FatClinicDatabase {
   private customRoles: CustomRole[];
   private listeners: Set<() => void> = new Set();
 
+  /**
+   * Resolves once the initial reconciliation with Postgres has finished,
+   * successfully or not. The app never blocks on it: the constructor has already
+   * filled every field from localStorage, so the UI is usable immediately and
+   * works offline. This exists so a sign-in screen or a test can wait for the
+   * database state rather than racing it.
+   */
+  public readonly ready: Promise<void>;
+  private resolveReady!: () => void;
+
   constructor() {
+    this.resolveReady = () => {};
+    this.ready = new Promise<void>((resolve) => {
+      this.resolveReady = resolve;
+    });
+
     ensureProductionStorage();
     this.settings = loadStorage(STORAGE_KEYS.SETTINGS, initialSettings);
     this.receiptSettings = { ...initialReceiptSettings, ...loadStorage(STORAGE_KEYS.RECEIPT_SETTINGS, {}) };
@@ -202,6 +286,99 @@ class FatClinicDatabase {
     this.consumableUsage = loadStorage(STORAGE_KEYS.CONSUMABLE_USAGE, []);
     this.medicationRequests = loadStorage(STORAGE_KEYS.MEDICATION_REQUESTS, []);
     this.customRoles = loadStorage(STORAGE_KEYS.CUSTOM_ROLES, []);
+
+    // Every field now holds a complete, usable copy. Reconcile with Postgres in
+    // the background and re-render when it lands.
+    void this.hydrateFromServer();
+  }
+
+  // --- Postgres hydration --------------------------------------------------
+
+  /**
+   * Reconcile localStorage with Postgres.
+   *
+   * CONFLICT POLICY, and it is a decision rather than a detail:
+   *
+   *   * A row the server holds wins. The server is the durable record; a browser
+   *     copy that lost a race, or was restored from a stale backup, must not
+   *     overwrite a colleague's committed work.
+   *   * A row only this browser holds is pushed up. That is how a fresh install
+   *     seeds a new database, and how work done offline survives.
+   *   * A row with a write still queued is never overwritten. Otherwise a
+   *     clinician who saved while the network was down would watch their entry
+   *     disappear the moment connectivity returned - the moment the data matters
+   *     most.
+   *
+   * The cost of "server wins" is that two clinicians editing the same patient at
+   * once resolve last-write-wins on the browser's schedule. That is a narrower
+   * problem than losing data, and the proper fix is per-role RLS plus optimistic
+   * concurrency, not making the browser authoritative over the record.
+   */
+  private async hydrateFromServer(): Promise<void> {
+    try {
+      if (!isSyncEnabled()) return;
+
+      const server = await hydrateAll();
+
+      // Ascending order, so a parent is in place before a child referencing it.
+      for (const map of [...TABLES].sort((a, b) => a.order - b.order)) {
+        const remote = server.get(map.key);
+        if (remote === undefined) continue;
+
+        if (map.single) {
+          // Replaced wholesale: there is one shared configuration and one source
+          // of truth for it. A partial admin edit on this device does not
+          // survive, which is the intended behaviour.
+          if (remote) this.adopt(map.key, remote);
+          continue;
+        }
+
+        const local = baseline.get(map.key);
+        const localList = Array.isArray(local) ? (local as any[]) : [];
+        const remoteList = Array.isArray(remote) ? (remote as any[]) : [];
+
+        // Browser-only rows are either new work or offline edits; both go up.
+        const remoteIds = new Set(remoteList.map((r) => String(r?.id)));
+        const localOnly = localList.filter(
+          (r) => r?.id && !remoteIds.has(String(r.id)) && !isInFlight(map.key, String(r.id)),
+        );
+
+        if (localOnly.length) {
+          const merged = [...remoteList, ...localOnly];
+          this.adopt(map.key, merged);
+          queueDiff(map, remoteList, merged);
+        } else if (remoteList.length || !localList.length) {
+          this.adopt(map.key, remoteList);
+        }
+        // Otherwise the local copy is non-empty and the server holds nothing
+        // new, so the browser copy stands and nothing is written.
+      }
+
+      this.notify();
+    } catch (err) {
+      // A failed read must not stop the app. localStorage is a complete copy and
+      // the clinician can keep working; the next save retries the write.
+      console.error('[db] could not read from Postgres, continuing on local data:', err);
+    } finally {
+      this.resolveReady();
+    }
+  }
+
+  /**
+   * Replace a collection with a server-authoritative value without treating it
+   * as a user edit. The baseline moves with it, so the next real save diffs
+   * against what the server holds instead of re-pushing the whole collection.
+   */
+  private adopt(key: string, value: unknown): void {
+    const field = STORAGE_FIELD[key];
+    if (!field) return;
+    (this as unknown as Record<string, unknown>)[field] = value;
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (err) {
+      console.error(`Error persisting ${key} after sync:`, err);
+    }
+    baseline.set(key, value);
   }
 
   public subscribe(listener: () => void): () => void {

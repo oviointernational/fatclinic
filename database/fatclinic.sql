@@ -478,9 +478,12 @@ CREATE TABLE IF NOT EXISTS service_prices (
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- One invoice per visit (enforced by UNIQUE below). The money columns are
--- maintained by recalc_invoice(); write `discount` and the line items, and let
--- the database do the arithmetic.
+-- One invoice per visit is expected of the application, not enforced by a
+-- constraint: a unique index on visit_id would make an unsynced browser that
+-- creates a second invoice hard-fail, and a clinical record should not lose a
+-- billing row to a constraint violation. The money columns are maintained by
+-- recalc_invoice(); write `discount` and the line items, and let the database do
+-- the arithmetic.
 CREATE TABLE IF NOT EXISTS invoices (
   id                 TEXT PRIMARY KEY,               -- 'FC-INV-2026-001'
   visit_id           TEXT NOT NULL REFERENCES visits(id) ON DELETE CASCADE,

@@ -13,9 +13,13 @@
     "db:lint": "node scripts/lint-schema.mjs",
     "db:lint:test": "node scripts/lint-selftest.mjs",
     "db:config:test": "node scripts/db-config-selftest.mjs",
-    "db:test": "npm run db:lint && npm run db:lint:test && npm run db:config:test",
+    "db:sync:test": "node scripts/sync-selftest.mjs",
+    "db:sync:defects": "node scripts/sync-defects.mjs",
+    "db:test": "npm run db:lint && npm run db:lint:test && npm run db:config:test && npm run db:sync:test && npm run db:sync:defects",
     "db:apply": "node scripts/apply-schema.mjs",
-    "db:check-rls": "node scripts/check-rls.mjs"
+    "db:check-rls": "node scripts/check-rls.mjs",
+    "db:check-api": "node scripts/check-api.mjs",
+    "db:verify": "npm run db:lint && npm run db:sync:test && npm run db:check-rls && npm run db:check-api"
   },
   "engines": {
     "node": ">=20"

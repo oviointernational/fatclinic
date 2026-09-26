@@ -14,8 +14,14 @@
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
-const url = import.meta.env.VITE_SUPABASE_URL?.trim();
-const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim();
+// `import.meta.env` only exists under a bundler. Reading it defensively means
+// this module can also be loaded by plain Node, which the sync self-test does so
+// the row mappers can be exercised without a browser or a live project.
+const env = ((import.meta as unknown as { env?: Record<string, string | undefined> }).env ??
+  {}) as Record<string, string | undefined>;
+
+const url = env.VITE_SUPABASE_URL?.trim();
+const anonKey = env.VITE_SUPABASE_ANON_KEY?.trim();
 
 /** True when the browser has been pointed at a Supabase project. */
 export const isSupabaseConfigured = Boolean(url && anonKey);

@@ -67,18 +67,30 @@ Supabase Auth.
 | `npm run db:lint` | Static checks on the SQL: every seed column, foreign key, index and view target exists, seed values satisfy their own CHECK constraints, ward codes match the TypeScript model, no credential column | no |
 | `npm run db:lint:test` | Injects known defects to prove `db:lint` actually catches them | no |
 | `npm run db:config:test` | Proves the `.env` password guards and the host resolver behave correctly, including the dotenv `#` truncation trap | no |
-| `npm run db:test` | All three of the above | no |
+| `npm run db:sync:test` | Proves the sync layer against the schema: mappers emit only real columns, every required column is always sent, values survive a round trip, and inserts/updates/deletes/children/grandchildren/append-only tables/queue coalescing all behave as documented | no |
+| `npm run db:sync:defects` | Breaks `sync.ts` six ways and requires the self-test to fail each time | no |
+| `npm run db:test` | All five of the above | no |
 | `npm run db:apply` | Applies the schema in a transaction, then verifies RLS, grants, triggers, invoice math and seeds | yes |
-| `npm run db:check-rls` | Proves the anon key is blocked by RLS over the public API | yes |
+| `npm run db:check-rls` | Proves the anon key is blocked by RLS over the public API | no (HTTP) |
+| `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
+| `npm run db:verify` | Lint, sync self-test, RLS and live API in one pass | no (HTTP) |
 
 `db:lint` is not a substitute for `db:apply` — it cannot type-check expressions or
 prove a trigger fires. It exists because a seed that names a valid column can
 still be rejected by a CHECK constraint, and that is not obvious until the
 database says so.
 
-The two `:test` scripts exist because a linter that silently checks nothing
+The `:test` scripts exist because a linter that silently checks nothing
 looks exactly like a linter that passes. Each one injects a defect and requires
 the linter to name it.
+
+`db:check-api` and `db:check-rls` need no Postgres connection — only the project
+URL and the anon key, over HTTPS. That matters on a machine that cannot route to
+the IPv6-only database host, where `db:apply` cannot run at all: a table can be
+created and still be absent from the PostgREST schema cache, and the app's first
+query against it then fails at runtime. A `404 PGRST205` means the name is not in
+the cache; a `401` means it is in the cache and the anon role has no grant, so
+the script verifies that split with a control name rather than assuming it.
 
 ### If the connection times out
 
