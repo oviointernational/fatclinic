@@ -24,6 +24,12 @@
  * Run:  npm run db:check-staff-accounts
  * Needs STAFF_PASSWORD in the environment (never argv - it would land in shell
  * history and in any process listing).
+ *
+ * Without it, the offline half still runs and the live half is skipped, so the
+ * script is safe in `npm run db:test`: the live half signs in as the
+ * administrator, which is the one thing here not done unattended. Password
+ * recovery itself is covered by db:check-recovery, against the deployed
+ * function, and needs no credential at all.
  */
 import { readFileSync } from 'node:fs';
 import { handleStaffAccountRequest, checkPassword, normaliseEmail } from '../supabase/functions/staff-accounts/handler.ts';
@@ -526,9 +532,15 @@ async function main() {
   if (!URL_BASE || !ANON || !SR) {
     throw new Error('VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY missing from .env');
   }
+  // The unit half is pure: it runs the local handler.ts with a fake environment
+  // and touches nothing. Splitting it out means a wording or validation change
+  // can be checked in the ordinary `db:test` run, without a live credential and
+  // without the risk of a suite that rewrites a real password.
   if (!ORIGINAL) {
-    console.log('STAFF_PASSWORD is not set in the environment. Nothing was changed.');
-    process.exitCode = 1;
+    console.log('STAFF_PASSWORD is not set: running the offline checks only. Nothing was changed.');
+    unitChecks();
+    console.log(failures === 0 ? '\nThe handler logic is correct (live half skipped).' : `\n${failures} check(s) failed.`);
+    if (failures) process.exitCode = 1;
     return;
   }
 

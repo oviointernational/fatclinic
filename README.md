@@ -120,13 +120,14 @@ connection colour, so it cannot show a green light over unsaved work.
 
 ### Staff accounts
 
-Three things, and one small server-side function:
+Four things, and one small server-side function:
 
 | Who | What | How |
 |---|---|---|
 | Staff member | Change their own password | **My Account → Password**. No server component. |
 | Administrator | Create a colleague's account with a password | **Admin → Staff → Add Staff Account** |
 | Administrator | Set a new password for someone who forgot theirs | **Admin → Staff → Reset Password** |
+| Anyone locked out | Recover a password with no session at all | **Sign-in → Forgotten your password?** |
 
 If someone is suddenly told their password is wrong when it is not, read
 [Locked out, but the password is right](#locked-out-but-the-password-is-right)
@@ -145,6 +146,10 @@ opened devtools — so the key lives in the function's server-side secrets and
 never crosses the wire toward the client. The function is not a backend and is
 not in the path of clinic data: ordinary records still go straight from the
 browser to Postgres through RLS, exactly as before.
+
+The fourth is described in [Forgotten password](#forgotten-password), because
+it is the only one that runs without a session, and that has consequences for
+`verify_jwt` worth reading before you change it.
 
 **Deploy it.** The function cannot be deployed from this repository without a
 Supabase personal access token, which is an account credential, not a project one:
@@ -268,13 +273,21 @@ guaranteed to keep the account locked. Someone can be certain their password is
 right, watch it be rejected all afternoon, and conclude the credential has broken.
 
 **What to do.** Stop trying and wait a minute. If it keeps happening, an
-administrator can clear it at once with **Admin → Staff → Reset Password**.
+administrator can clear it at once with **Admin → Staff → Reset Password** — and
+an administrator locked out of their own account can use
+[forgotten password](#forgotten-password), which needs no session at all.
 
-The app now says so rather than claiming the password is wrong
-(`src/services/authFailure.ts`, pinned by `npm run db:check-signin-locked`):
+The app now says so rather than claiming the password is wrong in either
+direction (`src/services/authFailure.ts`, pinned by `npm run db:check-signin-locked`):
 
-> Too many failed sign-in attempts for this account. Your password is not the
-> problem. Wait a minute without trying, then sign in once.
+> Too many failed sign-in attempts for this account. Wait a minute without trying,
+> then try once. If you have forgotten your password, an administrator can reset
+> it for you.
+
+It deliberately claims neither that the password is right nor that it is wrong,
+because neither is known. "Your password is not the problem" was the sentence in an
+earlier draft, and it is false for exactly the person most likely to read it: the
+one who has genuinely forgotten it.
 
 Distinguishing the two is safe to do — a rate limit says nothing about whether an
 address exists, so it leaks no more than a wrong password does. The two are told
@@ -282,41 +295,66 @@ apart on the shape of the refusal, and the test pins **both** directions, becaus
 the expensive mistake is the one that shows a wrong-password warning to a
 locked-out colleague.
 
-### If the administrator forgets their own password
+### Forgotten password
 
-**This is the one situation with no in-app answer, so it is worth knowing before
-you need it.**
+**Sign-in → Forgotten your password?** There is no email in this flow, because
+this project has no working mail relay and an email that never arrives is worse
+than no flow at all. Instead you supply three stored facts, and all three must
+match:
 
-There is no "forgot password" link on the sign-in screen. There cannot be one
-while this project has no working mail relay: a self-service flow ends in an email
-that never arrives, which is worse than no flow at all, because the person waits
-for a message that is not coming. It is left out on purpose.
+| | Where it is |
+|---|---|
+| **Email** | The address you sign in with |
+| **PIN** | Your 4-digit workstation PIN — **My Account → PIN** |
+| **ID** | Your account identifier — **My Account → PIN**, under "Write these down now" |
 
-The administrator is also the only person who can reset passwords, and doing that
-requires being signed in. So an administrator who cannot sign in has to come in
-from outside the app, from a terminal where the project is checked out:
+Write them down while you can sign in. The recovery screen shows the same three,
+and the ID is also in the Supabase dashboard under **Authentication → Users**, if
+you would rather not rely on the app.
+
+Changing the password ends every session already open on that account, so it is a
+revocation as well as a reset, and the person is made to choose a password of
+their own at the next sign-in.
+
+**If you are still stuck, the terminal always works.** From a checkout of the
+project:
 
 ```bash
 npm run staff:list                 # find your own id, USR-001 for the first admin
 npm run staff:add -- --link USR-001 --password 'a-new-password-you-choose'
 ```
 
-`--link` works on an account that already exists, so this both sets a new
-password and re-links the profile. Verified end to end on a throwaway account: the
-old password is refused and the new one signs in. The profile row, and its audit
-history, are untouched — resetting a password is not a new account.
+`--link` works on an account that already exists, so it both sets a new password
+and re-links the profile. The profile row and its audit history are untouched —
+resetting a password is not a new account. Verified end to end on a throwaway
+account: the old password is refused and the new one signs in.
 
-**Then change it again from inside the app.** That command sets a password you
-type on a shared machine, so treat it as a way back in rather than a way to live.
-Once you are in, **My Account → Password** sets one only you know.
+#### Why the check is one real factor and not three
 
-Two things that make this easier to get wrong than they look:
+It is worth being straight about this, because three boxes on a form look like
+three factors and are not.
 
-- **Stop after a few tries and wait.** Around 15–18 wrong attempts locks the
-  account for about a minute, and every retry during that window re-arms it. See
-  [Locked out, but the password is right](#locked-out-but-the-password-is-right).
-- **You cannot do this from the app at all.** The Admin → Staff → Reset Password
-  button is inside the workstation you are locked out of.
+- The **email** is not a secret. It is on a nameplate.
+- The **PIN** is not a secret either, and cannot be made into one: the app
+  compares it in the browser to wake a sleeping workstation, so every member of
+  staff can read every colleague's. It is a screen lock, and it ships as `1234`.
+- The **ID** is the only secret, and it is the whole check. A 122-bit value that
+  only you and the database owner can supply.
+
+The ID used to be readable by any signed-in staff member, which made the check
+worthless — any clinician could have read the administrator's three facts and
+become an administrator. `users.auth_user_id` is now granted to `authenticated`
+column by column, with that one column left out, and `app_own_account_id()` gives
+a signed-in person their own and nobody else's. `npm run db:check-recovery-secrets`
+fails if that grant is ever widened again, and it checks the live database rather
+than the SQL, because a grant that is quietly broadened produces no error anywhere
+else.
+
+Also worth knowing: recovery is the one action on the function that runs without a
+session, so `verify_jwt` is **off** for `staff-accounts` and the handler is the
+only gate. That is a real trade — an unauthenticated call now costs one function
+invocation before it is refused — and it is documented at length in
+`supabase/config.toml`.
 
 ### Database checks
 
@@ -341,9 +379,12 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:probe-auth-admin` | Pins the Auth admin API shapes the function depends on (`PUT` is the only update verb, `?filter=` is ignored so an email lookup must page), then deletes the account it made | yes (service_role) |
 | `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, and proves the gateway refuses an unauthenticated POST before the handler runs | no (HTTP) |
 | `npm run db:check-deployed` | Tests the function **Supabase is actually serving**, not the file on disk: a password containing the staff name is refused, an older rule is still refused, a good password really authenticates, a clinician is refused, and it deletes what it created | yes + a password |
+| `npm run db:check-recovery` | Tests [forgotten password](#forgotten-password) against the deployed function with no session: all three facts together change the password and the account really authenticates, each one alone is refused, every refusal says the same thing, the password rules still apply, an existing session is ended, the audit row says no session was involved, and a clinician still cannot reach `create`/`reset` now that `verify_jwt` is off | yes (service_role) |
+| `npm run db:check-recovery-secrets` | Signs in as a throwaway **physician** and proves they cannot read anybody's ID — not with `select *`, not by name — while the app's own column list, the PIN the screen lock needs, writes, and the function's own privileged read all still work. Also reads the grant out of the catalogue, so a widened privilege fails here rather than silently | yes (service_role) |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
 | `npm run db:purge-test-audit` | Deletes `SEC-` audit rows the checks left behind. `--dry-run` first | yes |
-| `npm run db:verify` | Lint, sync self-test, RLS, orphan, live API and the Auth admin probe in one pass | yes (service_role) |
+| `npm run db:check-account-failures` | Proves a wrong recovery fact is never reported as an expired session. Both arrive as `401`, and a status-first mapping tells somebody locked out to try their password again | no |
+| `npm run db:verify` | Lint, sync self-test, RLS, orphan, live API, the Auth admin probe, and both recovery checks in one pass | yes (service_role) |
 | `npm run staff:list` | Every staff profile, and whether each one can actually sign in | yes (service_role) |
 | `npm run staff:add` | Create a staff sign-in account, or reset one with `--link` | yes (service_role) |
 | `npm run staff:clean-demo` | Deletes the nine demo profiles a previous schema version seeded. `--dry-run` first | yes (service_role) |

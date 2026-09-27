@@ -20,101 +20,23 @@
  * sends can make a non-administrator into one.
  */
 import { getSupabase } from './supabase';
+import {
+  classifyStaffAccountFailure,
+  GENERIC,
+  type StaffAccountFailure,
+  type StaffAccountResult,
+} from './staffAccountFailure';
 
-/** Why a staff account operation failed, in terms the UI can act on. */
-export type StaffAccountFailure =
-  /** This build has no Supabase connection, so there is no function to call. */
-  | 'not-configured'
-  /** The function has not been deployed to the project yet. */
-  | 'function-missing'
-  /** The session expired mid-request. */
-  | 'session-expired'
-  /** The signed-in user is not an active administrator. */
-  | 'not-admin'
-  /** The address has no staff profile, so no account should exist for it. */
-  | 'no_staff_profile'
-  /** An account already exists, so "create" is the wrong operation. */
-  | 'account_exists'
-  /** No account exists, so "reset" is the wrong operation. */
-  | 'no_auth_account'
-  | 'invalid_email'
-  | 'weak_password'
-  | 'unreachable';
+// Re-exported so existing imports keep working from one place. The logic lives
+// in staffAccountFailure.ts because it has to be testable outside a bundler.
+export type { StaffAccountFailure, StaffAccountResult } from './staffAccountFailure';
 
-export type StaffAccountResult =
-  | { ok: true; message: string }
-  | {
-      ok: false;
-      reason: StaffAccountFailure;
-      message: string;
-      /**
-       * Set when the caller asked for the wrong operation, so the dialog can
-       * offer the right one instead of making the administrator work out why
-       * "reset" refused an account that has never been created.
-       */
-      suggests?: 'create' | 'reset';
-    };
-
-const GENERIC =
-  'The sign-in account could not be changed. Check your connection and try again.';
-
-/**
- * Translate whatever came back into a reason and a sentence for a clinician.
- *
- * A missing deployment gets its own message on purpose. It is the single most
- * likely failure in a fresh install, and "Relay Error invoking the Edge
- * Function" is not something an administrator can act on.
- */
-function classify(status: number | undefined, code: string | undefined, fallback: string): StaffAccountResult {
-  const message = (fallback || '').trim() || GENERIC;
-
-  switch (code) {
-    case 'missing_token':
-      return { ok: false, reason: 'session-expired', message: 'Your session has expired. Sign in again.' };
-    case 'not_admin':
-      return { ok: false, reason: 'not-admin', message };
-    case 'no_staff_profile':
-      return { ok: false, reason: 'no_staff_profile', message };
-    case 'account_exists':
-      return {
-        ok: false,
-        reason: 'account_exists',
-        message,
-        suggests: 'reset',
-      };
-    case 'no_auth_account':
-      return {
-        ok: false,
-        reason: 'no_auth_account',
-        message,
-        suggests: 'create',
-      };
-    case 'invalid_email':
-      return { ok: false, reason: 'invalid_email', message };
-    case 'weak_password':
-      return { ok: false, reason: 'weak_password', message };
-    default:
-      break;
-  }
-
-  if (status === 401) return { ok: false, reason: 'session-expired', message: 'Your session has expired. Sign in again.' };
-  if (status === 403) return { ok: false, reason: 'not-admin', message };
-  if (status === 404) {
-    return {
-      ok: false,
-      reason: 'function-missing',
-      message:
-        'This feature runs as a Supabase Edge Function that has not been deployed yet. ' +
-        'An administrator can deploy it with: supabase functions deploy staff-accounts',
-    };
-  }
-  return { ok: false, reason: 'unreachable', message: message || GENERIC };
-}
+const classify = classifyStaffAccountFailure;
 
 /** The function's own JSON shape, from handler.ts. */
 type FunctionReply = { ok: boolean; code?: string; message?: string };
 
-async function call(body: { action: 'create' | 'reset'; email: string; password: string }): Promise<StaffAccountResult> {
+async function call(body: Record<string, unknown>): Promise<StaffAccountResult> {
   const client = getSupabase();
   if (!client) {
     return {
@@ -185,4 +107,34 @@ export function createStaffAccount(email: string, password: string): Promise<Sta
  */
 export function resetStaffPassword(email: string, password: string): Promise<StaffAccountResult> {
   return call({ action: 'reset', email: email.trim().toLowerCase(), password });
+}
+
+/**
+ * Set a new password with no session, for someone who cannot sign in.
+ *
+ * All three of the address, the workstation PIN and the account's own ID must
+ * match. Only the third is a secret: the PIN is readable by any member of staff
+ * (the app has to compare it in the browser to unlock a screen) and the address
+ * is not secret at all, so the check is one factor deep and that factor is the
+ * ID. See opRecover in the function for the full reasoning, and the README for
+ * where to find the ID.
+ *
+ * Sent through the same client as the other two calls, which means supabase-js
+ * attaches a session when there is one. That is harmless and deliberate: it
+ * makes the row in the audit log say whether the person who recovered the
+ * password was already signed in, instead of guessing.
+ */
+export function recoverStaffPassword(
+  email: string,
+  pin: string,
+  id: string,
+  password: string,
+): Promise<StaffAccountResult> {
+  return call({
+    action: 'recover',
+    email: email.trim().toLowerCase(),
+    pin: pin.trim(),
+    id: id.trim().toLowerCase(),
+    password,
+  });
 }

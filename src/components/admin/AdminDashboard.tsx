@@ -2348,17 +2348,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
             </p>
 
             <p className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 leading-relaxed">
-              This ends any session they currently have open, and they will have to choose a password
-              of their own before the workstation opens.
+              This ends any session they currently have open - measured, not assumed, see
+              <code> check-recovery</code> - and they will have to choose a password of their own
+              before the workstation opens. If this person has never been issued a sign-in account,
+              the function says so and points at <strong>Add Staff</strong> instead.
             </p>
-
-            {passwordTarget.authUserId ? null : (
-              <p className="p-2.5 rounded-xl bg-slate-50 border border-slate-300 text-slate-600 leading-relaxed">
-                This profile has no sign-in account yet, so there is nothing to reset. If they have
-                never been able to sign in, use <strong>Add Staff</strong> instead to create the
-                account.
-              </p>
-            )}
 
             <div className="grid grid-cols-2 gap-3">
               <div>
@@ -2401,7 +2395,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
               </button>
               <button
                 type="submit"
-                disabled={isResetting || !passwordTarget.authUserId}
+                disabled={isResetting}
                 className="px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-700 disabled:opacity-60 text-white font-bold shadow-sm"
               >
                 {isResetting ? 'Changing…' : 'Set Password'}

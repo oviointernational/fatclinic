@@ -37,21 +37,16 @@ export interface User {
    * localStorage instead. Use `supabase.auth` (see src/services/auth.ts).
    */
   mustChangePassword?: boolean;
-  /**
-   * The Supabase Auth account this profile signs in as, or undefined if none
-   * exists yet.
-   *
-   * Read-only, and deliberately never written back: the `staff-accounts` Edge
-   * Function is the only thing that sets it, because linking a profile to an
-   * account is a privileged act. Carrying it here is what lets an administrator
-   * see at a glance who can actually sign in, instead of discovering it by
-   * pressing "reset" on somebody who was never issued an account.
-   *
-   * It is not a secret - RLS already lets any member of staff read the whole
-   * `users` row, this column included - and it grants nothing on its own. A
-   * valid JWT is still required, and that is resolved by email in SQL.
-   */
-  authUserId?: string;
+  // `authUserId` used to sit here as a read-only convenience, on the reasoning
+  // that "RLS lets any member of staff read the whole users row, this column
+  // included, so it is not a secret". That reasoning was the bug: the column is
+  // the secret half of password recovery, and being readable by every signed-in
+  // colleague meant any clinician could reset the administrator's password.
+  //
+  // It is now off the table staff can read, and off this model with it. A
+  // signed-in person who needs their own identifier to write it down reads it
+  // with app_own_account_id() in the database, which returns the caller's own
+  // and nobody else's.
   active: boolean;
 }
 

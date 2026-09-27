@@ -1104,6 +1104,29 @@ BEGIN
     $body$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
   $fn$;
 
+  -- The signed-in staff member's own auth_user_id, so they can record it.
+  --
+  -- Readable to nobody but its owner, by construction rather than by policy: the
+  -- value is looked up from the caller's own JWT email, so there is no argument
+  -- that could point it at a colleague. That is why this is a function and not a
+  -- column grant - RLS cannot express "this column, but only on your own row",
+  -- and the alternative (letting staff read the column) is the hole below.
+  --
+  -- Returns NULL, never an error, when signed out or unrecognised: a signed-in
+  -- account with no profile is not a failure to report, it is simply nobody.
+  EXECUTE $fn$
+    CREATE OR REPLACE FUNCTION public.app_own_account_id() RETURNS UUID AS $body$
+      SELECT u.auth_user_id
+        FROM public.users u
+       WHERE lower(u.email) = lower(auth.jwt() ->> 'email')
+         AND u.active
+       LIMIT 1;
+    $body$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+  $fn$;
+
+  COMMENT ON FUNCTION public.app_own_account_id() IS
+    'The signed-in staff member''s own users.auth_user_id, or NULL. Self-only by construction: resolved from the caller''s own JWT email, so it cannot be aimed at another person.';
+
   COMMENT ON FUNCTION public.app_user_role() IS
     'App role of the signed-in staff member, matched from the Supabase JWT email. NULL when signed out or unrecognised.';
 
@@ -1158,22 +1181,60 @@ BEGIN
     EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon';
   END IF;
 
+  -- users.auth_user_id is a recovery secret, so it comes off the staff-readable
+  -- table. Placed here, after the grant above, because that grant is
+  -- table-wide: in Postgres a table-level GRANT SELECT beats any column-level
+  -- REVOKE, so a revoke written anywhere earlier would be silently inert and
+  -- would look correct in review.
+  --
+  -- Why it matters: password recovery checks an address, the PIN, and this
+  -- identifier. The address is public and the PIN is readable by any colleague,
+  -- so this column is the whole of the check. It used to ride along in a
+  -- `SELECT *` that every signed-in staff member could run - measured on this
+  -- project with a throwaway PHYSICIAN account, which returned the
+  -- administrator's PIN and identifier with `app_is_staff()` and no other
+  -- privilege. Any clinician could then have reset the administrator's password
+  -- and become an administrator. See scripts/check-recovery-secrets.mjs, which
+  -- fails if the grant below is ever widened again.
+  --
+  -- `pin` stays readable on purpose. It is a workstation screen lock that the
+  -- application has to be able to compare in the browser, it ships as 1234, and
+  -- it is not treated as a secret anywhere in this codebase. The identifier is
+  -- the part that has to be unreadable, and a UUID only the database owner or
+  -- the person who wrote it down ever sees.
+  IF to_regclass('public.users') IS NOT NULL THEN
+    EXECUTE 'REVOKE SELECT ON public.users FROM authenticated';
+    EXECUTE 'GRANT SELECT (id, name, email, role, department, avatar, pin, custom_role_id, must_change_password, active) ON public.users TO authenticated';
+  END IF;
+
   -- Policies invoke these as the table owner; clients must not call them
   -- directly, so EXECUTE is revoked from PUBLIC and regranted narrowly.
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_user_role() FROM PUBLIC';
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_is_admin() FROM PUBLIC';
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_is_staff() FROM PUBLIC';
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_current_staff_id() FROM PUBLIC';
+  EXECUTE 'REVOKE ALL ON FUNCTION public.app_own_account_id() FROM PUBLIC';
+  -- Supabase's default privileges hand EXECUTE on new public functions to `anon`
+  -- as well, and a direct grant to a role survives a REVOKE FROM PUBLIC. So the
+  -- signed-out role has to be cut off by name. Without this the function is
+  -- callable while signed out; it would answer NULL, because there is no JWT
+  -- email to match, but a door that is only closed by the answer being empty is
+  -- not a closed door.
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    EXECUTE 'REVOKE ALL ON FUNCTION public.app_own_account_id() FROM anon';
+  END IF;
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_admin() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_staff() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO authenticated';
+  EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_own_account_id() TO authenticated';
 
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_admin() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_staff() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO service_role';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_own_account_id() TO service_role';
   END IF;
 
   ALTER DEFAULT PRIVILEGES IN SCHEMA public

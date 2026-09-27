@@ -190,6 +190,18 @@ interface TableMap {
   single?: boolean;
   /** Insert only: no UPDATE or DELETE policy, and a trigger that raises. */
   appendOnly?: boolean;
+  /**
+   * Columns to read, when the grant is narrower than the table.
+   *
+   * Defaults to `*`, which is right for almost every table here. `users` is the
+   * exception: the database grants `authenticated` an explicit column list
+   * rather than the whole table, because `auth_user_id` is the secret half of
+   * password recovery and must not be readable by colleagues. Postgres refuses
+   * a `SELECT *` that touches a column the caller lacks, so this list is what
+   * keeps the staff screen working, and it has to match the GRANT in
+   * database/fatclinic.sql exactly.
+   */
+  columns?: string;
   rowToModel: (row: Record<string, any>) => unknown;
   modelToRow: (model: any) => Record<string, unknown>;
   omit?: string[];
@@ -312,10 +324,20 @@ export const TABLES: TableMap[] = [
     key: USERS_STORAGE_KEY,
     table: 'users',
     order: 30,
+    // Matches the column grant in database/fatclinic.sql. `auth_user_id` is
+    // absent on purpose: it is the secret half of password recovery, so the
+    // database does not let a signed-in staff member read anybody's, including
+    // their own. A clinician who needs their own identifier for recovery reads
+    // it with app_own_account_id(), which returns only the caller's.
+    //
+    // Changing this list means changing that GRANT in the same commit.
+    // scripts/check-recovery-secrets.mjs fails when the two drift apart.
+    columns:
+      'id,name,email,role,department,avatar,pin,custom_role_id,must_change_password,active',
     // `password` is deliberately absent: public.users has no such column and
     // credentials belong to Supabase Auth. Reading it back would also be a
     // silent failure, because the column does not exist to read.
-    omit: [...SERVER_MANAGED, 'auth_user_id'],
+    omit: SERVER_MANAGED,
     normalises: ['email'],
     rowToModel: (r): User => ({
       id: text(r.id),
@@ -327,10 +349,6 @@ export const TABLES: TableMap[] = [
       pin: text(r.pin),
       customRoleId: optText(r.custom_role_id),
       mustChangePassword: Boolean(r.must_change_password),
-      // Read-only. Present so the admin screen can tell an account that exists
-      // from one that does not; `omit` below keeps it out of every write, so
-      // nothing in the browser can re-point a profile at another account.
-      authUserId: optText(r.auth_user_id),
       active: Boolean(r.active),
     }),
     modelToRow: (m: User) => ({
@@ -1744,7 +1762,7 @@ export async function hydrateAll(): Promise<Map<string, unknown>> {
   };
 
   for (const map of [...TABLES].sort((a, b) => a.order - b.order)) {
-    const rows = await selectAll(client, map.table);
+    const rows = await selectAll(client, map.table, map.columns ?? '*');
 
     if (map.single) {
       out.set(map.key, rows[0] ? map.rowToModel(rows[0]) : null);
