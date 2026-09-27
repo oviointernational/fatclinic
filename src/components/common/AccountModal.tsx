@@ -7,6 +7,18 @@ import { X, User, Lock, KeyRound, CheckCircle2 } from 'lucide-react';
 interface AccountModalProps {
   isOpen: boolean;
   onClose: () => void;
+  /**
+   * Lock the screen to the password form and refuse to close.
+   *
+   * Set when an administrator has issued a password, so the credential they read
+   * out over a ward telephone cannot become the person's standing one. The app
+   * is not rendered behind this, so the only way past it is a real change.
+   */
+  forced?: boolean;
+  /** Called after a forced change succeeds, so the caller can release the gate. */
+  onPasswordChanged?: () => void;
+  /** Always offered in forced mode: someone who cannot get in must still be able to leave. */
+  onSignOut?: () => void;
 }
 
 /**
@@ -19,7 +31,7 @@ interface AccountModalProps {
  * normal diff; the credential is not clinic data, is never written to
  * localStorage, and is never included in a sync payload.
  */
-export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose }) => {
+export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose, forced = false, onPasswordChanged, onSignOut }) => {
   const { setCurrentUser } = useAuth();
   const currentUser = useCurrentUser();
   const [tab, setTab] = useState<'details' | 'pin' | 'password'>('details');
@@ -46,10 +58,18 @@ export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose }) =
       setNotice(null);
       setError(null);
       setNeedsCode(false);
+      // A forced change opens on the password form rather than wherever the
+      // clinician last was, so the only thing on screen is the thing to do.
+      if (forced) setTab('password');
     }
-  }, [isOpen, currentUser.id]);
+  }, [isOpen, currentUser.id, forced]);
 
   if (!isOpen) return null;
+
+  // In forced mode this is not a dialog, it is the whole screen: closing it
+  // would put an application full of patient records behind a credential the
+  // administrator chose. So there is nothing to close.
+  const dismissible = !forced;
 
   const ok = (msg: string) => {
     setNotice(msg);
@@ -106,6 +126,19 @@ export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose }) =
         setConfirmPassword('');
         setReauthCode('');
         setNeedsCode(false);
+        // Clear the "must change" flag in the same breath. Supabase has already
+        // stored the new credential; this only updates the profile, and leaving
+        // it set would lock the person straight back into this form on their
+        // next sign-in even though they had just chosen a password of their own.
+        if (currentUser.mustChangePassword) {
+          const cleared = { ...currentUser, mustChangePassword: false };
+          db.updateUser(cleared, currentUser);
+          setCurrentUser(cleared);
+        }
+        if (forced) {
+          onPasswordChanged?.();
+          return;
+        }
         ok('Sign-in password changed.');
         return;
       }
@@ -126,24 +159,37 @@ export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose }) =
           <div className="flex items-center space-x-2">
             <User className="w-5 h-5 text-emerald-500" />
             <div>
-              <h3 className="text-sm font-extrabold">My Account</h3>
+              <h3 className="text-sm font-extrabold">{forced ? 'Choose your password' : 'My Account'}</h3>
               <p className="text-[11px] text-slate-500">{currentUser.name} • {currentUser.role.replace('_', ' ')}</p>
             </div>
           </div>
-          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-slate-100"><X className="w-4 h-4" /></button>
+          {dismissible && (
+            <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-slate-100"><X className="w-4 h-4" /></button>
+          )}
         </div>
 
-        <div className="flex border-b text-xs font-bold">
-          {(['details', 'pin', 'password'] as const).map(t => (
-            <button
-              key={t}
-              onClick={() => { setTab(t); setError(null); setNotice(null); }}
-              className={`flex-1 py-2.5 border-b-2 transition-all ${tab === t ? 'border-emerald-500 text-emerald-600' : 'border-transparent text-slate-400 hover:text-slate-600'}`}
-            >
-              {t === 'details' ? 'Details' : t === 'pin' ? 'Device PIN' : 'Password'}
-            </button>
-          ))}
-        </div>
+        {forced && (
+          <div className="px-5 py-3 bg-amber-50 border-b border-amber-200 text-[11px] leading-relaxed text-amber-800">
+            <p className="font-extrabold">An administrator has issued you a password.</p>
+            <p className="mt-1">
+              Choose your own before you continue. Patient records stay hidden until you do.
+            </p>
+          </div>
+        )}
+
+        {!forced && (
+          <div className="flex border-b text-xs font-bold">
+            {(['details', 'pin', 'password'] as const).map(t => (
+              <button
+                key={t}
+                onClick={() => { setTab(t); setError(null); setNotice(null); }}
+                className={`flex-1 py-2.5 border-b-2 transition-all ${tab === t ? 'border-emerald-500 text-emerald-600' : 'border-transparent text-slate-400 hover:text-slate-600'}`}
+              >
+                {t === 'details' ? 'Details' : t === 'pin' ? 'Device PIN' : 'Password'}
+              </button>
+            ))}
+          </div>
+        )}
 
         <div className="p-5">
           {notice && (
@@ -200,11 +246,11 @@ export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose }) =
 
           {tab === 'password' && (
             <form onSubmit={handleSavePassword} className="space-y-3 text-xs">
-              {currentUser.mustChangePassword && (
+              {currentUser.mustChangePassword && !forced && (
                 <p className="p-2 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 font-bold">Administration reset your password — please choose a new one now.</p>
               )}
               <p className="text-slate-500 leading-relaxed">
-                This is your sign-in password for the clinic server. Choose one you do not use
+                This is your sign-in password for the workstation. Choose one you do not use
                 anywhere else, and do not write it on the ward terminal.
               </p>
               {needsCode && (
@@ -236,8 +282,22 @@ export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose }) =
                 className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white font-bold flex items-center justify-center space-x-2"
               >
                 <Lock className="w-3.5 h-3.5" />
-                <span>{isChanging ? 'Changing…' : 'Change Password'}</span>
+                <span>{isChanging ? 'Changing…' : forced ? 'Set my password' : 'Change Password'}</span>
               </button>
+              {forced && onSignOut && (
+                // The escape hatch, and it is not optional. Without it a clinician
+                // who cannot get in - wrong address, no note of the password, a
+                // terminal they do not own - would be stranded on a screen with
+                // no way out, holding a session they cannot use. Being unable to
+                // leave is a worse failure than being unable to enter.
+                <button
+                  type="button"
+                  onClick={onSignOut}
+                  className="w-full py-2.5 rounded-xl border border-slate-300 dark:border-dark-border text-slate-600 dark:text-slate-300 font-bold hover:bg-slate-50 dark:hover:bg-dark-surface"
+                >
+                  Sign out instead
+                </button>
+              )}
             </form>
           )}
         </div>

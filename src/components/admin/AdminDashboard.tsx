@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { db } from '../../services/db';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { useAuth, useCurrentUser } from '../../context/AuthContext';
+import { createStaffAccount, resetStaffPassword } from '../../services/staffAccounts';
 import { 
   User, 
   UserRole, 
@@ -109,8 +110,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
     avatar: '👨‍⚕️',
     pin: '1234',
     customRoleId: '',
-    active: true
+    active: true,
+    // The sign-in password for the new account. Held in component state only for
+    // as long as the dialog is open, never written to storage, and sent straight
+    // to the privileged function. See the note on the handler below.
+    password: '',
+    confirmPassword: ''
   });
+  const [isCreatingAccount, setIsCreatingAccount] = useState(false);
+  const [accountError, setAccountError] = useState<string | null>(null);
 
   // Modal States: Consumable
   const [isAddConsumableOpen, setIsAddConsumableOpen] = useState(false);
@@ -156,6 +164,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
 
   // Modal States: Assign staff password (Administration sets a new password)
   const [passwordTarget, setPasswordTarget] = useState<User | null>(null);
+  const [resetPassword, setResetPassword] = useState('');
+  const [resetConfirm, setResetConfirm] = useState('');
+  const [isResetting, setIsResetting] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
+
+  const emptyUserForm = {
+    name: '',
+    email: '',
+    role: 'PHYSICIAN' as UserRole,
+    department: 'General Medicine',
+    avatar: '👨‍⚕️',
+    pin: '1234',
+    customRoleId: '',
+    active: true,
+    password: '',
+    confirmPassword: ''
+  };
 
   // Modal States: Custom Role
   const [showCustomRoleModal, setShowCustomRoleModal] = useState(false);
@@ -190,45 +215,118 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
   };
 
   // --- Handlers: Users ---
-  const handleCreateUser = (e: React.FormEvent) => {
+  //
+  // Creating a staff member is two writes, in this order and for a reason.
+  //
+  // The profile goes in first, through the ordinary RLS-protected path, exactly
+  // like any other clinic record. Only then is the sign-in account created, and
+  // that second step needs the privileged key, so it goes through the
+  // `staff-accounts` Edge Function instead of from here.
+  //
+  // The order is not cosmetic. If the account creation fails, the leftover is a
+  // profile with no sign-in account: inert, and the same dialog fixes it on the
+  // next attempt. The other way round would leave a live credential on the
+  // project with no profile behind it - something that reads no patient data
+  // thanks to `app_is_staff()`, but which still has to be found and deleted by
+  // hand.
+  const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) return;
-    if (!userForm.name || !userForm.email) {
-      alert('Please provide name and email');
+    if (!userForm.name.trim() || !userForm.email.trim()) {
+      setAccountError('Please provide a name and an email address.');
       return;
     }
-    const created = db.addUser({
-      name: userForm.name,
-      email: userForm.email,
-      role: userForm.role,
-      department: userForm.department,
-      avatar: userForm.avatar,
-      pin: userForm.pin || '1234',
-      customRoleId: userForm.customRoleId || undefined,
-      active: userForm.active
-    }, currentUser);
-    if (userForm.customRoleId) db.assignCustomRole(created.id, userForm.customRoleId, currentUser);
-    setIsAddUserOpen(false);
-    setUserForm({
-      name: '',
-      email: '',
-      role: 'PHYSICIAN',
-      department: 'General Medicine',
-      avatar: '👨‍⚕️',
-      pin: '1234',
-      customRoleId: '',
-      active: true
-    });
-    // The profile is saved and synced, but the account cannot sign in yet: the
-    // password lives in Supabase Auth, and creating an auth user needs the
-    // service_role key, which must never be in a browser. So the one remaining
-    // step is a command on the machine that holds that key, and the exact
-    // command is shown rather than described - an administrator should not have
-    // to work out the flags.
-    showNotification(
-      `Staff profile created for ${created.name}. ` +
-        `They cannot sign in until you run: node scripts/provision-staff.mjs --link ${created.id}`
-    );
+    if (userForm.password !== userForm.confirmPassword) {
+      setAccountError('The two passwords do not match.');
+      return;
+    }
+    if (!userForm.password) {
+      setAccountError('Please choose a sign-in password for this person.');
+      return;
+    }
+
+    setIsCreatingAccount(true);
+    setAccountError(null);
+    try {
+      const created = db.addUser({
+        name: userForm.name.trim(),
+        email: userForm.email.trim(),
+        role: userForm.role,
+        department: userForm.department,
+        avatar: userForm.avatar,
+        pin: userForm.pin || '1234',
+        customRoleId: userForm.customRoleId || undefined,
+        active: userForm.active
+      }, currentUser);
+      if (userForm.customRoleId) db.assignCustomRole(created.id, userForm.customRoleId, currentUser);
+
+      const result = await createStaffAccount(created.email, userForm.password);
+      if (!result.ok) {
+        // The profile exists, so this is recoverable: the dialog stays open with
+        // the reason, and the same button retries. Nothing is left half-created
+        // that a person has to phone support about.
+        setAccountError(
+          result.reason === 'function-missing'
+            ? result.message
+            : `${result.message} The staff profile for ${created.name} was saved.`,
+        );
+        return;
+      }
+
+      setIsAddUserOpen(false);
+      setAccountError(null);
+      setUserForm(emptyUserForm);
+      showNotification(
+        `${created.name} can now sign in. They must choose their own password at first sign-in.`,
+      );
+    } catch (err) {
+      console.error('[admin] could not create the staff account:', err);
+      setAccountError('Something went wrong. The staff profile may have been saved — try again.');
+    } finally {
+      setIsCreatingAccount(false);
+    }
+  };
+
+  /**
+   * Issue a new password for someone who has forgotten theirs.
+   *
+   * The person is signed out everywhere as a side effect, because Supabase
+   * invalidates existing sessions when the credential changes. That is the point
+   * of a reset: it is what makes a forgotten-password recovery also a revocation
+   * of whoever prompted it.
+   */
+  const handleResetStaffPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!passwordTarget) return;
+    if (resetPassword !== resetConfirm) {
+      setResetError('The two passwords do not match.');
+      return;
+    }
+    if (!resetPassword) {
+      setResetError('Please choose a new password.');
+      return;
+    }
+
+    setIsResetting(true);
+    setResetError(null);
+    try {
+      const result = await resetStaffPassword(passwordTarget.email, resetPassword);
+      if (!result.ok) {
+        setResetError(result.message);
+        return;
+      }
+      const name = passwordTarget.name;
+      setPasswordTarget(null);
+      setResetPassword('');
+      setResetConfirm('');
+      setResetError(null);
+      showNotification(`Password changed for ${name}. They must choose their own at next sign-in.`);
+    } catch (err) {
+      console.error('[admin] could not reset the staff password:', err);
+      setResetError('Something went wrong. Try again.');
+    } finally {
+      setIsResetting(false);
+    }
   };
 
   const handleUpdateUser = (e: React.FormEvent) => {
@@ -1432,13 +1530,39 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
               </div>
 
               <div className="p-2.5 rounded-xl bg-slate-50 dark:bg-dark-surface border border-dashed border-slate-300 dark:border-dark-border text-[11px] text-slate-500 leading-relaxed">
-                No sign-in password is set here. Passwords belong to Supabase Auth and cannot be
-                written from a browser, so once this profile is saved you run{' '}
-                <code className="font-mono text-slate-600 dark:text-slate-300">
-                  node scripts/provision-staff.mjs --link &lt;id&gt;
-                </code>{' '}
-                to create the account they sign in with. The exact command, with the real id
-                filled in, is shown when the profile is saved.
+                <p className="font-bold text-slate-600 dark:text-slate-300">Sign-in password</p>
+                <p className="mt-1">
+                  Tell them this one in person. They will be required to replace it with their own
+                  before the workstation opens, so it is a handover password rather than theirs.
+                </p>
+                <p className="mt-1">
+                  It is held by Supabase Auth, never written into the staff record, and never kept in
+                  this browser.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-bold mb-1">Sign-In Password:</label>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={userForm.password}
+                    onChange={e => setUserForm({ ...userForm, password: e.target.value })}
+                    className="w-full px-3 py-2 rounded-xl border bg-slate-50 dark:bg-dark-surface"
+                    placeholder="Min 8 characters"
+                  />
+                </div>
+                <div>
+                  <label className="block font-bold mb-1">Confirm Password:</label>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={userForm.confirmPassword}
+                    onChange={e => setUserForm({ ...userForm, confirmPassword: e.target.value })}
+                    className="w-full px-3 py-2 rounded-xl border bg-slate-50 dark:bg-dark-surface"
+                  />
+                </div>
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -1492,19 +1616,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
               </div>
             </div>
 
+            {accountError && (
+              <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-[11px] font-bold text-rose-700 leading-relaxed">
+                {accountError}
+              </div>
+            )}
+
             <div className="flex justify-end space-x-2 pt-3 border-t">
               <button
                 type="button"
-                onClick={() => setIsAddUserOpen(false)}
-                className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-dark-surface font-bold text-slate-600"
+                onClick={() => { setIsAddUserOpen(false); setAccountError(null); }}
+                disabled={isCreatingAccount}
+                className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-dark-surface font-bold text-slate-600 disabled:opacity-60"
               >
                 Cancel
               </button>
               <button
                 type="submit"
-                className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold shadow-sm"
+                disabled={isCreatingAccount}
+                className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white font-bold shadow-sm"
               >
-                Create Account
+                {isCreatingAccount ? 'Creating…' : 'Create Account'}
               </button>
             </div>
           </form>
@@ -2150,39 +2282,93 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
         </div>
       )}
 
-      {/* Reset Staff Password — instructs, does not collect */}
+      {/* Reset Staff Password — sets a real credential through the privileged
+          function, and forces the holder to replace it on next sign-in. */}
       {passwordTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-slate-900/60" onClick={() => setPasswordTarget(null)} />
-          <div className="relative bg-white dark:bg-dark-card rounded-2xl shadow-2xl w-full max-w-lg border p-5 space-y-4 text-xs">
+          <div className="absolute inset-0 bg-slate-900/60" onClick={() => !isResetting && setPasswordTarget(null)} />
+          <form
+            onSubmit={handleResetStaffPassword}
+            className="relative bg-white dark:bg-dark-card rounded-2xl shadow-2xl w-full max-w-lg border p-5 space-y-4 text-xs"
+          >
             <div className="flex items-center justify-between">
-              <h3 className="font-extrabold text-sm">Set a sign-in password — {passwordTarget.name}</h3>
-              <button type="button" onClick={() => setPasswordTarget(null)} className="p-1.5 rounded-lg hover:bg-slate-100"><X className="w-4 h-4" /></button>
-            </div>
-
-            <p className="text-slate-600 dark:text-slate-300 leading-relaxed">
-              Passwords are held by Supabase Auth, not by this application, and they cannot be
-              set from a browser: doing so needs the <code className="font-mono">service_role</code>{' '}
-              key, which would then be readable in the page by anyone who opened devtools.
-              So this screen cannot do it, and showing a field here that quietly saved a
-              local password is exactly the bug this replaced.
-            </p>
-
-            <div className="p-3 rounded-xl bg-slate-900 text-emerald-300 font-mono text-[11px] break-all select-text">
-              node scripts/provision-staff.mjs --link {passwordTarget.id} --password &lt;new-password&gt;
+              <h3 className="font-extrabold text-sm">Set a new password — {passwordTarget.name}</h3>
+              <button
+                type="button"
+                onClick={() => { setPasswordTarget(null); setResetError(null); setResetPassword(''); setResetConfirm(''); }}
+                disabled={isResetting}
+                className="p-1.5 rounded-lg hover:bg-slate-100 disabled:opacity-50"
+              >
+                <X className="w-4 h-4" />
+              </button>
             </div>
 
             <p className="text-slate-500 leading-relaxed">
-              Run it on a machine whose <code className="font-mono">.env</code> holds{' '}
-              <code className="font-mono">SUPABASE_SERVICE_ROLE_KEY</code>. The password is
-              read from the command you typed, not stored on disk by this script. The staff
-              member is then asked to change it themselves on first sign-in.
+              Their sign-in address is <span className="font-mono">{passwordTarget.email}</span>. Read
+              the new password to them in person — it cannot be emailed to them from here.
             </p>
 
-            <div className="flex justify-end">
-              <button type="button" onClick={() => setPasswordTarget(null)} className="px-4 py-2 rounded-xl border font-bold">Close</button>
+            <p className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 leading-relaxed">
+              This ends any session they currently have open, and they will have to choose a password
+              of their own before the workstation opens.
+            </p>
+
+            {passwordTarget.authUserId ? null : (
+              <p className="p-2.5 rounded-xl bg-slate-50 border border-slate-300 text-slate-600 leading-relaxed">
+                This profile has no sign-in account yet, so there is nothing to reset. If they have
+                never been able to sign in, use <strong>Add Staff</strong> instead to create the
+                account.
+              </p>
+            )}
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block font-bold mb-1">New Password</label>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={resetPassword}
+                  onChange={e => setResetPassword(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl border bg-slate-50 dark:bg-dark-surface"
+                  placeholder="Min 8 characters"
+                />
+              </div>
+              <div>
+                <label className="block font-bold mb-1">Confirm</label>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={resetConfirm}
+                  onChange={e => setResetConfirm(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl border bg-slate-50 dark:bg-dark-surface"
+                />
+              </div>
             </div>
-          </div>
+
+            {resetError && (
+              <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-[11px] font-bold text-rose-700 leading-relaxed">
+                {resetError}
+              </div>
+            )}
+
+            <div className="flex justify-end space-x-2">
+              <button
+                type="button"
+                onClick={() => { setPasswordTarget(null); setResetError(null); setResetPassword(''); setResetConfirm(''); }}
+                disabled={isResetting}
+                className="px-4 py-2 rounded-xl border font-bold disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={isResetting || !passwordTarget.authUserId}
+                className="px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-700 disabled:opacity-60 text-white font-bold shadow-sm"
+              >
+                {isResetting ? 'Changing…' : 'Set Password'}
+              </button>
+            </div>
+          </form>
         </div>
       )}
 

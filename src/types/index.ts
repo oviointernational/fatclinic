@@ -37,6 +37,21 @@ export interface User {
    * localStorage instead. Use `supabase.auth` (see src/services/auth.ts).
    */
   mustChangePassword?: boolean;
+  /**
+   * The Supabase Auth account this profile signs in as, or undefined if none
+   * exists yet.
+   *
+   * Read-only, and deliberately never written back: the `staff-accounts` Edge
+   * Function is the only thing that sets it, because linking a profile to an
+   * account is a privileged act. Carrying it here is what lets an administrator
+   * see at a glance who can actually sign in, instead of discovering it by
+   * pressing "reset" on somebody who was never issued an account.
+   *
+   * It is not a secret - RLS already lets any member of staff read the whole
+   * `users` row, this column included - and it grants nothing on its own. A
+   * valid JWT is still required, and that is resolved by email in SQL.
+   */
+  authUserId?: string;
   active: boolean;
 }
 

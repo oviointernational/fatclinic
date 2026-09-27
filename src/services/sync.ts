@@ -327,6 +327,10 @@ export const TABLES: TableMap[] = [
       pin: text(r.pin),
       customRoleId: optText(r.custom_role_id),
       mustChangePassword: Boolean(r.must_change_password),
+      // Read-only. Present so the admin screen can tell an account that exists
+      // from one that does not; `omit` below keeps it out of every write, so
+      // nothing in the browser can re-point a profile at another account.
+      authUserId: optText(r.auth_user_id),
       active: Boolean(r.active),
     }),
     modelToRow: (m: User) => ({

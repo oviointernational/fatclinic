@@ -73,20 +73,27 @@ re-running it is safe.
    Omit `--password` and one is generated and printed once. Never paste that key
    into chat or commit it: it bypasses every access rule in the database.
 
-   Adding a colleague from the app's admin screen creates their **profile** only.
-   The password cannot be set from a browser — it needs the service_role key — so
-   the screen prints the command to run:
-   `npm run staff:add -- --link USR-003`. Use `--link` with a new `--password` to
-   reset a forgotten one, and `--disable USR-003` to revoke access.
-6. Prove the whole path works, with a real sign-in:
+   Afterwards you can create and reset colleague accounts **from the app's admin
+   screen**, with a real password field, once the Edge Function below is
+   deployed. The `staff:add` script stays available for break-glass use.
+6. Deploy the `staff-accounts` Edge Function, so administrators can create
+   accounts and reset passwords from inside the app:
+   ```bash
+   npx supabase login                                    # once
+   npx supabase functions deploy staff-accounts
+   npx supabase secrets set SUPABASE_SERVICE_ROLE_KEY=<value from .env>
+   ```
+   See "Staff accounts" below for why this exists and what it does.
+7. Prove the whole path works, with a real sign-in:
    ```bash
    STAFF_PASSWORD='the-generated-password' \
      npm run db:check-signin -- you@fatclinic.health
    ```
    This signs in for real, reads through the live API, and asserts that the SQL
-   helpers resolve, that an admin may write to configuration, that a `DELETE` on
-   the staff table is refused, and that deactivating a profile revokes access
-   without touching the auth account. Every write is rolled back.
+   helpers resolve, that an admin may write to configuration, that a
+   **non-administrator cannot delete a staff row**, and that deactivating a
+   profile revokes access without touching the auth account. Every write is
+   rolled back.
 
 SSL is automatic for public hosts. `database/fatclinic.sql` creates 34 tables
 (`users`, `patients`, `visits`, `invoices`, `payments`, `audit_logs`, …) and
@@ -112,6 +119,73 @@ The header badge reports the truth about saving: it queries the database rather
 than a local endpoint, and shows outstanding unsaved changes in preference to the
 connection colour, so it cannot show a green light over unsaved work.
 
+### Staff accounts
+
+Three things, and one small server-side function:
+
+| Who | What | How |
+|---|---|---|
+| Staff member | Change their own password | **My Account → Password**. No server component. |
+| Administrator | Create a colleague's account with a password | **Admin → Staff → Add Staff Account** |
+| Administrator | Set a new password for someone who forgot theirs | **Admin → Staff → Reset Password** |
+
+The first has no privileged component at all: `changePassword` in
+`src/services/auth.ts` is a signed-in user writing their own credential, which
+needs no key that is not already in the browser.
+
+The other two do, and that is the whole reason `supabase/functions/staff-accounts`
+exists. Creating or resetting a Supabase Auth account requires the
+`service_role` key, which **bypasses every row-level security policy in the
+database**. Shipping it to the browser would hand the patient table to anyone who
+opened devtools — so the key lives in the function's server-side secrets and
+never crosses the wire toward the client. The function is not a backend and is
+not in the path of clinic data: ordinary records still go straight from the
+browser to Postgres through RLS, exactly as before.
+
+**Deploy it.** The function cannot be deployed from this repository without a
+Supabase personal access token, which is an account credential, not a project one:
+
+```bash
+npx supabase login                                     # dashboard → account → access tokens
+npx supabase functions deploy staff-accounts
+npx supabase secrets set SUPABASE_SERVICE_ROLE_KEY=<the same value as in .env>
+```
+
+Until it is deployed, the admin screens say exactly that rather than failing
+vaguely, and the CLI (`npm run staff:add -- --link USR-003`) still works.
+
+**What it checks.** The request body is a request, not a claim. The handler
+resolves the caller from the email inside their own verified JWT, requires an
+`active` `ADMINISTRATOR` row in `public.users`, and ignores any `role`,
+`user_id` or `is_admin` the browser sent. A valid session is not an
+administrator, and a disabled administrator is refused. There are two checks
+because the gateway's `verify_jwt` only proves the caller signed in.
+
+**Password rules, enforced server-side.** At least 8 characters, no spaces, no
+leading or trailing whitespace, not a short list of common passwords, not the
+email address, not one repeated character. The rules are duplicated in the form
+for a faster answer, but only the server-side copy counts — client validation of
+a secret can be skipped from the console.
+
+**A password you issue is not theirs to keep.** Both operations set
+`users.must_change_password`, and `App.tsx` then refuses to render the
+workstation until it is replaced — the credential you read out over a ward
+telephone is a handover password. `My Account → Password` clears the flag itself.
+The gate always offers **Sign out instead**: someone who cannot get in must still
+be able to leave.
+
+**Creating is two writes, in a fixed order.** The profile is written first
+through the ordinary RLS-protected path, then the account is created. If the
+second step fails the leftover is a profile with no sign-in account, which is
+inert and retried by the same button. The other order would leave a live
+credential that no profile exists for.
+
+**Every privileged action is audited** into `audit_logs` under the `SEC-` prefix,
+attributed to the acting administrator, and never containing the password. The
+table is append-only, so those rows cannot be edited afterwards — including by
+this test suite, which is why `db:check-staff-accounts` has to disable the
+immutability trigger for one statement in order to clean up after itself.
+
 ### Database checks
 
 | Command | What it does | Needs a database |
@@ -122,14 +196,18 @@ connection colour, so it cannot show a green light over unsaved work.
 | `npm run db:sync:test` | Proves the sync layer against the schema: mappers emit only real columns, every required column is always sent, values survive a round trip, and inserts/updates/deletes/children/grandchildren/append-only tables/queue coalescing all behave as documented | no |
 | `npm run db:sync:defects` | Breaks `sync.ts` ten ways and requires the self-test to fail each time | no |
 | `npm run db:test` | All five of the above | no |
-| `npm run db:apply` | Applies the schema in a transaction, then verifies RLS, grants, triggers, invoice math and seeds. Fails if a retired demo profile is still present, or if a verification probe leaked a row | yes |
+| `npm run db:apply` | Applies the schema in a transaction, then verifies RLS, grants, triggers, invoice math and seeds. Fails if a retired demo profile is still present, if a verification probe leaked a row, or if a live policy is not declared in `database/fatclinic.sql` (or vice versa) | yes |
 | `npm run db:find-region` | Finds which IPv4 pooler region the project is in, by handshaking | yes |
 | `npm run db:fix-connection` | The same, and writes the answer to `.env` | yes |
 | `npm run db:check-rls` | Proves the anon key is blocked by RLS over the public API, and that email self-signup is off | no (HTTP) |
 | `npm run db:check-orphan` | Creates a throwaway auth account with no staff profile, signs in for real, and proves it reads and writes nothing | yes (service_role) |
-| `npm run db:check-signin` | Signs in as a real staff member: proves RLS admits them, role gating works, and a deactivated profile loses access | yes + a password |
+| `npm run db:check-signin` | Signs in as a real staff member: proves RLS admits them, role gating works, a non-admin cannot delete a staff row, and a deactivated profile loses access | yes + a password |
+| `npm run db:check-password` | Proves a signed-in user can rotate their own password with no one-time code, that the new one works, the old one stops working, and the account is restored afterwards | yes + a password |
+| `npm run db:check-staff-accounts` | Runs the real `supabase/functions/staff-accounts/handler.ts` under Node against the live project: create and reset succeed, the passwords really authenticate, the profile is linked, refusals hold for a clinician / a disabled admin / a forged token / a weak password, and everything it created is removed | yes + a password |
+| `npm run db:probe-auth-admin` | Pins the Auth admin API shapes the function depends on (`PUT` is the only update verb, `?filter=` is ignored so an email lookup must page), then deletes the account it made | yes (service_role) |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
-| `npm run db:verify` | Lint, sync self-test, RLS, orphan and live API in one pass | yes (service_role) |
+| `npm run db:purge-test-audit` | Deletes `SEC-` audit rows the checks left behind. `--dry-run` first | yes |
+| `npm run db:verify` | Lint, sync self-test, RLS, orphan, live API and the Auth admin probe in one pass | yes (service_role) |
 | `npm run staff:list` | Every staff profile, and whether each one can actually sign in | yes (service_role) |
 | `npm run staff:add` | Create a staff sign-in account, or reset one with `--link` | yes (service_role) |
 | `npm run staff:clean-demo` | Deletes the nine demo profiles a previous schema version seeded. `--dry-run` first | yes (service_role) |

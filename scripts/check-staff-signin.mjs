@@ -135,9 +135,46 @@ const clinicalWrite = await asSession(() => client.query(
 )).then((r) => r.rows.length, (e) => { say(`      ${e.message}`); return 0; });
 check('a staff member may write to a clinical table', clinicalWrite >= 1);
 
-const deleted = await asSession(() => client.query('delete from users'))
-  .then(() => true, (e) => /row-level security/i.test(e.message));
-check('a DELETE on users is rejected (admin_tables are insert/update only for non-admins too)', deleted);
+// Deleting a staff row is a privileged act, so the property worth proving is
+// that an ordinary clinician cannot do it.
+//
+// The previous version of this check asserted that *nobody* could, by expecting
+// an RLS error. That was never true - `users_delete` has always been granted to
+// administrators in the live database - and the assertion only appeared to pass
+// for an unrelated reason. The DELETE was being refused by the append-only
+// audit trigger (the foreign key is ON DELETE SET NULL, which has to UPDATE
+// audit_logs, which the trigger forbids), not by row-level security at all. A
+// test that passes because of the wrong mechanism is worse than no test: it
+// stops the day the data changes shape.
+const tempClinician = 'USR-CHECKNONADMIN';
+const tempClinicianEmail = `check-nonadmin-${Date.now()}@clinic.test`;
+let nonAdminDelete = false;
+await client.query('begin');
+try {
+  await client.query(
+    `insert into users (id, name, email, role, pin, active)
+     values ($1, 'Check Non-Admin', $2, 'PHYSICIAN', '1234', true)`,
+    [tempClinician, tempClinicianEmail],
+  );
+  // Same transaction, so the profile exists for the moment the claims are used
+  // and is rolled back with everything else.
+  await client.query('set local role authenticated');
+  await client.query('select set_config($1, $2, true)', [
+    'request.jwt.claims',
+    JSON.stringify({ email: tempClinicianEmail, role: 'authenticated' }),
+  ]);
+  const del = await client.query(`delete from users where id = $1`, [tempClinician]);
+  nonAdminDelete = del.rowCount > 0;
+} catch (e) {
+  // An RLS refusal is the expected outcome.
+  nonAdminDelete = false;
+  if (!/row-level security/i.test(e.message)) {
+    say(`      unexpected refusal: ${e.message}`);
+  }
+} finally {
+  await client.query('rollback').catch(() => {});
+}
+check('a NON-administrator cannot delete a staff row', nonAdminDelete === false);
 
 // --- an inactive profile must lose access -------------------------------------
 // The other half of app_is_staff(): deactivating the profile, not deleting the

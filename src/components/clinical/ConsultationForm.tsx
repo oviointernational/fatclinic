@@ -872,7 +872,12 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
                   </div>
                   <div className="text-right">
                     <div className="text-xs opacity-80">Attending Physician</div>
-                    <div className="font-bold text-sm">{existingConsultation?.physicianName || 'Dr. Johnathan Adeleke'}</div>
+                    {/* Falls back to the signed-in clinician, who is who writes
+                        `physicianName` on save. This used to fall back to a
+                        hardcoded invented doctor, which put a fabricated name in
+                        the Attending Physician box of a real patient's record
+                        every time the consultation had not been saved yet. */}
+                    <div className="font-bold text-sm">{existingConsultation?.physicianName || currentUser.name}</div>
                     <div className="text-xs opacity-80 mt-1">Registered: {new Date(patient.registeredAt).toLocaleDateString()}</div>
                   </div>
                 </div>

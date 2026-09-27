@@ -5,6 +5,7 @@ import { MainContainer } from './components/layout/MainContainer';
 import { Header } from './components/layout/Header';
 import { PinLockModal } from './components/common/PinLockModal';
 import { AuthModal } from './components/common/AuthModal';
+import { AccountModal } from './components/common/AccountModal';
 import { AuditLogModal } from './components/common/AuditLogModal';
 import { PatientProfileDialog } from './components/patients/PatientProfileDialog';
 import { PatientRegistration } from './components/patients/PatientRegistration';
@@ -28,7 +29,7 @@ export const App: React.FC = () => {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
   const [isRegistrationOpen, setIsRegistrationOpen] = useState<boolean>(false);
 
-  const { isAuthenticated, isResolvingSession } = useAuth();
+  const { isAuthenticated, isResolvingSession, currentUser, signOut } = useAuth();
 
   // Audit Log Modal State
   const [auditLogModalOpen, setAuditLogModalOpen] = useState<boolean>(false);
@@ -133,6 +134,28 @@ export const App: React.FC = () => {
         <AuthModal
           isOpen={isAuthModalOpen}
           onClose={() => setIsAuthModalOpen(false)}
+        />
+      </div>
+    );
+  }
+
+  // A password issued by an administrator has to be replaced before the
+  // workstation opens.
+  //
+  // This gate sits above everything, so no patient record is ever rendered
+  // behind a credential an administrator chose and read out over a telephone.
+  // The escape hatch matters as much as the lock: someone who cannot get in must
+  // still be able to sign out, or a screen with no way off it is a worse failure
+  // than the one it prevents. The flag clears itself in AccountModal once
+  // Supabase confirms the change, so this releases without a reload.
+  if (isAuthenticated && currentUser?.mustChangePassword) {
+    return (
+      <div className="w-screen h-screen overflow-hidden flex items-center justify-center bg-light-bg dark:bg-dark-bg">
+        <AccountModal
+          isOpen
+          forced
+          onClose={() => undefined}
+          onSignOut={() => void signOut()}
         />
       </div>
     );
