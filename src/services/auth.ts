@@ -33,39 +33,12 @@ import type { Session } from '@supabase/supabase-js';
 import type { User } from '../types';
 import { getSupabase } from './supabase';
 import { TABLE_BY_KEY, USERS_STORAGE_KEY } from './sync';
+import { fail, isRateLimited, MESSAGES, type AuthFailure, type AuthFailureOutcome } from './authFailure';
 
-/** Why a sign-in did not produce a staff profile. */
-export type AuthFailure =
-  | 'not-configured'
-  | 'invalid-credentials'
-  | 'no-profile'
-  | 'inactive'
-  | 'unreachable';
-
-export type AuthOutcome =
-  | { ok: true; user: User }
-  | { ok: false; reason: AuthFailure; message: string };
-
-/**
- * Copy shown to the clinician.
- *
- * `invalid-credentials` deliberately does not say which half was wrong: telling
- * an attacker whether an address is registered turns the sign-in form into an
- * account-enumeration oracle.
- */
-const MESSAGES: Record<AuthFailure, string> = {
-  'not-configured':
-    'This build is not connected to Supabase, so nobody can sign in. Set ' +
-    'VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY, then rebuild.',
-  'invalid-credentials': 'Email or password is incorrect.',
-  'no-profile':
-    'Your sign-in was accepted, but there is no staff profile for this address. ' +
-    'An administrator has to create one before you can use the workstation.',
-  inactive: 'This staff account has been disabled. Contact Administration.',
-  unreachable: 'Could not reach the sign-in service. Check the connection and try again.',
-};
-
-const fail = (reason: AuthFailure): AuthOutcome => ({ ok: false, reason, message: MESSAGES[reason] });
+// Re-exported so the rest of the app keeps importing these from here, exactly as
+// before. Only the definitions moved, to a file a test can reach.
+export type { AuthFailure } from './authFailure';
+export type AuthOutcome = { ok: true; user: User } | AuthFailureOutcome;
 
 /** The `users` row mapper, reused so a session and a hydrated row agree exactly. */
 const usersMap = TABLE_BY_KEY.get(USERS_STORAGE_KEY);
@@ -139,6 +112,15 @@ export async function signIn(email: string, password: string): Promise<AuthOutco
 
   if (error || !data?.user) {
     console.warn('[auth] sign-in rejected:', error?.message);
+    // A rate-limited account is NOT a wrong password, and must not be reported as
+    // one. Measured on this project: after roughly 15-18 failed attempts the
+    // account starts answering 429 for the *correct* password too, and retyping
+    // it cannot help - only waiting, or an administrator re-setting it, clears
+    // the counter. Telling someone their password is wrong at that moment sends
+    // them into a loop that keeps the account locked.
+    if (isRateLimited((error as { status?: number } | null)?.status, error)) {
+      return fail('too-many-attempts');
+    }
     return fail('invalid-credentials');
   }
 

@@ -128,6 +128,11 @@ Three things, and one small server-side function:
 | Administrator | Create a colleague's account with a password | **Admin → Staff → Add Staff Account** |
 | Administrator | Set a new password for someone who forgot theirs | **Admin → Staff → Reset Password** |
 
+If someone is suddenly told their password is wrong when it is not, read
+[Locked out, but the password is right](#locked-out-but-the-password-is-right)
+first. It is the single most confusing thing that can happen at this screen, and
+the answer is not what the message says.
+
 The first has no privileged component at all: `changePassword` in
 `src/services/auth.ts` is a signed-in user writing their own credential, which
 needs no key that is not already in the browser.
@@ -239,6 +244,44 @@ table is append-only, so those rows cannot be edited afterwards — including by
 this test suite, which is why `db:check-staff-accounts` has to disable the
 immutability trigger for one statement in order to clean up after itself.
 
+### Locked out, but the password is right
+
+Supabase refuses a sign-in after roughly **15–18 failed attempts on one account**,
+and from then on it answers the **correct** password with the same
+`invalid_credentials` a wrong one gets. It looks exactly like a forgotten
+password. It is not one.
+
+Measured against this project, on throwaway accounts:
+
+| | |
+|---|---|
+| Trigger | ~15–18 failed attempts on that one account |
+| The limit is | **per account**, not per address — one person's typos do not lock out the rest of the clinic |
+| Correct password while locked | refused, `429 over_request_rate_limit` |
+| Retyping the correct password | **does not help** — every retry re-arms the lock |
+| Left alone | clears itself in **under a minute** |
+| Password re-set by an administrator | clears it immediately |
+
+That combination is what makes it so confusing. The natural response to "your
+password is wrong" is to type it again, and typing it again is the one thing
+guaranteed to keep the account locked. Someone can be certain their password is
+right, watch it be rejected all afternoon, and conclude the credential has broken.
+
+**What to do.** Stop trying and wait a minute. If it keeps happening, an
+administrator can clear it at once with **Admin → Staff → Reset Password**.
+
+The app now says so rather than claiming the password is wrong
+(`src/services/authFailure.ts`, pinned by `npm run db:check-signin-locked`):
+
+> Too many failed sign-in attempts for this account. Your password is not the
+> problem. Wait a minute without trying, then sign in once.
+
+Distinguishing the two is safe to do — a rate limit says nothing about whether an
+address exists, so it leaks no more than a wrong password does. The two are told
+apart on the shape of the refusal, and the test pins **both** directions, because
+the expensive mistake is the one that shows a wrong-password warning to a
+locked-out colleague.
+
 ### Database checks
 
 | Command | What it does | Needs a database |
@@ -248,13 +291,14 @@ immutability trigger for one statement in order to clean up after itself.
 | `npm run db:config:test` | Proves the `.env` password guards and the host resolver behave correctly, including the dotenv `#` truncation trap | no |
 | `npm run db:sync:test` | Proves the sync layer against the schema: mappers emit only real columns, every required column is always sent, values survive a round trip, and inserts/updates/deletes/children/grandchildren/append-only tables/queue coalescing all behave as documented | no |
 | `npm run db:sync:defects` | Breaks `sync.ts` ten ways and requires the self-test to fail each time | no |
-| `npm run db:test` | All five of the above | no |
+| `npm run db:test` | All six of the above | no |
 | `npm run db:apply` | Applies the schema in a transaction, then verifies RLS, grants, triggers, invoice math and seeds. Fails if a retired demo profile is still present, if a verification probe leaked a row, or if a live policy is not declared in `database/fatclinic.sql` (or vice versa) | yes |
 | `npm run db:find-region` | Finds which IPv4 pooler region the project is in, by handshaking | yes |
 | `npm run db:fix-connection` | The same, and writes the answer to `.env` | yes |
 | `npm run db:check-rls` | Proves the anon key is blocked by RLS over the public API, and that email self-signup is off | no (HTTP) |
 | `npm run db:check-orphan` | Creates a throwaway auth account with no staff profile, signs in for real, and proves it reads and writes nothing | yes (service_role) |
 | `npm run db:check-signin` | Signs in as a real staff member: proves RLS admits them, role gating works, a non-admin cannot delete a staff row, and a deactivated profile loses access | yes + a password |
+| `npm run db:check-signin-locked` | Proves a rate-limited account is not reported as a wrong password, in both directions, from every shape the error arrives in. See [Locked out but the password is right](#locked-out-but-the-password-is-right) | no |
 | `npm run db:check-password` | Proves a signed-in user can rotate their own password with no one-time code, that the new one works, the old one stops working, and the account is restored afterwards | yes + a password |
 | `npm run db:check-staff-accounts` | Runs the real `supabase/functions/staff-accounts/handler.ts` under Node against the live project: create and reset succeed, the passwords really authenticate, the profile is linked, refusals hold for a clinician / a disabled admin / a forged token / a weak password, the browser and the function agree on every password rule, and everything it created is removed | yes + a password |
 | `npm run db:check-email` | Inserts a real staff row and proves the live database refuses a second one for the same address, including when only the case differs. The form's message is help; this is the guarantee | yes (service_role) |
