@@ -81,7 +81,6 @@ re-running it is safe.
    ```bash
    npx supabase login                                    # once
    npx supabase functions deploy staff-accounts
-   npx supabase secrets set SUPABASE_SERVICE_ROLE_KEY=<value from .env>
    ```
    See "Staff accounts" below for why this exists and what it does.
 7. Prove the whole path works, with a real sign-in:
@@ -148,8 +147,13 @@ Supabase personal access token, which is an account credential, not a project on
 ```bash
 npx supabase login                                     # dashboard → account → access tokens
 npx supabase functions deploy staff-accounts
-npx supabase secrets set SUPABASE_SERVICE_ROLE_KEY=<the same value as in .env>
 ```
+
+There is no third step and no secret to paste. Supabase injects
+`SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` into every
+Edge Function automatically, so the privileged key is already present server-side
+after the deploy. It cannot be set by hand either: the `SUPABASE_` prefix is
+reserved, and both the Dashboard and the Management API reject it.
 
 Until it is deployed, the admin screens say exactly that rather than failing
 vaguely, and the CLI (`npm run staff:add -- --link USR-003`) still works.
