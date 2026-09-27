@@ -100,7 +100,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
                 autoComplete="current-password"
                 value={password}
                 onChange={e => { setPassword(e.target.value); setError(null); }}
-                placeholder="Password given to you by Administration"
+                placeholder="Password"
                 className="w-full px-3 py-2 text-xs rounded-xl bg-slate-50 dark:bg-dark-surface border border-light-border dark:border-dark-border text-slate-800 dark:text-slate-100 focus:ring-2 focus:ring-emerald-500 focus:outline-none"
               />
             </div>
@@ -119,11 +119,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
               <LogIn className="w-3.5 h-3.5" />
               <span>{isSubmitting ? 'Signing in…' : 'Sign In to Workstation'}</span>
             </button>
-
-            <p className="text-[10px] text-slate-400 text-center leading-relaxed">
-              Accounts are entirely database-controlled — staff cannot self-register.<br />
-              Your password is checked by the clinic server, never stored in this browser.
-            </p>
           </form>
         </div>
       </div>
