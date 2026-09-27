@@ -464,6 +464,43 @@ class FatClinicDatabase {
     return this.users.find(u => u.id === id);
   }
 
+  /**
+   * Mirror a profile field the server has already confirmed, without queueing a
+   * write for it.
+   *
+   * Every other write here goes through `saveStorage`, which diffs against the
+   * last persisted value and hands the difference to the sync layer to push.
+   * That is right for a field the browser owns. It is wrong for a field the
+   * database has just ruled on, for two reasons: the write is already done, and
+   * pushing it again is a write RLS will refuse. `public.users` is an admin
+   * table, so for anybody who is not an administrator the upsert comes back
+   * 42501, the queued change is dropped, and the console fills with an error
+   * that says nothing about what the user did.
+   *
+   * So this updates the in-memory list and localStorage, and deliberately does
+   * not touch the baseline that `saveStorage` diffs against. The row is correct
+   * locally, the server is already correct, and the next reconcile pulls the
+   * same value back, so there is nothing left to disagree about.
+   *
+   * It also inserts the row if the local list has never seen it. On a first
+   * sign-in the forced password screen is reachable before the authenticated
+   * reconcile has landed, and a missing row would otherwise make the update a
+   * silent no-op - the shape of the bug this method exists to close.
+   */
+  public applyServerConfirmedUser(user: User): void {
+    const known = this.users.some(u => u.id === user.id);
+    this.users = known
+      ? this.users.map(u => (u.id === user.id ? user : u))
+      : [...this.users, user];
+    try {
+      localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(this.users));
+    } catch (err) {
+      console.error('Error saving users to storage:', err);
+    }
+    baseline.set(STORAGE_KEYS.USERS, this.users);
+    this.notify();
+  }
+
   public updateUser(user: User, adminUser: User): void {
     this.users = this.users.map(u => u.id === user.id ? user : u);
     saveStorage(STORAGE_KEYS.USERS, this.users);

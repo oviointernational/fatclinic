@@ -1,8 +1,10 @@
 import React, { useState } from 'react';
 import { useAuth, useCurrentUser } from '../../context/AuthContext';
 import { db } from '../../services/db';
-import { changePassword } from '../../services/auth';
+import { changePassword, clearOwnMustChangePassword } from '../../services/auth';
 import { X, User, Lock, KeyRound, CheckCircle2 } from 'lucide-react';
+// Aliased: `User` above is the lucide icon, not the staff profile.
+import type { User as StaffProfile } from '../../types';
 
 interface AccountModalProps {
   isOpen: boolean;
@@ -130,10 +132,28 @@ export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose, for
         // stored the new credential; this only updates the profile, and leaving
         // it set would lock the person straight back into this form on their
         // next sign-in even though they had just chosen a password of their own.
+        //
+        // The flag is cleared by the function in the database, not by
+        // `db.updateUser`, because `public.users` is an admin table: a clinician
+        // writing their own row matches no RLS policy, so the change is dropped
+        // and this screen never opens. The server's answer is what decides
+        // whether the gate releases, not the local copy.
         if (currentUser.mustChangePassword) {
-          const cleared = { ...currentUser, mustChangePassword: false };
-          db.updateUser(cleared, currentUser);
-          setCurrentUser(cleared);
+          const cleared = await clearOwnMustChangePassword();
+          const updated: StaffProfile = { ...currentUser, mustChangePassword: !cleared };
+          db.applyServerConfirmedUser(updated);
+          setCurrentUser(updated);
+          if (!cleared) {
+            // The password really did change, but the flag did not, so this
+            // screen is about to stay exactly where it is. Saying so is the
+            // only honest thing: the alternative is a person retrying until
+            // they are refused for reusing the password they just set.
+            fail(
+              'Your password was changed, but the workstation could not mark it as done. ' +
+              'Sign out and sign in again; if this screen returns, tell your administrator.',
+            );
+            return;
+          }
         }
         if (forced) {
           onPasswordChanged?.();

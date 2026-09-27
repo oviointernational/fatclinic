@@ -189,7 +189,25 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setCurrentUserState(fresh);
       return;
     }
-    console.warn(`[auth] ignoring setCurrentUser for unknown profile ${u.id}`);
+    // Rebuilding from `db` is the point - a stale or tampered copy handed in by a
+    // caller must not become the session user. But the local list is not a
+    // guarantee that the row is there: on a first sign-in the forced password
+    // screen is reachable before the authenticated reconcile has landed, and
+    // before that the list holds whatever was in localStorage, which on a
+    // machine that has never held this profile holds nothing at all.
+    //
+    // Returning silently in that case is what made the forced screen unlockable.
+    // The write it was undoing had already been discarded as a no-op against a
+    // list the row was missing from, the flag stayed set, and the person was
+    // left on a screen that could not be completed - with the second attempt
+    // refused for reusing the password they had just set.
+    //
+    // So the caller's object is used, which is safe because every caller is
+    // already holding the session profile, and the next reconcile replaces it
+    // with the server's copy. `applyServerConfirmedUser` above covers the case
+    // where the row needs adding as well as updating.
+    console.warn(`[auth] local store has no profile ${u.id}; using the supplied copy`);
+    setCurrentUserState(u);
   };
 
   const signIn = async (email: string, password: string): Promise<AuthOutcome> => {

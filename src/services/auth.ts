@@ -180,6 +180,34 @@ export type PasswordChange =
 const REAUTH_RE = /reauth|re-auth|secure password change|nonce/i;
 
 /**
+ * GoTrue refusals that are nobody's fault but the user's, and that no
+ * administrator can help with.
+ *
+ * These used to fall through to "The password could not be changed. Contact
+ * Administration.", which was worse than vague. The first one is precisely what
+ * a person hits when the forced screen is still up *after* their change already
+ * succeeded: the flag did not clear, the screen stayed, they typed the same
+ * password again, GoTrue refused it as unchanged - and they were sent to an
+ * administrator to report a fault with a password that had just been set
+ * correctly. Naming the reason is the difference between somebody who picks a
+ * different password and somebody who is locked out permanently.
+ */
+const REJECTIONS: ReadonlyArray<{ re: RegExp; message: string }> = [
+  {
+    re: /should be different from the old password/i,
+    message: 'That is the password you already have. Choose a different one.',
+  },
+  {
+    re: /weak_password|password is too weak|is_in_leaked/i,
+    message: 'That password is too easy to guess. Choose a longer one, or one you do not use anywhere else.',
+  },
+  {
+    re: /at least \d+ characters|minimum length/i,
+    message: 'Choose a longer password.',
+  },
+];
+
+/**
  * Change the signed-in user's own password.
  *
  * Staff being able to rotate their own credential is the most important
@@ -207,6 +235,16 @@ export async function changePassword(newPassword: string, nonce?: string): Promi
 
   console.warn('[auth] password change rejected:', error.message);
   if (!REAUTH_RE.test(error.message)) {
+    // GoTrue reports some refusals only in `code`, or in a `weak_password` block
+    // alongside a generic message. All three are matched, so "you already have
+    // that password" never arrives dressed as a fault needing an administrator.
+    const detail = [
+      error.message,
+      error.code ?? '',
+      JSON.stringify((error as { weak_password?: { reasons?: string[] } }).weak_password ?? ''),
+    ].join(' ');
+    const known = REJECTIONS.find((r) => r.re.test(detail));
+    if (known) return { ok: false, kind: 'message', message: known.message };
     return {
       ok: false,
       kind: 'message',
@@ -228,6 +266,46 @@ export async function changePassword(newPassword: string, nonce?: string): Promi
   }
 
   return { ok: false, kind: 'needs-nonce', message: 'That code was not accepted. We have emailed a new one - try again.' };
+}
+
+/**
+ * Clear the signed-in staff member's own `must_change_password` flag.
+ *
+ * WHY THIS CANNOT GO THROUGH THE OFFLINE STORE
+ * --------------------------------------------
+ * `db.updateUser` is the obvious way to clear a field on a profile, and it is
+ * the wrong one here. `public.users` is an admin table: its UPDATE policy
+ * requires `app_is_admin()`, so a clinician updating their own row matches no
+ * row and the write does nothing - silently, returning zero rows and no error.
+ * The offline store's own push is an upsert, which RLS refuses outright, so the
+ * change is dropped with a console error and the local copy is quietly
+ * reverts to the server's value on the next reconcile.
+ *
+ * The result was a workstation that could not be unlocked by the person using
+ * it. They changed the password successfully, the "choose your password" screen
+ * stayed up, and the next attempt was refused because the password had already
+ * changed - so the second message told them to contact an administrator about a
+ * credential that was in fact correct.
+ *
+ * So the flag is cleared by a function that can only ever clear the caller's own
+ * row, and the caller's answer is trusted over any local copy. See
+ * `app_clear_own_must_change_password` in database/fatclinic.sql for why it is
+ * a function and not a widened policy.
+ *
+ * Returns whether the row was actually updated, so a caller can tell a cleared
+ * flag from a refused one rather than assuming and stranding somebody behind a
+ * screen that will not open.
+ */
+export async function clearOwnMustChangePassword(): Promise<boolean> {
+  const client = getSupabase();
+  if (!client) return false;
+
+  const { data, error } = await client.rpc('app_clear_own_must_change_password');
+  if (error) {
+    console.error('[auth] could not clear must_change_password:', error.message);
+    return false;
+  }
+  return data === true;
 }
 
 /**

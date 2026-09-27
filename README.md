@@ -230,9 +230,56 @@ reject a great many reasonable passwords and teach people to ignore the rule.
 **A password you issue is not theirs to keep.** Both operations set
 `users.must_change_password`, and `App.tsx` then refuses to render the
 workstation until it is replaced — the credential you read out over a ward
-telephone is a handover password. `My Account → Password` clears the flag itself.
-The gate always offers **Sign out instead**: someone who cannot get in must still
-be able to leave.
+telephone is a handover password. The gate always offers **Sign out instead**:
+someone who cannot get in must still be able to leave.
+
+#### The person who was issued the password clears the flag, not the app
+
+This is the one thing in the account model that has to work for *everybody*, and
+it was broken for anyone who is not an administrator. `public.users` is an admin
+table, so its `UPDATE` policy requires `app_is_admin()`: a clinician writing
+their own row matches no policy and **the write does nothing** — silently,
+returning zero rows and no error. The offline store's own push is an `upsert`,
+which RLS refuses outright with `42501`. So `must_change_password` could not be
+cleared by the only person who was ever going to clear it.
+
+The result looked like a network fault, and every layer above the database
+reported success:
+
+1. The person signed in with the issued password and chose their own.
+2. Supabase **stored the new credential.** The change had worked.
+3. The flag never cleared, so the "choose your password" screen stayed up.
+4. They tried again, naturally, with the same password. Supabase refused it —
+   *New password should be different from the old password* — and because that
+   did not match the re-authentication pattern it was reported as
+   **"The password could not be changed. Contact Administration."**
+
+So they were sent to an administrator to report a fault with a password that had
+in fact just been set correctly, by a workstation that could not be unlocked at
+all. There was a second, independent cause: the forced screen is reachable
+*before* the local store has been reconciled, and `setCurrentUser` discarded
+the update when the profile was not in the local list yet — a silent no-op
+behind the same symptom.
+
+Clearing the flag is therefore a function in the database,
+`app_clear_own_must_change_password()`. It is not a widened policy because RLS is
+row-level: "your own row" would also hand over `role`, `active` and `pin`, which
+is self-promotion to administrator. The function takes no arguments, writes one
+boolean on the one row that is the caller's, resolves the row with
+`app_current_staff_id()` (so an orphaned token matches nothing), and is
+`anon`-proof. `db:apply` re-creates and re-grants it every run.
+
+`db:check-forced-password-change` pins all of it against the live project,
+including that a clinician still **cannot** write `users` by any other route —
+asserted on purpose, because that is the condition which made the function
+necessary, and a future policy change that removed it should fail a test rather
+than pass quietly.
+
+**A refusal that is the user's own fault is named, not escalated.** "You already
+have that password", a password in the leaked-password list, and "too short" are
+each reported as what they are. They used to fall through to *Contact
+Administration*, which is both untrue and — for the first of them — the reason
+somebody was permanently locked out.
 
 **Creating is two writes, in a fixed order.** The profile is written first
 through the ordinary RLS-protected path, then the account is created. If the
@@ -245,6 +292,20 @@ attributed to the acting administrator, and never containing the password. The
 table is append-only, so those rows cannot be edited afterwards — including by
 this test suite, which is why `db:check-staff-accounts` has to disable the
 immutability trigger for one statement in order to clean up after itself.
+
+**Known blocker: a staff profile that appears in the audit log cannot be
+deleted at all.** The trigger refuses `UPDATE` *and* `DELETE`, and
+`audit_logs.user_id` is `ON DELETE SET NULL` — so deleting a profile makes
+Postgres fire an `UPDATE` the trigger rejects, and the delete fails with
+`audit_logs is append-only; UPDATE is not permitted`. In a clinic that means any
+clinician who has ever touched a patient record can never be removed by an
+administrator, which is the opposite of what an offboarding screen promises.
+Undecided: the honest options are to make the FK `ON DELETE RESTRICT` and have
+the app *deactivate* rather than delete (the audit trail keeps its attribution,
+which is the point of an audit trail), or to narrow the trigger to refuse
+`UPDATE` of recorded values while permitting an `ON DELETE SET NULL` attribution
+rewrite. The first preserves more; the second is a smaller change. Not decided
+here, and it needs a decision before delete-staff ships.
 
 ### Locked out, but the password is right
 
@@ -478,7 +539,8 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:probe-auth-admin` | Pins the Auth admin API shapes the function depends on (`PUT` is the only update verb, `?filter=` is ignored so an email lookup must page), then deletes the account it made | yes (service_role) |
 | `npm run db:check-profile-lookup` | Signs in for real as a throwaway clinician and runs the exact `select *` on `users` that sign-in depends on. A column-level grant change once made that query fail, and `fetchProfile` reported it as "Could not reach the sign-in service" — so this pins the query login cannot do without | yes (service_role) |
 | `npm run db:check-forgot-password` | The administrator-only reset link, end to end: the function answers a caller with **no session**, a clinician / a disabled admin / an admin with no sign-in account are all refused, an unknown address gets the byte-identical reply a clinician gets, the reply carries no profile id or auth UUID, a real administrator does get a link, the generated link comes back to the deployed app in the URL fragment the app parses, and every request is audited with no actor. Proves a link is *generated* — only the recipient can confirm it *arrives* | yes (service_role) |
-| `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, proves the **handler** (not the gateway — `verify_jwt` is off) refuses `create` without a session and to a forged token, and proves the same caller is still *answered* for `forgot` | no (HTTP) |
+| `npm run db:check-forced-password-change` | The first sign-in after an administrator has issued a password, end to end: the function exists, takes no argument, runs as the definer with a pinned search_path, and only `authenticated` can execute it; a clinician can clear **their own** flag and the database records it; nobody else's row is touched; it cannot grant a role, deactivate an account, or reach a colleague; `anon` cannot call it; a clinician still **cannot** write `users` by any other route (asserted on purpose - it is why the function exists); and Supabase's "you already have that password" refusal is refused, recognised, and not sent to an administrator. This is the check for the lockout where the change *succeeded*, the screen stayed, and the retry was reported as a fault | yes (service_role) |
+| `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, proves the **handler** (not the gateway - `verify_jwt` is off) refuses `create` without a session and to a forged token, and proves the same caller is still *answered* for `forgot` | no (HTTP) |
 | `npm run db:check-deployed` | Tests the function **Supabase is actually serving**, not the file on disk: a password containing the staff name is refused, an older rule is still refused, a good password really authenticates, a clinician is refused, and it deletes what it created | yes + a password |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
 | `npm run db:purge-test-audit` | Deletes `SEC-` audit rows the checks left behind. `--dry-run` first | yes |

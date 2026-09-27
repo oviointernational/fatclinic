@@ -1104,11 +1104,48 @@ BEGIN
     $body$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
   $fn$;
 
+  -- Clear the signed-in staff member's own must_change_password flag.
+  --
+  -- WHY THIS IS A FUNCTION AND NOT A POLICY
+  -- ----------------------------------------
+  -- An administrator who issues a password sets must_change_password, and the
+  -- whole point is that the person who was issued it replaces it themselves.
+  -- But `users` is in admin_tables, so users_update requires app_is_admin() and
+  -- a clinician cannot clear their own flag: the workstation keeps showing
+  -- "choose your password" for ever, and the second attempt is rejected because
+  -- the password has already changed. Widening users_update to "your own row"
+  -- would not work either, because RLS is row-level - it would also hand over
+  -- role, active and pin, which is self-promotion to administrator.
+  --
+  -- So the permission is expressed as the one statement that is actually needed,
+  -- on the one row that is actually the caller's. It takes no arguments, so
+  -- there is nothing to smuggle through it, and it writes one boolean column,
+  -- so there is nothing to escalate with. It resolves the row with
+  -- app_current_staff_id(), which already requires an active profile matching
+  -- the JWT email - an orphaned token matches no row and changes nothing.
+  --
+  -- Returns TRUE when a row was actually updated, so the caller can tell a
+  -- cleared flag from a refused one instead of assuming.
+  EXECUTE $fn$
+    CREATE OR REPLACE FUNCTION public.app_clear_own_must_change_password() RETURNS BOOLEAN AS $body$
+      WITH cleared AS (
+        UPDATE public.users
+           SET must_change_password = FALSE
+         WHERE id = public.app_current_staff_id()
+        RETURNING 1
+      )
+      SELECT EXISTS (SELECT 1 FROM cleared);
+    $body$ LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = public
+  $fn$;
+
   COMMENT ON FUNCTION public.app_user_role() IS
     'App role of the signed-in staff member, matched from the Supabase JWT email. NULL when signed out or unrecognised.';
 
   COMMENT ON FUNCTION public.app_is_staff() IS
     'TRUE only when the JWT email matches an active public.users row. Never NULL, so it denies an orphaned auth account by evaluating FALSE rather than by accident.';
+
+  COMMENT ON FUNCTION public.app_clear_own_must_change_password() IS
+    'Clears must_change_password on the caller''s own profile and nothing else. Takes no arguments and writes one column, so it cannot be used to change a role or reach another person. Returns FALSE when the caller has no active profile.';
 
   FOREACH t IN ARRAY staff_tables LOOP
     IF to_regclass('public.' || quote_ident(t)) IS NULL THEN CONTINUE; END IF;
@@ -1164,16 +1201,34 @@ BEGIN
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_is_admin() FROM PUBLIC';
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_is_staff() FROM PUBLIC';
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_current_staff_id() FROM PUBLIC';
+  EXECUTE 'REVOKE ALL ON FUNCTION public.app_clear_own_must_change_password() FROM PUBLIC';
+  -- A revoke from PUBLIC is not enough on its own. PostgREST has to be able to
+  -- reach RPCs as the anon role, so this database also carries a
+  -- default-privileges entry giving that role EXECUTE on functions in this
+  -- schema, and an explicit grant to a named role survives a revoke from PUBLIC.
+  -- The function is harmless when called with no session - app_current_staff_id()
+  -- matches no row and it returns FALSE having written nothing - but a function
+  -- whose only job is to write a row has no business being callable by a role
+  -- that cannot sign in, so anon is cut off explicitly.
+  --
+  -- (Written as prose rather than as the statement it describes because db:lint
+  -- reads GRANT ... ON ... TO out of the raw file, comments included, and a
+  -- comment phrased as SQL fails the schema as a table that does not exist.)
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    EXECUTE 'REVOKE ALL ON FUNCTION public.app_clear_own_must_change_password() FROM anon';
+  END IF;
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_admin() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_staff() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO authenticated';
+  EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_clear_own_must_change_password() TO authenticated';
 
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_admin() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_staff() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO service_role';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_clear_own_must_change_password() TO service_role';
   END IF;
 
   ALTER DEFAULT PRIVILEGES IN SCHEMA public
