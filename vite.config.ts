@@ -44,13 +44,36 @@ export default defineConfig(({ command, mode }) => {
     }
 
     if (missing.length) {
+      // Which fix applies depends on who is running the build, and guessing wrong
+      // sends people to create a file that cannot possibly help. CI is detected
+      // from the variables the providers actually set, not from the name of the
+      // build script, which differs per provider.
+      const onCi = Boolean(process.env.CI)
+        || Boolean(process.env.CF_PAGES)
+        || Boolean(process.env.CF_PAGES_BRANCH)
+        || Boolean(process.env.GITHUB_ACTIONS)
+        || Boolean(process.env.VERCEL)
+        || Boolean(process.env.NETLIFY);
+
+      const fix = onCi
+        ? '  This is a CI build on a remote machine, where .env does not and cannot\n'
+        + '  exist (.env is gitignored because it also holds the service_role key).\n'
+        + '  Set these as BUILD-TIME variables in the provider dashboard instead:\n'
+        + '      Cloudflare: Workers & Pages -> this project -> Settings\n'
+        + '                   -> Environment variables -> Add variable (plain text)\n'
+        + '  Run `npm run deploy:vars` locally to print the exact values to paste.\n'
+        + '  Put SUPABASE_SERVICE_ROLE_KEY nowhere - it is not a build input, and any\n'
+        + '  VITE_ value is inlined into published JavaScript.'
+        : '  Copy .env.example to .env and fill in the real values from\n'
+        + '  Supabase -> Project Settings -> API.\n'
+        + '  (npm run dev still works without them - it falls back to local-only mode.)';
+
       throw new Error(
         `[fatclinic] cannot build: ${missing.join(' and ')} not set.\n`
         + '  The bundle inlines these at build time and the deployed site has no\n'
         + '  server to supply them later, so a build without them produces a site\n'
         + '  that renders but can never sign in.\n'
-        + '  Copy .env.example to .env and fill them in.\n'
-        + '  (npm run dev still works without them - it falls back to local-only mode.)',
+        + fix,
       );
     }
   }

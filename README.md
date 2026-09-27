@@ -282,13 +282,34 @@ hostname.
 `npm run deploy` builds locally and publishes the static bundle to Cloudflare
 Workers Static Assets. Run `npx wrangler login` once first.
 
-**Do not add variables to the Cloudflare project.** A Static Assets project has
-no Worker script, so there is nothing for a Cloudflare-side variable to bind to
-and the dashboard rejects it with *"Variables cannot be added to a Worker that
-only has static assets."* Nothing is missing: Vite inlines `VITE_*` into the
-JavaScript at build time, and the build happens on your machine, so the project
-URL and the anon key are already inside `dist/assets/index-*.js` when wrangler
-uploads them. There is no server-side build step that would need them later.
+There are two ways to deploy, and they need different setup. Confusing the two is
+how a green local deploy turns into a failed one.
+
+**1. `npm run deploy` — builds on your machine.** It reads `.env`, so the two
+`VITE_*` values are already present and nothing else is required. Run
+`npx wrangler login` once first.
+
+**2. Cloudflare building from a git push.** The dashboard builds on *Cloudflare's*
+servers, where `.env` does not exist — it is gitignored, and it also holds the
+service_role key. Unless the two `VITE_*` values are set as **build-time**
+variables, this path fails with `[fatclinic] cannot build: VITE_SUPABASE_URL and
+VITE_SUPABASE_ANON_KEY not set`. Print the exact values to paste with:
+
+```bash
+npm run deploy:vars
+```
+
+Workers & Pages → fatclinic → Settings → Environment variables → Add variable, as
+plain text, for both Production and Preview if asked.
+
+**Build-time variables are not runtime variables, and the difference is the whole
+point.** A runtime variable is a binding a Worker reads while serving; a project
+with only static assets has no Worker, so the dashboard rejects runtime variables
+with *"Variables cannot be added to a Worker that only has static assets."*
+Build-time variables exist only during `npm run build` on the build machine and
+are never served, so they are accepted — and they are what the two values above
+need. An earlier version of this README said the project "takes no variables",
+which was true of the runtime and wrong about the git-connected build.
 
 | Variable | Where it comes from | Where it is used |
 |---|---|---|
