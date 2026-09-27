@@ -22,6 +22,7 @@
     "db:check-password": "node scripts/check-password-rotation.mjs",
     "db:probe-auth-admin": "node scripts/probe-auth-admin.mjs",
     "db:check-staff-accounts": "node scripts/check-staff-accounts.mjs",
+    "db:check-function-live": "node scripts/check-function-live.mjs",
     "db:check-api": "node scripts/check-api.mjs",
     "db:purge-test-audit": "node scripts/purge-test-audit-rows.mjs",
     "db:verify": "npm run db:lint && npm run db:sync:test && npm run db:check-rls && npm run db:check-orphan && npm run db:check-api && npm run db:probe-auth-admin",

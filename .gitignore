@@ -27,3 +27,6 @@ node_modules/.vite/
 
 # Wrangler local dev state (miniflare sqlite caches and build temp)
 .wrangler/
+
+# Supabase CLI local state (linked project ref, cached CLI version)
+supabase/.temp/

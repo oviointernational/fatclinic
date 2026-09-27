@@ -158,6 +158,22 @@ reserved, and both the Dashboard and the Management API reject it.
 Until it is deployed, the admin screens say exactly that rather than failing
 vaguely, and the CLI (`npm run staff:add -- --link USR-003`) still works.
 
+**Confirm it is live.** `npm run db:check-function-live` needs no password and no
+service_role key, so it is safe to run any time:
+
+```bash
+npm run db:check-function-live
+```
+
+It distinguishes *deployed* from *not deployed* (an undeployed function answers
+404 `Edge Function "staff-accounts" not found`, which is easy to mistake for
+something else) and then checks the property that actually matters: that the
+gateway refuses an unauthenticated POST **before** the handler runs, so the
+service_role key is not one request away from the public internet. Both the
+gateway and the handler answer with a `code`; the gateway's are always
+`UNAUTHORIZED_*` and the handler's are lowercase, which is how the two are told
+apart.
+
 **What it checks.** The request body is a request, not a claim. The handler
 resolves the caller from the email inside their own verified JWT, requires an
 `active` `ADMINISTRATOR` row in `public.users`, and ignores any `role`,
@@ -209,6 +225,7 @@ immutability trigger for one statement in order to clean up after itself.
 | `npm run db:check-password` | Proves a signed-in user can rotate their own password with no one-time code, that the new one works, the old one stops working, and the account is restored afterwards | yes + a password |
 | `npm run db:check-staff-accounts` | Runs the real `supabase/functions/staff-accounts/handler.ts` under Node against the live project: create and reset succeed, the passwords really authenticate, the profile is linked, refusals hold for a clinician / a disabled admin / a forged token / a weak password, and everything it created is removed | yes + a password |
 | `npm run db:probe-auth-admin` | Pins the Auth admin API shapes the function depends on (`PUT` is the only update verb, `?filter=` is ignored so an email lookup must page), then deletes the account it made | yes (service_role) |
+| `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, and proves the gateway refuses an unauthenticated POST before the handler runs | no (HTTP) |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
 | `npm run db:purge-test-audit` | Deletes `SEC-` audit rows the checks left behind. `--dry-run` first | yes |
 | `npm run db:verify` | Lint, sync self-test, RLS, orphan, live API and the Auth admin probe in one pass | yes (service_role) |
