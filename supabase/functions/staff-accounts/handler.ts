@@ -108,11 +108,17 @@ export const MAX_PASSWORD_LENGTH = 200;
 /**
  * Validate a password chosen by an administrator on a colleague's behalf.
  *
- * Enforced here rather than in the form because client-side validation of a
- * secret is theatre: it can be skipped by opening the console, so the only
- * check that counts is the one next to the operation being performed.
+ * Enforced here rather than only in the form because client-side validation of a
+ * secret is theatre: it can be skipped by opening the console, so this is the
+ * check that counts. The form runs the same rules first only so that a mistake
+ * is caught before the staff profile is written - see
+ * src/services/passwordPolicy.ts, which a test pins to this function.
+ *
+ * `name` is optional so existing callers and tests keep working, but both
+ * operations pass it: a password containing the name of the person it belongs to
+ * is guessable by anyone who knows who they work for.
  */
-export function checkPassword(password: unknown, email: string): string | null {
+export function checkPassword(password: unknown, email: string, name?: string | null): string | null {
   if (typeof password !== 'string' || password.length === 0) {
     return 'Enter a password.';
   }
@@ -138,6 +144,17 @@ export function checkPassword(password: unknown, email: string): string | null {
   const localPart = email.split('@')[0] ?? '';
   if (localPart.length >= 4 && password.toLowerCase().includes(localPart.toLowerCase())) {
     return 'The password must not contain the staff email address.';
+  }
+  // Every word of the name that is long enough to identify somebody. Short words
+  // are skipped: "Obi" or "Ana" would reject a great many reasonable passwords
+  // and train people to ignore this rule.
+  for (const word of (name ?? '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 4)) {
+    if (password.toLowerCase().includes(word)) {
+      return 'The password must not contain the staff member’s name.';
+    }
   }
   if (/^(.)\1+$/.test(password)) {
     return 'The password must not be a single repeated character.';
@@ -374,9 +391,11 @@ async function opCreate(env: HandlerEnv, body: CreateBody, actor: StaffProfile) 
   if (!email) {
     throw new HttpError(400, 'invalid_email', 'That email address is not valid.');
   }
-  const weak = checkPassword(body.password, email);
-  if (weak) throw new HttpError(400, 'weak_password', weak);
 
+  // The profile has to be looked up before the password can be judged against
+  // the name, so this is the one rule that cannot be checked before it. The form
+  // checks it client-side anyway, so in practice this only fires for a caller
+  // that skipped the form.
   const profile = await findProfile(env, email);
   if (!profile) {
     throw new HttpError(
@@ -388,6 +407,9 @@ async function opCreate(env: HandlerEnv, body: CreateBody, actor: StaffProfile) 
   if (!profile.active) {
     throw new HttpError(400, 'no_staff_profile', 'That staff profile is disabled. Enable it before creating an account.');
   }
+
+  const weak = checkPassword(body.password, email, profile.name);
+  if (weak) throw new HttpError(400, 'weak_password', weak);
 
   const existing = await findAuthUser(env, email);
   if (existing) {
@@ -473,13 +495,14 @@ async function opReset(env: HandlerEnv, body: ResetBody, actor: StaffProfile) {
   if (!email) {
     throw new HttpError(400, 'invalid_email', 'That email address is not valid.');
   }
-  const weak = checkPassword(body.password, email);
-  if (weak) throw new HttpError(400, 'weak_password', weak);
 
   const profile = await findProfile(env, email);
   if (!profile) {
     throw new HttpError(404, 'no_staff_profile', 'There is no staff profile for that address.');
   }
+
+  const weak = checkPassword(body.password, email, profile.name);
+  if (weak) throw new HttpError(400, 'weak_password', weak);
 
   const authUser = await findAuthUser(env, email);
   if (!authUser) {

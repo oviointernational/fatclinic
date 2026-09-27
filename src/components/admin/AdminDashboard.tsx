@@ -3,6 +3,7 @@ import { db } from '../../services/db';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { useAuth, useCurrentUser } from '../../context/AuthContext';
 import { createStaffAccount, resetStaffPassword } from '../../services/staffAccounts';
+import { passwordProblems, PASSWORD_RULES } from '../../services/passwordPolicy';
 import { 
   User, 
   UserRole, 
@@ -236,12 +237,36 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
       setAccountError('Please provide a name and an email address.');
       return;
     }
+
+    const wanted = userForm.email.trim().toLowerCase();
+
+    // Everything below has to happen BEFORE db.addUser. The staff profile is
+    // written first because the Edge Function needs a profile to link the
+    // credential to, so any refusal the function would make has to be made here,
+    // or the profile is left in the database with no way for that person to sign
+    // in. A rejected form must leave no trace at all.
+    if (allUsers.some((u) => u.email.trim().toLowerCase() === wanted)) {
+      setAccountError(
+        `A staff profile already exists for ${wanted}. Find them in the list below to change their role or reset their password.`,
+      );
+      return;
+    }
+
     if (userForm.password !== userForm.confirmPassword) {
       setAccountError('The two passwords do not match.');
       return;
     }
     if (!userForm.password) {
       setAccountError('Please choose a sign-in password for this person.');
+      return;
+    }
+
+    // The same rules the function enforces, so the profile is not written for a
+    // password the function is about to refuse. Every failure is listed, not
+    // just the first, so nobody fixes one problem and hits the next.
+    const problems = passwordProblems(userForm.password, wanted, userForm.name);
+    if (problems.length) {
+      setAccountError(problems.join(' '));
       return;
     }
 
@@ -304,6 +329,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
     }
     if (!resetPassword) {
       setResetError('Please choose a new password.');
+      return;
+    }
+
+    // Nothing is written before this, so a refusal here costs a round trip
+    // rather than leaving a half-changed record. Judged against the person it
+    // belongs to, so "reset" cannot be used to set a guessable password.
+    const problems = passwordProblems(resetPassword, passwordTarget.email, passwordTarget.name);
+    if (problems.length) {
+      setResetError(problems.join(' '));
       return;
     }
 
@@ -1472,15 +1506,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
       {/* 1. Add User Modal */}
       {isAddUserOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
-          <form onSubmit={handleCreateUser} className="bg-white dark:bg-dark-card rounded-2xl border border-light-border dark:border-dark-border shadow-2xl p-6 w-full max-w-md space-y-4 text-xs">
-            <div className="flex items-center justify-between border-b pb-3">
+          <form
+            onSubmit={handleCreateUser}
+            className="bg-white dark:bg-dark-card rounded-2xl border border-light-border dark:border-dark-border shadow-2xl w-full max-w-md text-xs flex flex-col max-h-[90vh] sm:max-h-[85vh]"
+          >
+            <div className="flex items-center justify-between border-b border-light-border dark:border-dark-border px-6 py-4 shrink-0">
               <h3 className="font-extrabold text-sm text-slate-900 dark:text-white">Add New Staff Account</h3>
               <button type="button" onClick={() => setIsAddUserOpen(false)} className="text-slate-400 hover:text-slate-600">
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="space-y-3">
+            {/* The body scrolls on its own so the title and the buttons stay put.
+                The form is taller than a laptop viewport now that the rules and
+                every failure are shown, and a dialog that puts its own buttons
+                out of reach is a dialog people cannot submit. */}
+            <div className="overflow-y-auto overscroll-contain px-6 py-4 space-y-3 flex-1 min-h-0">
               <div>
                 <label className="block font-bold mb-1">Full Name & Title:</label>
                 <input
@@ -1531,14 +1572,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
 
               <div className="p-2.5 rounded-xl bg-slate-50 dark:bg-dark-surface border border-dashed border-slate-300 dark:border-dark-border text-[11px] text-slate-500 leading-relaxed">
                 <p className="font-bold text-slate-600 dark:text-slate-300">Sign-in password</p>
-                <p className="mt-1">
-                  Tell them this one in person. They will be required to replace it with their own
-                  before the workstation opens, so it is a handover password rather than theirs.
-                </p>
-                <p className="mt-1">
-                  It is held by Supabase Auth, never written into the staff record, and never kept in
-                  this browser.
-                </p>
+                <p className="mt-1">Give this one to them in person. They must replace it with their own before the workstation opens.</p>
+                <ul className="mt-1.5 space-y-0.5 list-disc pl-4">
+                  {PASSWORD_RULES.map((rule) => (
+                    <li key={rule}>{rule}</li>
+                  ))}
+                </ul>
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -1617,12 +1656,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
             </div>
 
             {accountError && (
-              <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-[11px] font-bold text-rose-700 leading-relaxed">
+              <div className="mx-6 mb-3 p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-[11px] font-bold text-rose-700 leading-relaxed shrink-0">
                 {accountError}
               </div>
             )}
 
-            <div className="flex justify-end space-x-2 pt-3 border-t">
+            <div className="flex justify-end space-x-2 px-6 py-4 border-t border-light-border dark:border-dark-border shrink-0 bg-white dark:bg-dark-card rounded-b-2xl">
               <button
                 type="button"
                 onClick={() => { setIsAddUserOpen(false); setAccountError(null); }}

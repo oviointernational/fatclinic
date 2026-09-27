@@ -181,11 +181,32 @@ resolves the caller from the email inside their own verified JWT, requires an
 administrator, and a disabled administrator is refused. There are two checks
 because the gateway's `verify_jwt` only proves the caller signed in.
 
+**Nothing is registered unless the details are right.** The Add Staff dialog writes
+the staff profile *before* it calls the function, because the function needs a
+profile to link the credential to. So the dialog checks first, and a rejected
+submission leaves no trace at all — no profile, no account:
+
+| Rejected in the form | Why |
+|---|---|
+| the address is already used | a second profile for one person splits their record in two |
+| the address is not an email | refused before anything is written |
+| passwords do not match | the handover password has to be typed twice |
+| the password breaks a rule below | listed all at once, not one per attempt |
+
 **Password rules, enforced server-side.** At least 8 characters, no spaces, no
 leading or trailing whitespace, not a short list of common passwords, not the
-email address, not one repeated character. The rules are duplicated in the form
-for a faster answer, but only the server-side copy counts — client validation of
-a secret can be skipped from the console.
+email address, **not the staff member's own name**, not one repeated character.
+
+The rules are duplicated in the form for a faster answer, and only the server-side
+copy counts — client validation of a secret can be skipped from the console. The
+two are pinned to each other by a test that imports both and requires an
+identical verdict and an identical message for 19 inputs, so they cannot drift:
+`npm run db:check-staff-accounts`. Duplicating rather than sharing is deliberate;
+sharing the file would mean bundling the privileged handler into the browser,
+which is the one thing it exists to keep out of there.
+
+Name words shorter than four characters are ignored, or "Ana" and "Obi" would
+reject a great many reasonable passwords and teach people to ignore the rule.
 
 **A password you issue is not theirs to keep.** Both operations set
 `users.must_change_password`, and `App.tsx` then refuses to render the
@@ -223,7 +244,8 @@ immutability trigger for one statement in order to clean up after itself.
 | `npm run db:check-orphan` | Creates a throwaway auth account with no staff profile, signs in for real, and proves it reads and writes nothing | yes (service_role) |
 | `npm run db:check-signin` | Signs in as a real staff member: proves RLS admits them, role gating works, a non-admin cannot delete a staff row, and a deactivated profile loses access | yes + a password |
 | `npm run db:check-password` | Proves a signed-in user can rotate their own password with no one-time code, that the new one works, the old one stops working, and the account is restored afterwards | yes + a password |
-| `npm run db:check-staff-accounts` | Runs the real `supabase/functions/staff-accounts/handler.ts` under Node against the live project: create and reset succeed, the passwords really authenticate, the profile is linked, refusals hold for a clinician / a disabled admin / a forged token / a weak password, and everything it created is removed | yes + a password |
+| `npm run db:check-staff-accounts` | Runs the real `supabase/functions/staff-accounts/handler.ts` under Node against the live project: create and reset succeed, the passwords really authenticate, the profile is linked, refusals hold for a clinician / a disabled admin / a forged token / a weak password, the browser and the function agree on every password rule, and everything it created is removed | yes + a password |
+| `npm run db:check-email` | Inserts a real staff row and proves the live database refuses a second one for the same address, including when only the case differs. The form's message is help; this is the guarantee | yes (service_role) |
 | `npm run db:probe-auth-admin` | Pins the Auth admin API shapes the function depends on (`PUT` is the only update verb, `?filter=` is ignored so an email lookup must page), then deletes the account it made | yes (service_role) |
 | `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, and proves the gateway refuses an unauthenticated POST before the handler runs | no (HTTP) |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |

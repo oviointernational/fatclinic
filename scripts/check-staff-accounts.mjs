@@ -27,6 +27,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { handleStaffAccountRequest, checkPassword, normaliseEmail } from '../supabase/functions/staff-accounts/handler.ts';
+import { checkStaffPassword, passwordProblems } from '../src/services/passwordPolicy.ts';
 
 const env = Object.fromEntries(
   readFileSync(new URL('../.env', import.meta.url), 'utf8')
@@ -139,8 +140,60 @@ function unitChecks() {
   check('rejects a repeated character', checkPassword('aaaaaaaaaa', 'a@b.co') !== null);
   check('rejects the email local part', checkPassword('AmaraOkonkwo1', 'amara@clinic.test') !== null);
   check('rejects the clinic name', checkPassword('FatClinic123', 'a@b.co') !== null);
+  check('rejects the staff member’s name', checkPassword('Adebayo2024', 'ngozi@clinic.test', 'Dr. Ngozi Adebayo') !== null);
+  check('rejects any word of the name', checkPassword('Bright-Ngozi-7', 'x@clinic.test', 'Ngozi Bright') !== null);
+  check('ignores name words too short to identify', checkPassword('Ana-Obi-Kwara-42', 'x@clinic.test', 'Ana Obi') === null);
   check('accepts a reasonable passphrase', checkPassword('correct-horse-9!Batt', 'a@b.co') === null);
   check('non-strings are rejected', checkPassword(undefined, 'a@b.co') !== null && checkPassword(12345678, 'a@b.co') !== null);
+
+  // The Add Staff dialog writes the staff profile *before* it calls this
+  // function, because the function needs a profile to link the credential to. So
+  // the browser has to reach the same verdict first, or a rejected password
+  // leaves a profile with no way to sign in. The two copies are pinned here
+  // rather than shared, because sharing would bundle the privileged handler
+  // into the browser - the one thing it exists to keep out of there.
+  console.log('\nBrowser and function agree on the password policy');
+  const CASES = [
+    ['', 'a@b.co', 'Dr. Ngozi Adebayo'],
+    ['Ab1!', 'a@b.co', 'Dr. Ngozi Adebayo'],
+    ['password123', 'a@b.co', 'Dr. Ngozi Adebayo'],
+    ['  Str0ngPass!  ', 'a@b.co', 'Dr. Ngozi Adebayo'],
+    ['Str0ng Pass!', 'a@b.co', 'Dr. Ngozi Adebayo'],
+    ['aaaaaaaaaa', 'a@b.co', 'Dr. Ngozi Adebayo'],
+    ['AmaraOkonkwo1', 'amara@clinic.test', 'Dr. Amara Okonkwo'],
+    ['FatClinic123', 'a@b.co', 'Dr. Ngozi Adebayo'],
+    ['Adebayo2024', 'ngozi@clinic.test', 'Dr. Ngozi Adebayo'],
+    ['Bright-Ngozi-7', 'x@clinic.test', 'Ngozi Bright'],
+    ['Ana-Obi-Kwara-42', 'x@clinic.test', 'Ana Obi'],
+    ['Anaa-Okonkwo-42', 'x@clinic.test', 'Ana Okonkwo'],
+    ['Adebayo', 'ngozi@clinic.test', 'Dr. Ngozi Adebayo'],
+    ['ngo', 'ngozi@clinic.test', 'Dr. Ngozi Adebayo'],
+    ['correct-horse-9!Batt', 'a@b.co', 'Dr. Ngozi Adebayo'],
+    ['Zx-9920-mango', 'a@b.co', 'Dr. Ngozi Adebayo'],
+    ['x'.repeat(201), 'a@b.co', 'Dr. Ngozi Adebayo'],
+    [undefined, 'a@b.co', 'Dr. Ngozi Adebayo'],
+    [12345678, 'a@b.co', 'Dr. Ngozi Adebayo'],
+  ];
+
+  const drift = [];
+  for (const [password, email, name] of CASES) {
+    const server = checkPassword(password, email, name);
+    const browser = checkStaffPassword(password, email, name);
+    if (server !== browser) {
+      drift.push(`    ${JSON.stringify(password)} / ${email} / ${name}\n      function: ${server}\n      browser:  ${browser}`);
+    }
+  }
+  check(
+    `all ${CASES.length} cases return an identical verdict, message for message`,
+    drift.length === 0,
+    drift.length ? `${drift.length} differ:\n${drift.join('\n')}` : '',
+  );
+
+  // The browser lists every problem, not just the first, so nobody fixes one
+  // fault and immediately hits the next. This one trips three at once: too
+  // short, a leading space, and a space inside it.
+  const many = passwordProblems('  ab', 'ngozi@clinic.test', 'Ngozi Adebayo');
+  check('the browser reports every problem at once', many.length >= 3, `${many.length} problems: ${many.join(' / ')}`);
 
   console.log('\nEmail normalisation');
   check('lowercases and trims', normaliseEmail('  Nurse@Clinic.TEST ') === 'nurse@clinic.test');
@@ -485,7 +538,18 @@ async function main() {
 
   const admin = await signIn(ADMIN_EMAIL, ORIGINAL);
   if (admin.status !== 200) {
-    console.log(`\nCannot sign in as ${ADMIN_EMAIL} (status ${admin.status}). Stopping.`);
+    // Seen twice on this project, and not caused by anything in this file: the
+    // suite only ever changes the throwaway clinician's password, never the
+    // administrator's, and the account's updated_at shows no write. Supabase
+    // refuses a correct password here, returning the same invalid_credentials it
+    // returns for a wrong one. Setting the password again clears it, so say
+    // that rather than leaving someone to wonder what they broke.
+    console.log(`\nCannot sign in as ${ADMIN_EMAIL} (status ${admin.status}). Nothing was changed.`);
+    console.log('  This account is not written to by this script, and the refusal is the same');
+    console.log('  one Supabase returns for a genuinely wrong password. Setting the password');
+    console.log('  again clears it - in the app, use Reset Password; or from a terminal:');
+    console.log('    npm run staff:list                                   # find their id');
+    console.log("    npm run staff:add -- --link <id> --password 'a-new-password'");
     process.exitCode = 1;
     return;
   }
