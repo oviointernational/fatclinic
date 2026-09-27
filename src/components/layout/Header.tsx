@@ -15,7 +15,7 @@ import {
 } from 'lucide-react';
 import { db } from '../../services/db';
 import { getSupabase, isSupabaseConfigured } from '../../services/supabase';
-import { pendingKeys } from '../../services/sync';
+import { onSyncFailuresChanged, pendingKeys, syncFailures, type SyncFailure } from '../../services/sync';
 import { Patient, UserRole } from '../../types';
 import { OnlineBookingModal } from '../frontdesk/OnlineBookingModal';
 import { AccountModal } from '../common/AccountModal';
@@ -46,6 +46,7 @@ type SyncState = 'local-only' | 'checking' | 'connected' | 'offline';
 const ServerStatus: React.FC = () => {
   const [state, setState] = useState<SyncState>(isSupabaseConfigured ? 'checking' : 'local-only');
   const [unsaved, setUnsaved] = useState<number>(0);
+  const [refused, setRefused] = useState<SyncFailure[]>([]);
 
   // Network reachability: cheap, but not free, so once a minute.
   React.useEffect(() => {
@@ -74,14 +75,43 @@ const ServerStatus: React.FC = () => {
 
   // Outstanding writes: an in-memory read, so it can be polled often enough for
   // the badge to appear while a clinician is still looking at the screen.
+  //
+  // The queue alone cannot report a failure, and this is not a detail. The queue
+  // is drained by shifting an entry off it *before* awaiting the request, so a
+  // write that is in flight and a write the database has already refused both
+  // read as "nothing pending". That is how a consultation whose every field was
+  // rejected showed a clean green light: the count went to zero, the badge went
+  // green, and the record was gone. Refusals are therefore tracked separately
+  // and pushed, not polled, so they cannot be missed between two ticks.
   React.useEffect(() => {
-    const refresh = () => setUnsaved(pendingKeys().length);
+    const refresh = () => {
+      setUnsaved(pendingKeys().length);
+      setRefused(syncFailures());
+    };
     refresh();
     const timer = setInterval(refresh, 2500);
-    return () => clearInterval(timer);
+    const unsubscribe = onSyncFailuresChanged(refresh);
+    return () => {
+      clearInterval(timer);
+      unsubscribe();
+    };
   }, []);
 
-  const title = unsaved
+  // A refusal is the worst state there is: the work is on this machine and not on
+  // the patient's record, and retrying will not fix it. It outranks both the
+  // pending count and the connection colour, because "connected" is true and
+  // irrelevant - the database answered, by refusing.
+  const failed = refused.length > 0;
+
+  const title = failed
+    ? refused
+        .map(
+          (f) =>
+            `NOT SAVED - ${f.table}: ${f.message}` +
+            (f.permanent ? ' (the database rejected it; this will not fix itself)' : ''),
+        )
+        .join('\n')
+    : unsaved
     ? `${unsaved} change${unsaved === 1 ? '' : 's'} not yet saved to the server. They are safe in this browser and will be retried.`
     : state === 'connected'
     ? 'Connected: entries are being saved to the clinic database.'
@@ -93,23 +123,25 @@ const ServerStatus: React.FC = () => {
 
   // Unsaved work outranks connection state: a green light next to a pending
   // write would be the exact false all-clear this component exists to remove.
-  const tone =
-    unsaved || state === 'offline' || state === 'local-only'
-      ? state === 'offline' || state === 'local-only'
-        ? 'bad'
-        : 'warn'
-      : state === 'connected'
-      ? 'good'
-      : 'wait';
+  const tone = failed
+    ? 'bad'
+    : unsaved || state === 'offline' || state === 'local-only'
+    ? state === 'offline' || state === 'local-only'
+      ? 'bad'
+      : 'warn'
+    : state === 'connected'
+    ? 'good'
+    : 'wait';
 
-  const label =
-    unsaved > 0
-      ? `${unsaved} unsaved`
-      : tone === 'bad'
-      ? 'Not saving'
-      : state === 'connected'
-      ? 'Server DB'
-      : '…';
+  const label = failed
+    ? `${refused.length} not saved`
+    : unsaved > 0
+    ? `${unsaved} unsaved`
+    : tone === 'bad'
+    ? 'Not saving'
+    : state === 'connected'
+    ? 'Server DB'
+    : '…';
 
   const tones: Record<string, string> = {
     good:

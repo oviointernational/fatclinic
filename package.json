@@ -15,7 +15,7 @@
     "db:sync:test": "node scripts/sync-selftest.mjs",
     "db:sync:defects": "node scripts/sync-defects.mjs",
     "typecheck:functions": "tsc -p tsconfig.functions.json",
-    "db:test": "npm run db:lint && npm run db:lint:test && npm run db:config:test && npm run typecheck:functions && npm run db:sync:test && npm run db:sync:defects && npm run db:check-signin-locked",
+    "db:test": "npm run db:lint && npm run db:lint:test && npm run db:config:test && npm run typecheck:functions && npm run db:sync:test && npm run db:sync:defects && npm run db:consultation-test && npm run db:consultation:defects && npm run db:check-signin-locked",
     "db:apply": "node scripts/apply-schema.mjs",
     "db:check-rls": "node scripts/check-rls.mjs",
     "db:check-orphan": "node scripts/check-orphan.mjs",
@@ -31,13 +31,16 @@
     "db:check-deployed": "node scripts/check-deployed-function.mjs",
     "db:check-api": "node scripts/check-api.mjs",
     "db:purge-test-audit": "node scripts/purge-test-audit-rows.mjs",
-    "db:verify": "npm run db:lint && npm run db:sync:test && npm run db:check-rls && npm run db:check-orphan && npm run db:check-api && npm run db:probe-auth-admin && npm run db:check-forgot-password && npm run db:check-forced-password-change",
+    "db:verify": "npm run db:lint && npm run db:sync:test && npm run db:check-rls && npm run db:check-orphan && npm run db:check-api && npm run db:crud && npm run db:probe-auth-admin && npm run db:check-forgot-password && npm run db:check-forced-password-change",
     "db:find-region": "node scripts/find-region.mjs",
     "db:fix-connection": "node scripts/find-region.mjs --write",
     "staff:list": "node scripts/provision-staff.mjs --list",
     "staff:add": "node scripts/provision-staff.mjs",
     "staff:disable": "node scripts/provision-staff.mjs --disable",
-    "staff:clean-demo": "node scripts/remove-demo-staff.mjs"
+    "staff:clean-demo": "node scripts/remove-demo-staff.mjs",
+    "db:consultation-test": "node scripts/consultation-selftest.mjs",
+    "db:consultation:defects": "node scripts/consultation-defects.mjs",
+    "db:crud": "node scripts/check-clinical-crud.mjs"
   },
   "engines": {
     "node": ">=20"

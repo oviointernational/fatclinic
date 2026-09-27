@@ -35,15 +35,24 @@ const ORIGINAL = ORIGINAL_RAW.replaceAll('\r\n', '\n');
 
 const DEFECTS = [
   {
-    name: 'an empty string is sent instead of NULL for a foreign key',
-    // The bug the suite was built for: '' is a real value, and a foreign key
-    // check against it fails, so a consultation with no physician cannot save.
-    from: `        patient_id: m.patientId,
-        physician_id: fk(m.physicianId),
-        physician_name: m.physicianName ?? '',`,
-    to: `        patient_id: m.patientId,
-        physician_id: orNull(m.physicianId),
-        physician_name: m.physicianName ?? '',`,
+    name: 'a blank optional value is sent as an empty string instead of NULL',
+    // The bug that voided every consultation the doctor saved without setting a
+    // follow-up date, and 24 other date and timestamp columns across 17 tables.
+    // `orNull` is the only place that translation happens, so breaking it here
+    // is what the rest of the suite is relying on to be meaningful.
+    from: `const orNull = <T>(v: T | undefined | null): T | null =>
+  v === undefined || v === null || (v as unknown) === '' ? null : (v as T);`,
+    to: `const orNull = <T>(v: T | undefined | null): T | null =>
+  v === undefined || v === null ? null : (v as T);`,
+    count: 1,
+  },
+  {
+    name: 'a non-finite number is sent to a NOT NULL numeric column',
+    // 47 numeric columns are written straight from the model. A cleared box
+    // reaches them as NaN, and the whole record is refused with a message that
+    // names neither the column nor the screen.
+    from: `    if (typeof v === 'number' && !Number.isFinite(v)) {`,
+    to: `    if (false) {`,
     count: 1,
   },
   {

@@ -116,7 +116,76 @@ account out of the UI, and the SQL helper is what keeps it out of the data.
 
 The header badge reports the truth about saving: it queries the database rather
 than a local endpoint, and shows outstanding unsaved changes in preference to the
-connection colour, so it cannot show a green light over unsaved work.
+connection colour, so it cannot show a green light over unsaved work. A write the
+database **refuses** is reported separately from one that is merely pending, with
+the database's own message, and the count only falls when the refused write has
+actually succeeded — the badge used to read "nothing pending" the whole time,
+because the queue entry was removed before the request was sent.
+
+#### A blank field, and what happens to it
+
+This is the bug that emptied the consultations table, so the rule is written down.
+
+A controlled input the clinician left empty holds `''`. `''` is a legal value for
+a text column and illegal for everything else. So in the mappers:
+
+- a field the clinician may leave empty is wrapped in `orNull()`, which sends
+  `''` as SQL NULL. This is the *only* place that translation happens, and it is
+  opt-in per field rather than a blanket rule, because about twenty `NOT NULL
+  TEXT` columns legitimately receive `''` and a blanket rule would trade one lost
+  consultation for another;
+- a numeric field is sent as it stands, and `forPostgres()` — the one chokepoint
+  every row passes through — refuses a non-finite number, naming the table and
+  column, instead of letting Postgres reject the request with a message that
+  names neither;
+- an array field goes through `list()`, and a jsonb field through a `typeof`
+  check, so a value of the wrong shape becomes *no entries* rather than a
+  malformed literal that voids the record.
+
+The two halves are not symmetric, and the asymmetry is deliberate. A blank sent to
+a **nullable** column is a defect: the mapper knew the field was optional, so it
+had every chance to send NULL. A blank sent to a **NOT NULL** column is not the
+same thing — the mapper cannot send NULL there without inventing data, and for a
+clinical value inventing data is worse than refusing the write, because a recorded
+temperature of 0 is a falsehood in a patient's chart while a refused save leaves
+the chart true. `npm run db:crud` fails on the first and lists the second, by
+table and column, so the count is known rather than guessed. Closing the second
+kind belongs in the form that asks for the number, not in the data layer, which
+has no safe answer to give.
+
+Because an upsert is a single request, any one of these refusals used to void
+*every* field on the record while the form said "Saved!". That is why the refusals
+are surfaced, and why the audit exists.
+
+#### When a doctor may write
+
+A doctor's queue is built by nurses: a patient arrives, a nurse records vitals and
+sends the patient to a doctor. Until that happens the doctor has nothing to
+consult, and until the visit moves on they have no reason to reopen it. So the
+consultation is view-only for `Awaiting Vitals` and `With Nurse`, writable from
+`With Doctor` through `Admitted`, and view-only again once the visit is `Treated`,
+`Discharged` or `Completed` — a closed visit is amended by a new visit, not by
+editing a finished one.
+
+The rule lives in one place, `src/services/consultationAccess.ts`, and it is
+keyed on the **selected** visit rather than the patient's latest, because the
+visit dropdown lists every visit that patient has ever had and the two are not
+always the same. `ConsultationForm.tsx` and `NursingStation.tsx` both ask it, so
+the doctor's screen and the nurse's queue cannot disagree.
+
+It is enforced on the **handlers**, not on the buttons. A button is presentation
+and can be bypassed by a keyboard shortcut, a stale dialog or a queued click; a
+handler is the point where the mutation happens. The thirteen open handlers call
+`refuseIfReadOnly()` first, and the Save button, the read-only banner and any open
+dialog are all consequences of the same answer rather than separate
+implementations of it.
+
+This gate is in the client, so it is a **workflow** rule, not a security rule: the
+database admits any signed-in staff member to `consultations`, because a nurse, a
+doctor and an administrator all write there and they do not write the same rows.
+Protecting the *record* is RLS's job; protecting the *workflow* is this gate's
+job. `npm run db:crud` states that distinction rather than pretending the gate is
+a database constraint.
 
 ### Staff accounts
 
@@ -524,8 +593,10 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:config:test` | Proves the `.env` password guards and the host resolver behave correctly, including the dotenv `#` truncation trap | no |
 | `npm run db:sync:test` | Proves the sync layer against the schema: mappers emit only real columns, every required column is always sent, values survive a round trip, and inserts/updates/deletes/children/grandchildren/append-only tables/queue coalescing all behave as documented | no |
 | `npm run db:sync:defects` | Breaks `sync.ts` ten ways and requires the self-test to fail each time | no |
+| `npm run db:consultation-test` | The consultation's own logic, off-database: every visit status is either writable or explained, the doctor's read-only gate names the reason, an examination finding lands in the column its dialog title named (all eleven systems), and a surgery entry survives the round trip through the one text column including notes containing the separator | no |
+| `npm run db:consultation:defects` | Breaks the consultation logic twelve ways and requires the self-test to fail each time | no |
 | `npm run typecheck:functions` | Type-checks `supabase/functions/staff-accounts/handler.ts`, which the root `tsconfig.json` does not reach — its `include` is `src` only, so both `tsc --noEmit` and `npm run build` report a clean tree while the one file holding the privileged key's only caller goes unchecked | no |
-| `npm run db:test` | All seven of the above | no |
+| `npm run db:test` | All nine of the above | no |
 | `npm run db:apply` | Applies the schema in a transaction, then verifies RLS, grants, triggers, invoice math and seeds. Fails if a retired demo profile is still present, if a verification probe leaked a row, or if a live policy is not declared in `database/fatclinic.sql` (or vice versa) | yes |
 | `npm run db:find-region` | Finds which IPv4 pooler region the project is in, by handshaking | yes |
 | `npm run db:fix-connection` | The same, and writes the answer to `.env` | yes |
@@ -543,8 +614,9 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, proves the **handler** (not the gateway - `verify_jwt` is off) refuses `create` without a session and to a forged token, and proves the same caller is still *answered* for `forgot` | no (HTTP) |
 | `npm run db:check-deployed` | Tests the function **Supabase is actually serving**, not the file on disk: a password containing the staff name is refused, an older rule is still refused, a good password really authenticates, a clinician is refused, and it deletes what it created | yes + a password |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
+| `npm run db:crud` | The clinical record against the live database, as a real signed-in clinician, through the real write path. Sweeps all 350 columns of all 24 tables for a blank value sent where the column could have taken NULL, then creates, edits and deletes the chain a doctor writes — patient, visit, vitals, consultation, both diagnoses, lab request with its test, prescription with its item — and reads every assertion back with SQL rather than with the app's own reader. Everything it creates, including the throwaway account, it removes | yes (service_role) |
 | `npm run db:purge-test-audit` | Deletes `SEC-` audit rows the checks left behind. `--dry-run` first | yes |
-| `npm run db:verify` | Lint, sync self-test, RLS, orphan, live API and the Auth admin probe in one pass | yes (service_role) |
+| `npm run db:verify` | Lint, sync self-test, RLS, orphan, live API, the live clinical CRUD audit and the Auth admin probe in one pass | yes (service_role) |
 | `npm run staff:list` | Every staff profile, and whether each one can actually sign in | yes (service_role) |
 | `npm run staff:add` | Create a staff sign-in account, or reset one with `--link` | yes (service_role) |
 | `npm run staff:clean-demo` | Deletes the nine demo profiles a previous schema version seeded. `--dry-run` first | yes (service_role) |

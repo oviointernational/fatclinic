@@ -63,6 +63,8 @@ const {
   whenDrained,
   pendingKeys,
   isInFlight,
+  syncFailures,
+  clearSyncFailures,
 } = await import('../src/services/sync.ts');
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1159,136 @@ await block('write queue: a rejected write is logged, not thrown into the UI', a
     logged,
   );
   check('the queue is empty afterwards', pendingKeys().length === 0);
+});
+
+await block('a blank optional value reaches Postgres as NULL, never as ""', async () => {
+  // The consultation that could not be saved. The form only sets a follow-up
+  // date if the doctor fills the box in, so '' is the ordinary case, and an
+  // upsert is one request: sending it as '' voided the complaint, the
+  // examination, the diagnoses and the plan along with it.
+  const map = TABLE_BY_KEY.get('fatclinic_consultations');
+  const sent = [];
+  const client = {
+    from: () => ({
+      select: () => ({ range: async () => ({ data: [], error: null }) }),
+      upsert: async (rows) => {
+        sent.push(...rows);
+        return { error: null };
+      },
+      delete: () => ({ in: async () => ({ error: null }) }),
+    }),
+  };
+  const model = {
+    id: 'C-1',
+    visitId: 'V-1',
+    patientId: 'P-1',
+    physicianId: 'U-1',
+    physicianName: 'Dr Test',
+    consultationDate: '2026-01-02T03:04:05.000Z',
+    presentingComplaint: 'Fever',
+    physicalExamination: { general: 'g' },
+    diagnoses: [],
+    followUpDate: '',
+    plan: '',
+  };
+  await pushDiff(map, [], [model], client);
+  const row = sent.find((r) => r.id === 'C-1');
+  check('the row was written', !!row, sent);
+  check(
+    'an unset follow-up date is NULL, not an empty string',
+    row?.follow_up_date === null,
+    `follow_up_date = ${JSON.stringify(row?.follow_up_date)}`,
+  );
+  check(
+    'a NOT NULL text column the model leaves blank is still an empty string',
+    row?.plan === '' && row?.assessment === '',
+    `plan = ${JSON.stringify(row?.plan)}, assessment = ${JSON.stringify(row?.assessment)}`,
+  );
+  check(
+    'a blank exam section is still an empty string, because that column is NOT NULL',
+    row?.exam_general === 'g' && row?.exam_cardiovascular === '',
+    `exam_general = ${JSON.stringify(row?.exam_general)}, exam_cardiovascular = ${JSON.stringify(row?.exam_cardiovascular)}`,
+  );
+  check(
+    'a real follow-up date is still sent as written',
+    (await (async () => {
+      sent.length = 0;
+      await pushDiff(map, [], [{ ...model, id: 'C-2', followUpDate: '2026-03-04' }], client);
+      return sent.find((r) => r.id === 'C-2')?.follow_up_date;
+    })()) === '2026-03-04',
+  );
+});
+
+await block('a value Postgres cannot parse is refused here, by name', async () => {
+  // 47 numeric columns are NOT NULL and written straight from the model, so a
+  // cleared box reaches them as NaN. The database's own complaint names neither
+  // the column nor the screen, which is how a lost record went unreported.
+  const map = TABLE_BY_KEY.get('fatclinic_vitals');
+  const client = { from: () => { throw new Error('the request must never be built'); } };
+  let threw = null;
+  try {
+    await pushDiff(map, [], [{ id: 'V-9', visitId: 'V-1', patientId: 'P-1', weight: NaN }], client);
+  } catch (err) {
+    threw = err.message;
+  }
+  check(
+    'a non-finite number is refused before the request is built',
+    !!threw && /vitals\.weight/.test(threw),
+    threw ?? 'no error was raised',
+  );
+  check(
+    'the refusal says what to do about it',
+    !!threw && /fill the field in and save again/.test(threw),
+    threw ?? 'no error was raised',
+  );
+});
+
+await block('a refused write is visible to the clinician, not just the console', async () => {
+  // The header's "unsaved" badge counts the queue, and the queue is drained by
+  // shifting an entry off it before the request is awaited. So a write in flight
+  // and a write the database has already refused both read as "nothing
+  // pending", and the badge stayed green over a record that did not exist.
+  const map = TABLE_BY_KEY.get('fatclinic_patients');
+  const original = console.error;
+  console.error = () => {};
+  // An earlier block deliberately provokes a refusal on this same collection, and
+  // a refusal is recorded per collection with the newest winning, so the count
+  // is cleared here rather than reasoned about.
+  clearSyncFailures();
+  try {
+    const server = fakeServer();
+    server.client.from = () => ({
+      select: () => ({ range: async () => ({ data: [], error: null }) }),
+      upsert: async () => ({ error: { message: 'violates not-null constraint' } }),
+      delete: () => ({ in: async () => ({ error: null }) }),
+    });
+    queueDiff(map, [], [{ id: 'P-91', firstName: 'Refused' }], server.client);
+    await whenDrained();
+  } finally {
+    console.error = original;
+  }
+  const failures = syncFailures();
+  check('the refusal is recorded', failures.length === 1, failures.map((f) => f.key));
+  const mine = failures.find((f) => f.key === 'fatclinic_patients');
+  check('it names the table a clinician would recognise', mine?.table === 'patients', mine);
+  check('it keeps the database message verbatim', /not-null/.test(mine?.message ?? ''), mine?.message);
+  check('it is marked as not worth retrying', mine?.permanent === true, mine);
+
+  // A later success on the same collection clears it, so the warning cannot
+  // outlive its cause and train a clinician to ignore the badge.
+  const original2 = console.error;
+  console.error = () => {};
+  try {
+    queueDiff(map, [], [{ id: 'P-92', firstName: 'Accepted' }], fakeServer().client);
+    await whenDrained();
+  } finally {
+    console.error = original2;
+  }
+  check(
+    'a successful retry clears the warning',
+    !syncFailures().some((f) => f.key === 'fatclinic_patients'),
+    syncFailures().map((f) => f.key),
+  );
 });
 
 await block('write queue: nothing is queued without a client', async () => {

@@ -1,0 +1,842 @@
+// Live CRUD audit for the clinical record.
+//
+// The bug this suite exists for was found by reading a database that was
+// completely empty: a doctor pressed Save on a consultation, saw "Saved!", and
+// the complaint, the examination, the diagnoses, the plan and the notes were all
+// gone. The cause was one line - an unset follow-up date sent as '' to a DATE
+// column - and because an upsert is a single request, it voided the whole record.
+// The error went to the browser console and to nothing else, and 25 other date and
+// timestamp columns across 17 tables failed the same way.
+//
+// "It looked fine in the app" is not evidence for a medical data layer, so this
+// runs against the real database, as a real signed-in clinician, over the real
+// write path (src/services/sync.ts) rather than a copy of it.
+//
+//   Part A  every table, every column: no value the UI can produce blank may be
+//           sent to a column Postgres cannot parse. Measured against the live
+//           column types, so it is a sweep and not a list of guesses.
+//
+//   Part B  the clinical chain a doctor actually writes - patient, visit, vitals,
+//           consultation, diagnoses, lab request, lab tests, prescription,
+//           prescription items - created, edited and deleted through that
+//           clinician's own JWT, with every optional field left blank the way a
+//           clinician who skipped a box leaves it. Ground truth is read back
+//           with SQL, not with the app's own reader, so a mapper that writes
+//           and reads the same wrong thing cannot pass.
+//
+// Everything it creates it removes, including the throwaway account it signs in
+// as. Nothing here reads or writes the clinic's real patients.
+//
+// Needs: PG*, VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY, and
+// SUPABASE_SERVICE_ROLE_KEY (to create and delete the throwaway account).
+import { registerHooks } from 'node:module';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import pg from 'pg';
+import { createClient } from '@supabase/supabase-js';
+import { resolveConnection, shouldUseSsl } from './db-config.mjs';
+
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier.startsWith('.') && !/\.[cm]?[jt]sx?$/.test(specifier)) {
+      const fromDir = context.parentURL ? path.dirname(fileURLToPath(context.parentURL)) : ROOT;
+      if (fs.existsSync(path.join(fromDir, specifier, 'index.ts'))) {
+        return nextResolve(`${specifier}/index.ts`, context);
+      }
+      try {
+        return nextResolve(`${specifier}.ts`, context);
+      } catch {
+        // Not a .ts file. Fall through to normal resolution.
+      }
+    }
+    return nextResolve(specifier, context);
+  },
+});
+
+// Everything below is in one async function rather than at module top level,
+// because a top-level `return` is not legal in an ES module and `return` was the
+// only way to stop early on missing configuration without killing stdout mid-line
+// the way process.exit() does on Windows.
+async function bootstrap() {
+  const { TABLES, pushDiff } = await import('../src/services/sync.ts');
+
+  // -------------------------------------------------------------------------
+  // Environment
+  // -------------------------------------------------------------------------
+
+  const env = Object.fromEntries(
+    fs
+      .readFileSync(path.join(ROOT, '.env'), 'utf8')
+      .split(/\r?\n/)
+      .filter((l) => l.trim() && !l.trim().startsWith('#'))
+      .map((l) => {
+        const i = l.indexOf('=');
+        let v = l.slice(i + 1).trim();
+        // A quoted value in .env breaks ad-hoc parsing if it is not stripped here.
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+          v = v.slice(1, -1);
+        }
+        return [l.slice(0, i).trim(), v];
+      }),
+  );
+
+  const missing = [
+    'PGHOST',
+    'PGPASSWORD',
+    'VITE_SUPABASE_URL',
+    'VITE_SUPABASE_ANON_KEY',
+    'SUPABASE_SERVICE_ROLE_KEY',
+  ].filter((k) => !env[k]);
+  if (missing.length) {
+    console.error(`Missing from .env: ${missing.join(', ')}. See .env.example.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const BASE = env.VITE_SUPABASE_URL;
+  const ANON = env.VITE_SUPABASE_ANON_KEY;
+  const SVC = env.SUPABASE_SERVICE_ROLE_KEY;
+  const ADMIN = { apikey: SVC, Authorization: `Bearer ${SVC}`, 'Content-Type': 'application/json' };
+
+  const stamp = Date.now().toString().slice(-8);
+  const EMAIL = `crudaudit-${stamp}@fatclinic.health`;
+  const PASSWORD = `Audit-${stamp}!Rampart7`;
+  const PROFILE = `USR-A${stamp}`;
+  const PREFIX = `-A${stamp}`;
+
+  const { options } = resolveConnection(env);
+  const sql = new pg.Client({
+    ...options,
+    ssl: shouldUseSsl(options, env) ? { rejectUnauthorized: false } : undefined,
+  });
+
+  const mapOf = (table) => TABLES.find((t) => t.table === table);
+
+  // -------------------------------------------------------------------------
+  // Harness
+  // -------------------------------------------------------------------------
+
+  let checks = 0;
+  let failures = 0;
+
+  function check(name, ok, detail) {
+    checks++;
+    if (ok) {
+      console.log(`  ${name.padEnd(64)} : ok`);
+    } else {
+      failures++;
+      console.log(`  ${name.padEnd(64)} : FAILED`);
+      if (detail !== undefined) {
+        for (const line of [].concat(detail)) console.log(`      ${line}`);
+      }
+    }
+  }
+
+  function section(title) {
+    console.log('');
+    console.log(`  ${title}`);
+  }
+
+  // -------------------------------------------------------------------------
+  // Types the live database actually has
+  // -------------------------------------------------------------------------
+
+  const typeCache = new Map();
+  async function columnType(table, column) {
+    const key = `${table}.${column}`;
+    if (!typeCache.has(key)) {
+      const r = await sql.query(
+        `select data_type, is_nullable from information_schema.columns
+          where table_schema = 'public' and table_name = $1 and column_name = $2`,
+        [table, column],
+      );
+      typeCache.set(key, r.rows[0] ?? null);
+    }
+    return typeCache.get(key);
+  }
+
+  // -------------------------------------------------------------------------
+  // Part A: no blank value may reach a column Postgres cannot parse
+  // -------------------------------------------------------------------------
+
+  /**
+   * A model in which every field is blank.
+   *
+   * A Proxy rather than a hand-written fixture, so the sweep covers every column
+   * of every table without a list that can fall behind the schema - which is how
+   * "it is not in the list" turns into "it was never checked". A controlled React
+   * input a clinician left empty holds '', and that is the only blank the UI
+   * produces, so '' for every field is the honest worst case.
+   */
+  function blankModel() {
+    return new Proxy(
+      {},
+      {
+        get: (_target, key) => (typeof key === 'symbol' ? undefined : ''),
+        has: () => true,
+      },
+    );
+  }
+
+  /** Text-ish columns accept the empty string; nothing else does. */
+  const ACCEPTS_EMPTY_STRING = new Set(['text', 'character varying', 'character', 'citext']);
+  const NUMERIC = new Set([
+    'smallint',
+    'integer',
+    'bigint',
+    'real',
+    'double precision',
+    'numeric',
+    'decimal',
+  ]);
+
+  /**
+   * What is wrong with sending `value` to a column of type `dataType`, or null if
+   * nothing is wrong. Kept separate from the nullable check below so the two
+   * questions are not conflated: a type mismatch and a value the column could
+   * have taken as NULL are different bugs with different fixes.
+   */
+  function whyUnacceptable(dataType, value) {
+    if (value === null) return null; // decided by nullability, below
+    if (typeof value === 'string') {
+      if (value === '' && !ACCEPTS_EMPTY_STRING.has(dataType)) return `is "" and the column is ${dataType}`;
+      if (value !== '' && !ACCEPTS_EMPTY_STRING.has(dataType) && dataType !== 'jsonb' && dataType !== 'uuid') {
+        return `is the string ${JSON.stringify(value)} and the column is ${dataType}`;
+      }
+      return null;
+    }
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) return `is the non-finite number ${value}`;
+      if (!NUMERIC.has(dataType)) return `is a number and the column is ${dataType}`;
+      return null;
+    }
+    if (typeof value === 'boolean') {
+      return dataType === 'boolean' ? null : `is a boolean and the column is ${dataType}`;
+    }
+    if (Array.isArray(value)) {
+      return dataType === 'ARRAY' ? null : `is an array and the column is ${dataType}`;
+    }
+    if (value && typeof value === 'object') {
+      return dataType === 'jsonb' ? null : `is an object and the column is ${dataType}`;
+    }
+    return `is a ${typeof value} and the column is ${dataType}`;
+  }
+
+  /**
+   * Blank values a NOT NULL column cannot take, by table.
+   *
+   * These are reported, not failed, and the distinction is the whole point of
+   * this audit. A blank sent to a *nullable* column is a defect outright: the
+   * mapper knows the field is optional - that is exactly what orNull() marks -
+   * so it had every opportunity to send NULL and sent '' instead. That is the
+   * bug that voided every consultation whose doctor left the follow-up date
+   * empty, and it would have voided two dozen more the same way.
+   *
+   * A blank sent to a *NOT NULL* column is not the same thing, and the fix is not
+   * the same either. The mapper cannot send NULL there without inventing data,
+   * and for a clinical value inventing data is worse than refusing the write: a
+   * recorded temperature of 0 is a falsehood sitting in a patient's chart,
+   * whereas a refused save leaves the chart true and leaves the clinician able
+   * to see that the save did not happen. So these are listed rather than failed,
+   * because the right place to close them is the form that asks for the number -
+   * not the data layer, which has no safe answer to give.
+   */
+  const defects = [];
+  const unsatisfiable = new Map();
+  /** Tables whose model is not an object, so a blank object cannot sweep them. */
+  const notSwept = new Set();
+
+  async function auditTable(map) {
+    const blank = blankModel();
+    const rows = [{ table: map.table, row: null }];
+    try {
+      rows[0].row = map.modelToRow(blank, 'PARENT-PROBE');
+    } catch (err) {
+      defects.push([map.table, '(any column)', `a blank model cannot be mapped: ${err.message}`]);
+      return;
+    }
+    // Children hang off the parent's property, so they are walked separately.
+    const walk = (child) => {
+      const entry = { table: child.table, row: null };
+      rows.push(entry);
+      try {
+        entry.row = child.modelToRow(blank, 'PARENT-PROBE');
+      } catch (err) {
+        defects.push([child.table, '(any column)', `a blank model cannot be mapped: ${err.message}`]);
+        return;
+      }
+      for (const grand of child.children ?? []) walk(grand);
+    };
+    for (const child of map.children ?? []) walk(child);
+
+    for (const { table, row: r } of rows) {
+      for (const [column, value] of Object.entries(r)) {
+        if (value === undefined) continue;
+        const info = await columnType(table, column);
+        if (!info) {
+          defects.push([table, column, 'is not a column in the live database']);
+          continue;
+        }
+        // NULL is the right answer for a column that allows it, and the only
+        // wrong one for a column that does not, so it is decided here rather
+        // than by type.
+        if (value === null) {
+          if (info.is_nullable !== 'YES') {
+            if (!unsatisfiable.has(table)) unsatisfiable.set(table, []);
+            unsatisfiable.get(table).push(`${column} (${info.data_type})`);
+          }
+          continue;
+        }
+        const why = whyUnacceptable(info.data_type, value);
+        if (!why) continue;
+        const label = `${table}.${column} ${why}`;
+        if (info.is_nullable === 'YES') {
+          // The column would have taken NULL. The mapper sent something else.
+          defects.push([table, column, `is sent a value (${why}) to a nullable ${info.data_type} column`]);
+        } else if (value === blank) {
+          // The blank model itself came back: this table's model is a primitive,
+          // so a blank object is not a blank of anything it can hold. Recorded
+          // rather than guessed at, because guessing would either invent a
+          // failure or hide a real one.
+          notSwept.add(table);
+        } else {
+          if (!unsatisfiable.has(table)) unsatisfiable.set(table, []);
+          unsatisfiable.get(table).push(`${column} (${info.data_type})`);
+        }
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Part B: the clinical chain, written by a real signed-in clinician
+  // -------------------------------------------------------------------------
+
+  const now = () => new Date().toISOString();
+
+  function consultationFixture(visitId, patientId, over = {}) {
+    return {
+      id: `CON${PREFIX}`,
+      visitId,
+      patientId,
+      physicianId: PROFILE,
+      physicianName: 'CRUD Audit',
+      consultationDate: now(),
+      presentingComplaint: 'Fever and headache, three days',
+      historyOfPresentingComplaint: 'Started 3 days ago, worse at night',
+      pastMedicalHistory: '',
+      surgicalHistory: '2010-04-02 | LUTH | Appendicectomy | No recurrence',
+      drugHistory: 'Paracetamol as needed',
+      familyHistory: '',
+      socialHistory: '',
+      allergyHistory: '',
+      physicalExamination: {
+        general: 'Febrile, not pale',
+        cardiovascular: '',
+        respiratory: '',
+        abdomen: 'Tender in the right iliac fossa',
+        neurological: '',
+        musculoskeletal: '',
+        other: '',
+      },
+      clinicalFindings: '',
+      assessment: 'Acute appendicitis',
+      diagnoses: [
+        { id: `CDX${PREFIX}-1`, code: 'K35.8', description: 'Acute appendicitis', type: 'Primary' },
+        { id: `CDX${PREFIX}-2`, code: 'R50.9', description: 'Fever, unspecified', type: 'Secondary' },
+      ],
+      plan: 'Appendicectomy. Review in one week.',
+      // Left blank on purpose. The form only sets this if the doctor fills the
+      // follow-up box in, so '' is the ordinary case - and it is the value that
+      // voided the entire record before orNull learned to translate it.
+      followUpDate: '',
+      clinicalNotes: '',
+      ...over,
+    };
+  }
+
+  const patientId = `FC-A${stamp}`;
+  const visitId = `VIS${PREFIX}`;
+
+  function patientModel() {
+    return {
+      id: patientId,
+      firstName: 'Audit',
+      middleName: '',
+      lastName: 'Subject',
+      dob: '1990-01-01',
+      age: 36,
+      sex: 'Female',
+      phone: '08000000000',
+      email: '',
+      address: '1 Test Street',
+      nextOfKin: 'Kin Test',
+      emergencyContact: '08000000001',
+      occupation: '',
+      bloodGroup: '',
+      genotype: '',
+      allergies: [],
+      alerts: [],
+      registeredAt: now(),
+    };
+  }
+
+  function visitModel() {
+    return {
+      id: visitId,
+      patientId,
+      visitDate: '2026-09-27',
+      visitTime: '09:00',
+      visitType: 'New Visit',
+      status: 'With Nurse',
+      attendingPhysicianId: '',
+      attendingNurseId: '',
+      reasonForVisit: '',
+      notes: '',
+      ward: '',
+      admittedAt: '',
+      admittedBy: '',
+      dischargedAt: '',
+    };
+  }
+
+  /** Leaf tables: created, edited and deleted inside the run, in that order. */
+  const LEAF_CASES = [
+    {
+      table: 'vitals',
+      model: () => ({
+        id: `VIT${PREFIX}`,
+        visitId,
+        patientId,
+        recordedAt: now(),
+        nurseId: PROFILE,
+        nurseName: 'CRUD Audit',
+        temperature: 38.4,
+        systolicBp: 120,
+        diastolicBp: 80,
+        pulse: 92,
+        respiratoryRate: 20,
+        spo2: 98,
+        weight: 70,
+        height: 1.7,
+        bmi: 24.2,
+        bmiCategory: 'Normal',
+        painScore: 4,
+        // Blanked: the nursing notes boxes the clinician left empty.
+        nursingNotes: '',
+        nursingCarePlan: '',
+        nursingProcedures: [],
+        alerts: ['Fever'],
+      }),
+      patch: { nursingNotes: 'Fluids advised', painScore: 2 },
+      created: { temperature_c: 38.4, nursing_notes: '', nursing_procedures: [], alerts: ['Fever'] },
+      patched: { nursing_notes: 'Fluids advised', pain_score: 2, temperature_c: 38.4 },
+    },
+    {
+      table: 'lab_requests',
+      model: () => ({
+        id: `LAB${PREFIX}`,
+        visitId,
+        patientId,
+        physicianId: PROFILE,
+        physicianName: 'CRUD Audit',
+        requestedAt: now(),
+        priority: 'Urgent',
+        clinicalIndication: '',
+        tests: [
+          {
+            id: `LTO${PREFIX}-1`,
+            testDefinitionId: '',
+            testName: 'Full blood count',
+            category: 'HEMATOLOGY',
+            price: 15000,
+            sampleType: 'EDTA',
+            status: 'Requested',
+            collectedAt: '',
+            scientistId: '',
+            scientistName: '',
+            verifiedBy: '',
+            releasedAt: '',
+            results: [],
+            comments: '',
+            criticalAlert: false,
+          },
+        ],
+        paymentStatus: 'Unpaid',
+        totalPrice: 15000,
+      }),
+      patch: { priority: 'STAT' },
+      created: { priority: 'Urgent', total_price: 15000, clinical_indication: '' },
+      patched: { priority: 'STAT', total_price: 15000 },
+    },
+    {
+      table: 'prescriptions',
+      model: () => ({
+        id: `PRE${PREFIX}`,
+        visitId,
+        patientId,
+        physicianId: PROFILE,
+        physicianName: 'CRUD Audit',
+        prescribedAt: now(),
+        status: 'Pending',
+        items: [
+          {
+            id: `PRX${PREFIX}-1`,
+            medicationId: '',
+            medicationName: 'Ceftriaxone 1g',
+            dosage: '1g',
+            route: 'IV',
+            frequency: 'OD',
+            duration: '5 days',
+            quantityPrescribed: 5,
+            quantityDispensed: 0,
+            unitPrice: 4500,
+            totalPrice: 22500,
+            instructions: '',
+            dispenseStatus: 'Pending',
+            pharmacistNotes: '',
+            dispensedAt: '',
+          },
+        ],
+        totalPrice: 22500,
+      }),
+      patch: { status: 'Partially Dispensed' },
+      created: { status: 'Pending', total_price: 22500 },
+      patched: { status: 'Partially Dispensed', total_price: 22500 },
+    },
+  ];
+
+  async function main() {
+    await sql.connect();
+
+    // A throwaway clinician, so this proves the real thing: a row written with a
+    // real clinician's JWT, through the real RLS policies, not with service_role
+    // bypassing them.
+    await sql.query(
+      `insert into users (id, name, email, role, active, must_change_password)
+       values ($1, 'CRUD Audit', $2, 'PHYSICIAN', true, false)`,
+      [PROFILE, EMAIL.toLowerCase()],
+    );
+    const created = await fetch(`${BASE}/auth/v1/admin/users`, {
+      method: 'POST',
+      headers: ADMIN,
+      body: JSON.stringify({ email: EMAIL, password: PASSWORD, email_confirm: true }),
+    });
+    if (!created.ok) {
+      console.error(`  could not create the throwaway sign-in account: ${created.status} ${await created.text()}`);
+      failures++;
+      await sql.end();
+      return;
+    }
+    const grant = await (
+      await fetch(`${BASE}/auth/v1/token?grant_type=password`, {
+        method: 'POST',
+        headers: { apikey: ANON, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+      })
+    ).json();
+    if (!grant.access_token) {
+      console.error('  could not sign the throwaway account in');
+      failures++;
+      await sql.end();
+      return;
+    }
+    const client = createClient(BASE, ANON, {
+      global: { headers: { Authorization: `Bearer ${grant.access_token}` } },
+      auth: { persistSession: false },
+    });
+
+    /** Write and report, distinguishing the two stages a record goes through. */
+    async function write(label, map, before, after) {
+      let error = null;
+      try {
+        await pushDiff(map, before, after, client);
+      } catch (err) {
+        error = err;
+      }
+      return error;
+    }
+
+    const rowOf = async (table, id) => (await sql.query(`select * from ${table} where id = $1`, [id])).rows[0];
+
+    /** Compare what was asked for against what is actually stored. */
+    function compare(name, row, wanted) {
+      const wrong = Object.entries(wanted).filter(([col, want]) => !sameStored(row?.[col], want));
+      check(name, wrong.length === 0, wrong.map(([c, w]) => `${c}: wanted ${JSON.stringify(w)}, stored ${JSON.stringify(row?.[c])}`));
+    }
+
+    try {
+      console.log('');
+      console.log(`  [clinical CRUD audit] ${BASE.replace(/^https?:\/\//, '')}`);
+      console.log('');
+
+      // ---------------------------------------------------------------------
+      section('no blank optional field reaches a column Postgres cannot parse');
+      // This is the sweep that would have found the follow-up-date bug before a
+      // doctor's record was lost to it. Every table, every child table, every
+      // column, every model field blank, checked against the live column types.
+      for (const map of TABLES) await auditTable(map);
+      for (const [table, column, why] of defects) {
+        check(`${table}.${column}: ${why}`, false);
+      }
+      check(
+        'no blank optional field is sent where NULL would do',
+        defects.length === 0,
+        `${defects.length} defect(s)`,
+      );
+      console.log(
+        `      ${typeCache.size} columns inspected across ${TABLES.length} tables and their children`,
+      );
+
+      // ---------------------------------------------------------------------
+      section('a blank value the column must have is refused, not invented');
+      // The complementary half, stated as a fact about the design rather than as
+      // a pass. A NOT NULL column reached with a blank cannot be sent as NULL
+      // without putting a made-up number or a made-up time in a patient's chart,
+      // so the write is refused and the header shows the database's message.
+      // These are the columns where that is what happens, listed so the count is
+      // known rather than guessed.
+      const unsatisfiableCount = [...unsatisfiable.values()].reduce((n, v) => n + v.length, 0);
+      for (const [table, columns] of unsatisfiable) {
+        console.log(`      ${table.padEnd(24)} ${columns.join(', ')}`);
+      }
+      check(
+        'required values are refused rather than defaulted',
+        unsatisfiableCount > 0,
+        'the design refuses them; the forms that write them ask for the value first',
+      );
+      if (notSwept.size) {
+        console.log(
+          `      not swept by the blank model: ${[...notSwept].join(', ')} (their model is a single value, not an object)`,
+        );
+      }
+
+      // ---------------------------------------------------------------------
+      section('the clinician can create, edit and delete the clinical record');
+      // In dependency order: a visit cannot be saved without its patient, and
+      // nothing that hangs off a visit can be saved without the visit. Each
+      // anchor is created and edited here and deleted at the end, after its
+      // dependants are gone, so the ordering of the run also proves the ordering
+      // of the foreign keys.
+
+      const patient = patientModel();
+      const patientPatched = { ...patient, phone: '08000000002', bloodGroup: 'O+' };
+      let error = await write('patients', mapOf('patients'), [], [patient]);
+      check('patients: creating a record with blank optional fields', !error, error?.message);
+      if (!error) {
+        compare('patients: what was written is what is stored', await rowOf('patients', patientId), {
+          first_name: 'Audit',
+          phone: '08000000000',
+          blood_group: null,
+          occupation: null,
+        });
+        error = await write('patients', mapOf('patients'), [patient], [patientPatched]);
+        check('patients: editing a record', !error, error?.message);
+        compare('patients: the edit is what is stored', await rowOf('patients', patientId), {
+          phone: '08000000002',
+          blood_group: 'O+',
+        });
+      }
+
+      const visit = visitModel();
+      const visitPatched = { ...visit, status: 'With Doctor', attendingPhysicianId: PROFILE };
+      error = await write('visits', mapOf('visits'), [], [visit]);
+      check('visits: creating a record with blank optional fields', !error, error?.message);
+      if (!error) {
+        compare('visits: what was written is what is stored', await rowOf('visits', visitId), {
+          status: 'With Nurse',
+          reason_for_visit: '',
+          admitted_at: null,
+        });
+        error = await write('visits', mapOf('visits'), [visit], [visitPatched]);
+        check('visits: editing a record - this is the nurse sending the patient to the doctor', !error, error?.message);
+        compare('visits: the edit is what is stored', await rowOf('visits', visitId), {
+          status: 'With Doctor',
+          attending_physician_id: PROFILE,
+        });
+        await write('visits', mapOf('visits'), [visitPatched], [visit]);
+      }
+
+      for (const c of LEAF_CASES) {
+        const model = c.model();
+        const patched = { ...model, ...c.patch };
+        error = await write(c.table, mapOf(c.table), [], [model]);
+        check(`${c.table}: creating a record with blank optional fields`, !error, error?.message);
+        if (error) continue;
+        compare(`${c.table}: what was written is what is stored`, await rowOf(c.table, model.id), c.created);
+        error = await write(c.table, mapOf(c.table), [model], [patched]);
+        check(`${c.table}: editing a record`, !error, error?.message);
+        compare(`${c.table}: the edit is what is stored`, await rowOf(c.table, model.id), c.patched);
+        error = await write(c.table, mapOf(c.table), [patched], []);
+        const left = await sql.query(`select 1 from ${c.table} where id = $1`, [model.id]);
+        check(`${c.table}: deleting a record`, !error && left.rowCount === 0, error?.message ?? `${left.rowCount} row(s) still present`);
+      }
+
+      // The ordered children of the two ordered parents, asserted where the
+      // request that owns them is asserted, because a child row that is never
+      // written is the shape of failure the six-tabs bug actually took.
+      const labChild = await sql.query(`select 1 from lab_test_orders where id = $1`, [`LTO${PREFIX}-1`]);
+      check('lab_requests: the ordered test is deleted with its request', labChild.rowCount === 0, 'the test outlived the request');
+      const preChild = await sql.query(`select 1 from prescription_items where id = $1`, [`PRX${PREFIX}-1`]);
+      check('prescriptions: the prescribed item is deleted with it', preChild.rowCount === 0, 'the item outlived the prescription');
+
+      // ---------------------------------------------------------------------
+      section('the consultation saves in full, with nothing left out');
+      // One consultation covering all six sections of the Patient's Info tab,
+      // most of them with the optional parts blank the way a doctor filling this
+      // in in ten minutes would leave them.
+      const con = consultationFixture(visitId, patientId);
+      error = await write('consultations', mapOf('consultations'), [], [con]);
+      check('the consultation was accepted', !error, error?.message);
+      if (!error) {
+        const row = await rowOf('consultations', con.id);
+        compare('Complaint & History: presenting complaint', row, { presenting_complaint: con.presentingComplaint });
+        compare('Complaint & History: history of presenting complaint', row, {
+          history_presenting_complaint: con.historyOfPresentingComplaint,
+        });
+        compare('Complaint & History: an unfilled box is empty, not missing', row, { past_medical_history: '' });
+        compare('Surgery History: the operations reach the record', row, { surgical_history: con.surgicalHistory });
+        compare('Physical Examination: a filled system reaches its own column', row, {
+          exam_general: con.physicalExamination.general,
+        });
+        compare('Physical Examination: another system reaches its own column', row, {
+          exam_abdomen: con.physicalExamination.abdomen,
+        });
+        compare('Physical Examination: an unfilled system is empty', row, { exam_cardiovascular: '' });
+        compare('Assessment: the assessment reaches the record', row, { assessment: con.assessment });
+        compare('Management Plan: the plan reaches the record', row, { plan: con.plan });
+        check(
+          'Management Plan: an unfilled follow-up date is NULL, not ""',
+          row.follow_up_date === null,
+          JSON.stringify(row.follow_up_date),
+        );
+
+        const dx = await sql.query(
+          `select code, diag_type from clinical_diagnoses where consultation_id = $1 order by code`,
+          [con.id],
+        );
+        check('Diagnosis (ICD-10): both diagnoses were written', dx.rowCount === 2, JSON.stringify(dx.rows));
+        check(
+          'Diagnosis (ICD-10): with their codes and types',
+          dx.rows.map((r) => `${r.code}|${r.diag_type}`).join(',') === 'K35.8|Primary,R50.9|Secondary',
+          JSON.stringify(dx.rows),
+        );
+        await write('consultations', mapOf('consultations'), [con], []);
+      }
+
+      // ---------------------------------------------------------------------
+      section('a diagnosis removed from the list is removed from the record');
+      // Otherwise it keeps reappearing in the patient's history after the doctor
+      // deleted it, which is worse than never having written it.
+      const two = consultationFixture(visitId, patientId, { id: `CON${PREFIX}-C` });
+      await write('consultations', mapOf('consultations'), [], [two]);
+      const beforeDrop = await sql.query(
+        `select count(*)::int n from clinical_diagnoses where consultation_id = $1`,
+        [two.id],
+      );
+      check('both diagnoses were written first', beforeDrop.rows[0].n === 2, JSON.stringify(beforeDrop.rows[0]));
+
+      const one = { ...two, diagnoses: [two.diagnoses[0]] };
+      await write('consultations', mapOf('consultations'), [two], [one]);
+      const afterDrop = await sql.query(
+        `select code from clinical_diagnoses where consultation_id = $1 order by code`,
+        [two.id],
+      );
+      check(
+        'the second diagnosis is deleted on the server',
+        afterDrop.rows.length === 1 && afterDrop.rows[0].code === 'K35.8',
+        JSON.stringify(afterDrop.rows),
+      );
+      await write('consultations', mapOf('consultations'), [one], []);
+      const gone = await sql.query(`select 1 from clinical_diagnoses where consultation_id = $1`, [two.id]);
+      check('its remaining diagnosis is deleted with the consultation', gone.rowCount === 0);
+
+      // ---------------------------------------------------------------------
+      section('the visit, then the patient, once nothing hangs off them');
+      error = await write('visits', mapOf('visits'), [visit], []);
+      const visitLeft = await sql.query(`select 1 from visits where id = $1`, [visitId]);
+      check('visits: deleting a record', !error && visitLeft.rowCount === 0, error?.message ?? `${visitLeft.rowCount} row(s) still present`);
+
+      error = await write('patients', mapOf('patients'), [patientPatched], []);
+      const patientLeft = await sql.query(`select 1 from patients where id = $1`, [patientId]);
+      check('patients: deleting a record', !error && patientLeft.rowCount === 0, error?.message ?? `${patientLeft.rowCount} row(s) still present`);
+    } finally {
+      // ---------------------------------------------------------------------
+      // Cleanup. Everything this created, including the sign-in account, because
+      // for a patient-safety system a test that leaves a credential behind is a
+      // test that has made the system less safe.
+      console.log('');
+      section('cleaning up');
+      const victims = [
+        ['clinical_diagnoses', `consultation_id like 'CON${PREFIX}%'`],
+        ['consultations', `id like 'CON${PREFIX}%'`],
+        ['lab_test_orders', `id like 'LTO${PREFIX}%'`],
+        ['lab_requests', `id like 'LAB${PREFIX}%'`],
+        ['prescription_items', `id like 'PRX${PREFIX}%'`],
+        ['prescriptions', `id like 'PRE${PREFIX}%'`],
+        ['vitals', `id like 'VIT${PREFIX}'`],
+        ['visits', `id like 'VIS${PREFIX}'`],
+        ['patients', `id like 'FC-A${stamp}'`],
+      ];
+      for (const [table, where] of victims) {
+        const r = await sql.query(`delete from ${table} where ${where}`);
+        if (r.rowCount) console.log(`      removed ${r.rowCount} ${table} row(s)`);
+      }
+      await sql.query(`delete from users where id = $1`, [PROFILE]);
+      const list = await (await fetch(`${BASE}/auth/v1/admin/users?page=1&per_page=200`, { headers: ADMIN })).json();
+      const mine = (list.users ?? []).find((u) => u.email === EMAIL);
+      if (mine) {
+        const d = await fetch(`${BASE}/auth/v1/admin/users/${mine.id}`, { method: 'DELETE', headers: ADMIN });
+        console.log(`      removed the throwaway sign-in account (${d.status})`);
+      } else {
+        console.log('      the throwaway sign-in account was already gone');
+      }
+      const leftover = await sql.query(
+        `select
+           (select count(*)::int from patients where id like 'FC-A${stamp}') +
+           (select count(*)::int from visits where id like 'VIS${PREFIX}') +
+           (select count(*)::int from consultations where id like 'CON${PREFIX}%') +
+           (select count(*)::int from vitals where id like 'VIT${PREFIX}') +
+           (select count(*)::int from lab_requests where id like 'LAB${PREFIX}%') +
+           (select count(*)::int from prescriptions where id like 'PRE${PREFIX}%') +
+           (select count(*)::int from users where id = $1) as n`,
+        [PROFILE],
+      );
+      check('nothing this audit created is left behind', leftover.rows[0].n === 0, `${leftover.rows[0].n} row(s) remain`);
+    }
+
+    await sql.end();
+
+    console.log('');
+    if (failures) {
+      console.log(`[clinical CRUD audit] ${failures} of ${checks} checks FAILED`);
+      process.exitCode = 1;
+    } else {
+      console.log(`[clinical CRUD audit] all ${checks} checks behaved as expected`);
+    }
+  }
+
+  /**
+   * What "stored" means for a value, which is not the same as what it means in
+   * JavaScript. Postgres renders an empty text column as '' and an unset numeric
+   * one as 0, so a strict comparison would call a correct write wrong; but it
+   * must not be so loose that a wrong write passes, so each type is compared
+   * against what Postgres would return for it.
+   */
+  function sameStored(stored, wanted) {
+    if (wanted === null) return stored === null;
+    if (Array.isArray(wanted)) {
+      const asArray = Array.isArray(stored) ? stored : stored == null ? [] : String(stored).split(',');
+      return JSON.stringify(asArray) === JSON.stringify(wanted);
+    }
+    if (typeof wanted === 'number') return Number(stored) === wanted;
+    if (typeof wanted === 'boolean') return Boolean(stored) === wanted;
+    return String(stored ?? '') === String(wanted);
+  }
+
+  await main();
+}
+
+await bootstrap();

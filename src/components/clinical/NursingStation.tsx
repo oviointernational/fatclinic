@@ -3,6 +3,7 @@ import { Patient, Visit, Vitals, wardName } from '../../types';
 import { db } from '../../services/db';
 import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
+import { isWithDoctor } from '../../services/consultationAccess';
 import {
   CheckCircle2,
   Thermometer,
@@ -95,7 +96,11 @@ export const NursingStation: React.FC<NursingStationProps> = ({
     const rxs = db.getPrescriptions(p.id, latestVisit.id);
     const rad = db.getRadiologyOrders(p.id, latestVisit.id);
     const physio = db.getPhysiotherapyOrders(p.id, latestVisit.id);
-    const sentToDoctor = ['With Doctor', 'Awaiting Physician', 'In Consultation', 'Awaiting Lab', 'Awaiting Pharmacy', 'Awaiting Payment', 'Admitted', 'Completed', 'Discharged'].includes(latestVisit.status);
+    // From the shared rule, so the nurse's checklist and the doctor's read-only
+    // gate cannot disagree about whether a patient has been sent. This list also
+    // carried 'Completed' and 'Discharged', which the doctor's gate did not: a
+    // nurse could see the patient as handed over while the doctor was refused.
+    const sentToDoctor = isWithDoctor(db.getVisits(p.id));
     return [
       { label: "Patient's Info", done: true, detail: `${p.sex}, ${p.age}y • Visit ${latestVisit.visitDate} (${latestVisit.status})` },
       { label: 'Vitals', done: !!vitalsRec, detail: vitalsRec ? `BP ${vitalsRec.systolicBp}/${vitalsRec.diastolicBp} • SpO2 ${vitalsRec.spo2}%` : 'Not recorded' },

@@ -1,9 +1,17 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { Patient, Visit, ClinicalDiagnosis, LabCategory, LabInvestigationDefinition, Medication, wardName } from '../../types';
 import { db } from '../../services/db';
 import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { aiService } from '../../services/aiService';
+import { mayDoctorWrite, readOnlyReason } from '../../services/consultationAccess';
+import {
+  formatSurgeryHistory,
+  isStructuredSurgeryHistory,
+  parseSurgeryHistory,
+  type SurgeryHistoryEntry,
+} from '../../services/surgeryHistory';
+import { classifyExamEntry, isAdditionalFindings } from '../../services/physicalExam';
 import { AdmitDialog } from './AdmitDialog';
 import {
   Stethoscope,
@@ -86,8 +94,10 @@ const DEPARTMENTS: Array<{
 ];
 
 // generic entry types
+// `SurgeryHistoryEntry` is imported from services/surgeryHistory, which owns the
+// shape because it also owns the serialisation into the single text column. A
+// second, local copy of the interface is a second thing to forget to update.
 interface EntryItem { id: string; title: string; body: string; complaint?: string; }
-interface SurgeryHistoryEntry { id: string; date: string; hospital: string; surgeryType: string; notes: string; }
 interface DiagnosisEntry { id: string; title: string; body: string; isCoded: boolean; code: string; type: 'Primary' | 'Secondary'; }
 interface ManagementEntry { id: string; title: string; body: string; date?: string; priority?: string; category?: string; }
 
@@ -111,6 +121,26 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   const visits = patient ? db.getVisits(patient.id) : [];
   const [currentVisitId, setCurrentVisitId] = useState<string>(initialVisit?.id || '');
   const activeVisit = visits.find(v => v.id === currentVisitId) || initialVisit || visits[0] || undefined;
+
+  /**
+   * Whether this clinician may add anything to the record in front of them.
+   *
+   * Keyed on the *selected* visit, not on the patient's latest one. The visit
+   * dropdown lists every visit the patient has ever had, so a patient whose
+   * current visit is waiting for vitals can still have a closed visit selected
+   * from before - and "the latest visit is fine" would then wave that through.
+   *
+   * This is the enforcement point. The patient list already refused to open a
+   * patient who had not been sent, but that was a filter on one screen: the
+   * component still rendered a fully editable consultation form, the Save button
+   * was live, and the dialogs for complaints, examination, diagnoses, lab orders
+   * and prescriptions all opened. Anything that reached the form - the initial
+   * patient passed in by the dashboard, a deep link, the browser's own back
+   * button - could be typed into and saved. A gate that only exists on the list
+   * is a gate with no door in it.
+   */
+  const canWrite = mayDoctorWrite(activeVisit);
+  const gateReason = readOnlyReason(activeVisit);
 
   const [showPatientSearch, setShowPatientSearch] = useState(false);
   const [patientSearch, setPatientSearch] = useState('');
@@ -222,7 +252,10 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
     if (existingConsultation.presentingComplaint) arr.push({ id: 'c0', title: 'Presenting Complaint', body: existingConsultation.presentingComplaint });
     if (existingConsultation.historyOfPresentingComplaint) arr.push({ id: 'c1', title: 'History of Presenting Complaint', body: existingConsultation.historyOfPresentingComplaint });
     if (existingConsultation.pastMedicalHistory) arr.push({ id: 'c2', title: 'Past Medical History', body: existingConsultation.pastMedicalHistory });
-    if (existingConsultation.surgicalHistory) arr.push({ id: 'c3', title: 'Surgical History', body: existingConsultation.surgicalHistory });
+    // Only when it is free text. Once the Surgery History tab owns the column the
+    // same operations would appear twice, and saving would keep whichever copy the
+    // Complaint tab happened to hold - silently discarding the structured one.
+    if (existingConsultation.surgicalHistory && !isStructuredSurgeryHistory(existingConsultation.surgicalHistory)) arr.push({ id: 'c3', title: 'Surgical History', body: existingConsultation.surgicalHistory });
     if (existingConsultation.drugHistory) arr.push({ id: 'c4', title: 'Drug / Medication History', body: existingConsultation.drugHistory });
     if (existingConsultation.familyHistory) arr.push({ id: 'c5', title: 'Family History', body: existingConsultation.familyHistory });
     if (existingConsultation.socialHistory) arr.push({ id: 'c6', title: 'Social / Occupational History', body: existingConsultation.socialHistory });
@@ -257,27 +290,103 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
     if (existingConsultation.clinicalNotes) arr.push({ id: 'm1', title: 'Clinical Notes', body: existingConsultation.clinicalNotes, category: 'Notes' });
     return arr;
   };
+  /**
+   * The Surgery History tab, read back out of the single text column.
+   *
+   * `surgeryEntries` used to start empty and stay empty across page loads, which
+   * is the other half of the tab not saving: there was nothing to seed it from
+   * even if the save had written something.
+   */
+  const initSurgery = (): SurgeryHistoryEntry[] =>
+    parseSurgeryHistory(existingConsultation?.surgicalHistory);
 
   const [complaintEntries, setComplaintEntries] = useState<EntryItem[]>(initComplaint());
   const [examEntries, setExamEntries] = useState<EntryItem[]>(initExam());
   const [diagnosisEntries, setDiagnosisEntries] = useState<DiagnosisEntry[]>(initDiagnosis());
   const [managementEntries, setManagementEntries] = useState<ManagementEntry[]>(initManagement());
+  const [surgeryEntries, setSurgeryEntries] = useState<SurgeryHistoryEntry[]>(initSurgery());
+
+  /**
+   * Re-seed every entry list when the record on screen changes.
+   *
+   * `useState`'s argument is an initialiser: it runs on mount and never again.
+   * The component stays mounted while the doctor moves between patients and
+   * between a patient's visits, so all five lists kept the *previous* patient's
+   * contents. Selecting a second patient showed the first patient's complaint,
+   * examination, diagnoses and plan, and pressing Save wrote them onto the second
+   * patient's record under the second patient's name - one keystroke, and one
+   * patient's history written onto another's. The visit dropdown made the same
+   * trap available within a single patient.
+   *
+   * The key is the visit, because that is the unit the consultation is keyed on:
+   * `db.getConsultation` looks it up by visit, and the complaint, examination,
+   * diagnoses and plan all belong to that visit rather than to the person.
+   */
+  /**
+   * Shut any open editor if the record stops being writable.
+   *
+   * The gate can flip while a dialog is on screen: a nurse sends the patient
+   * through, or the doctor switches to a different visit from the dropdown, or a
+   * colleague marks the visit treated. A dialog that was legitimately open when
+   * the record became read-only would otherwise still be open, still accepting
+   * text, and its Save would write to a record that is no longer the doctor's to
+   * write to.
+   */
+  useEffect(() => {
+    if (canWrite) return;
+    setShowComplaintDlg(false);
+    setShowExamDlg(false);
+    setShowSurgeryDlg(false);
+    setShowDiagDlg(false);
+    setShowLabDlg(false);
+    setShowRxDlg(false);
+    setShowMgmtDlg(false);
+    setShowNextAppt(false);
+    setAiSuggestions([]);
+  }, [canWrite]);
+
+  const seededFor = useRef<string>('');
+  useEffect(() => {
+    const key = activeVisit?.id ?? `no-visit:${currentPatientId}`;
+    if (seededFor.current === key) return;
+    seededFor.current = key;
+    setComplaintEntries(initComplaint());
+    setExamEntries(initExam());
+    setDiagnosisEntries(initDiagnosis());
+    setManagementEntries(initManagement());
+    setSurgeryEntries(initSurgery());
+    // Deliberately keyed on the visit alone. `initComplaint` and friends close
+    // over `existingConsultation`, which is derived from the same visit, so
+    // listing it would be listing the same thing twice; the ref is what makes
+    // this run once per visit rather than on every render of that visit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeVisit?.id, currentPatientId]);
 
   // fallback old state for save compatibility still kept as derived
   const complaint = useMemo(() => complaintEntries.map(e => `${e.title}: ${e.body}`).join('\n'), [complaintEntries]);
   const hpc = useMemo(() => { const f = complaintEntries.find(e=>e.title.toLowerCase().includes('history of presenting')); return f?f.body:'' }, [complaintEntries]);
-  // physical exam mapping
+  /**
+   * The examination, folded from the titled entries into the seven columns.
+   *
+   * `classifyExamEntry` decides the column. The old inline substring matching put
+   * Gastrointestinal and Neurological findings into "other" - the two systems the
+   * dialog offers whose names contain neither of the substrings it looked for -
+   * and also appended the additional-findings entry to "other", storing the same
+   * text in two columns on every save.
+   */
   const examMap = useMemo(() => {
-    const m: Record<string,string> = {};
-    examEntries.forEach(e=>{
-      const k=e.title.toLowerCase();
-      if(k.includes('general')) m.general=e.body;
-      else if(k.includes('cardio')) m.cardiovascular=e.body;
-      else if(k.includes('resp')) m.respiratory=e.body;
-      else if(k.includes('abdomen')||k.includes('gi')) m.abdomen=e.body;
-      else if(k.includes('nervous')||k.includes('cns')) m.neurological=e.body;
-      else if(k.includes('musculo')) m.musculoskeletal=e.body;
-      else m.other=(m.other? m.other+'\n':'')+ `${e.title}: ${e.body}`;
+    const m: Record<string, string> = {};
+    const append = (key: string, line: string) => {
+      m[key] = m[key] ? `${m[key]}\n${line}` : line;
+    };
+    examEntries.forEach((e) => {
+      if (isAdditionalFindings(e.title)) return; // its own column, read below
+      const column = classifyExamEntry(e.title);
+      // A recognised system stores just the finding, so a reload reads back as
+      // one entry per system. Anything filed under "other" keeps its title, or the
+      // column would come back as a run-on sentence with no way to tell where one
+      // finding ended and the next began.
+      append(column, column === 'other' ? `${e.title}: ${e.body}` : e.body);
     });
     return m;
   }, [examEntries]);
@@ -292,7 +401,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   const plan = useMemo(()=> managementEntries.map(m=> `${m.title}: ${m.body}`).join('\n'), [managementEntries]);
   const followUpDate = useMemo(()=> managementEntries.find(m=>m.date)?.date || '', [managementEntries]);
   const clinicalNotes = useMemo(()=> managementEntries.filter(m=>m.title.toLowerCase().includes('note')).map(m=>m.body).join('\n'), [managementEntries]);
-  const clinicalFindings = useMemo(()=> examEntries.find(e=>e.title.toLowerCase().includes('additional'))?.body || '', [examEntries]);
+  const clinicalFindings = useMemo(()=> examEntries.find(e=>isAdditionalFindings(e.title))?.body || '', [examEntries]);
 
   // lab & rx state
   const [orderedLabTests, setOrderedLabTests] = useState<LabOrderItem[]>([]);
@@ -301,6 +410,8 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   const [rxItems, setRxItems] = useState<Array<{ medId: string; dosage: string; route: string; frequency: string; duration: string; quantity: number; instructions: string; }>>([]);
 
   const [savedSuccess, setSavedSuccess] = useState(false);
+  /** Set when a save was refused by the gate, so the doctor is told why. */
+  const [saveBlocked, setSaveBlocked] = useState<string | null>(null);
   const [aiSuggestions, setAiSuggestions] = useState<string[]>([]);
   const [activeAiField, setActiveAiField] = useState<'complaint' | 'exam' | 'plan' | 'diagnosis' | null>(null);
 
@@ -363,7 +474,6 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   const [showNextAppt, setShowNextAppt] = useState(false);
 
   // Surgery history
-  const [surgeryEntries, setSurgeryEntries] = useState<SurgeryHistoryEntry[]>([]);
   const [showSurgeryDlg, setShowSurgeryDlg] = useState(false);
   const [surgeryDlgDate, setSurgeryDlgDate] = useState('');
   const [surgeryDlgHospital, setSurgeryDlgHospital] = useState('');
@@ -371,8 +481,8 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   const [surgeryDlgNotes, setSurgeryDlgNotes] = useState('');
   const [editingSurgeryId, setEditingSurgeryId] = useState<string | null>(null);
 
-  const openSurgeryAdd = () => { setSurgeryDlgDate(''); setSurgeryDlgHospital(''); setSurgeryDlgType(''); setSurgeryDlgNotes(''); setEditingSurgeryId(null); setShowSurgeryDlg(true); };
-  const openSurgeryEdit = (s: SurgeryHistoryEntry) => { setSurgeryDlgDate(s.date); setSurgeryDlgHospital(s.hospital); setSurgeryDlgType(s.surgeryType); setSurgeryDlgNotes(s.notes); setEditingSurgeryId(s.id); setShowSurgeryDlg(true); };
+  const openSurgeryAdd = () => { if (refuseIfReadOnly()) return; setSurgeryDlgDate(''); setSurgeryDlgHospital(''); setSurgeryDlgType(''); setSurgeryDlgNotes(''); setEditingSurgeryId(null); setShowSurgeryDlg(true); };
+  const openSurgeryEdit = (s: SurgeryHistoryEntry) => { if (refuseIfReadOnly()) return; setSurgeryDlgDate(s.date); setSurgeryDlgHospital(s.hospital); setSurgeryDlgType(s.surgeryType); setSurgeryDlgNotes(s.notes); setEditingSurgeryId(s.id); setShowSurgeryDlg(true); };
   const saveSurgery = () => {
     if(!surgeryDlgType.trim()) return;
     const entry: SurgeryHistoryEntry = { id: editingSurgeryId||'surg-'+Date.now(), date: surgeryDlgDate, hospital: surgeryDlgHospital, surgeryType: surgeryDlgType, notes: surgeryDlgNotes };
@@ -382,11 +492,13 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   };
 
   const handleAiAutocomplete = (field: 'complaint' | 'exam' | 'plan' | 'diagnosis') => {
+    if (refuseIfReadOnly()) return;
     setActiveAiField(field);
     const suggestions = aiService.getAutocompleteSuggestions(field, field === 'complaint' ? complaint : '');
     setAiSuggestions(suggestions);
   };
   const applyAiSuggestion = (suggestion: string) => {
+    if (refuseIfReadOnly()) return;
     if (activeAiField === 'complaint') {
       const parts = suggestion.split(':');
       setComplaintEntries(prev => [...prev, { id: 'ai-'+Date.now(), title: parts[0]?.trim() || 'AI Suggestion', body: parts[1]?.trim() || suggestion }]);
@@ -403,8 +515,24 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   };
 
   // complaint handlers
-  const openComplaintAdd = () => { setComplaintDlgTitle(''); setComplaintDlgComplaint(''); setComplaintDlgBody(''); setEditingComplaintId(null); setShowComplaintDlg(true); };
-  const openComplaintEdit = (e: EntryItem) => { setComplaintDlgTitle(e.title); setComplaintDlgComplaint(e.complaint || ''); setComplaintDlgBody(e.body); setEditingComplaintId(e.id); setShowComplaintDlg(true); };
+  /**
+   * Refuse to start an edit while this record is read-only.
+   *
+   * Placed on the handlers rather than on the eleven buttons that call them,
+   * because a button is a presentation detail and a handler is the thing that
+   * actually opens an editor. Guarding the buttons would mean eleven chances to
+   * forget one, and a forgotten button is a working editor on a read-only record
+   * - which is the exact hole this gate was written to close. Returns true when
+   * the caller should stop, and says why on screen.
+   */
+  const refuseIfReadOnly = (): boolean => {
+    if (canWrite) return false;
+    setSaveBlocked(gateReason);
+    return true;
+  };
+
+  const openComplaintAdd = () => { if (refuseIfReadOnly()) return; setComplaintDlgTitle(''); setComplaintDlgComplaint(''); setComplaintDlgBody(''); setEditingComplaintId(null); setShowComplaintDlg(true); };
+  const openComplaintEdit = (e: EntryItem) => { if (refuseIfReadOnly()) return; setComplaintDlgTitle(e.title); setComplaintDlgComplaint(e.complaint || ''); setComplaintDlgBody(e.body); setEditingComplaintId(e.id); setShowComplaintDlg(true); };
   const saveComplaint = () => {
     if(!complaintDlgTitle.trim() || !complaintDlgBody.trim()) return;
     if(editingComplaintId){
@@ -416,8 +544,8 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   };
 
   // exam handlers
-  const openExamAdd = () => { setExamDlgSystem('General'); setExamDlgTitle(''); setExamDlgBody(''); setEditingExamId(null); setShowExamDlg(true); };
-  const openExamEdit = (e: EntryItem) => { setExamDlgSystem(e.title.split(' - ')[0] || 'General'); setExamDlgTitle(e.title.split(' - ')[1] || e.title); setExamDlgBody(e.body); setEditingExamId(e.id); setShowExamDlg(true); };
+  const openExamAdd = () => { if (refuseIfReadOnly()) return; setExamDlgSystem('General'); setExamDlgTitle(''); setExamDlgBody(''); setEditingExamId(null); setShowExamDlg(true); };
+  const openExamEdit = (e: EntryItem) => { if (refuseIfReadOnly()) return; setExamDlgSystem(e.title.split(' - ')[0] || 'General'); setExamDlgTitle(e.title.split(' - ')[1] || e.title); setExamDlgBody(e.body); setEditingExamId(e.id); setShowExamDlg(true); };
   const saveExam = () => {
     if(!examDlgTitle.trim() || !examDlgBody.trim()) return;
     const fullTitle = `${examDlgSystem} - ${examDlgTitle}`;
@@ -427,8 +555,8 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   };
 
   // diagnosis handlers
-  const openDiagAdd = () => { setDiagDlgTitle(''); setDiagDlgBody(''); setDiagDlgIsCoded(true); setDiagDlgCode(''); setDiagDlgType(diagnosisEntries.some(d=>d.type==='Primary')?'Secondary':'Primary'); setEditingDiagId(null); setShowDiagDlg(true); };
-  const openDiagEdit = (d: DiagnosisEntry) => { setDiagDlgTitle(d.title); setDiagDlgBody(d.body); setDiagDlgIsCoded(d.isCoded); setDiagDlgCode(d.code); setDiagDlgType(d.type); setEditingDiagId(d.id); setShowDiagDlg(true); };
+  const openDiagAdd = () => { if (refuseIfReadOnly()) return; setDiagDlgTitle(''); setDiagDlgBody(''); setDiagDlgIsCoded(true); setDiagDlgCode(''); setDiagDlgType(diagnosisEntries.some(d=>d.type==='Primary')?'Secondary':'Primary'); setEditingDiagId(null); setShowDiagDlg(true); };
+  const openDiagEdit = (d: DiagnosisEntry) => { if (refuseIfReadOnly()) return; setDiagDlgTitle(d.title); setDiagDlgBody(d.body); setDiagDlgIsCoded(d.isCoded); setDiagDlgCode(d.code); setDiagDlgType(d.type); setEditingDiagId(d.id); setShowDiagDlg(true); };
   const saveDiag = () => {
     if(!diagDlgTitle.trim()) return;
     if(diagDlgIsCoded && !diagDlgCode.trim()) return;
@@ -439,7 +567,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   };
 
   // lab dialog handlers
-  const openLabDlg = () => {
+  const openLabDlg = () => { if (refuseIfReadOnly()) return;
     setLabDlgSelectedIds([]);
     const first = labDefs.find(d=> d.category===labDlgDept)?.id || labDefs[0]?.id || '';
     setLabDlgPick(first);
@@ -465,7 +593,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   };
 
   // rx dialog handlers
-  const openRxDlg = () => {
+  const openRxDlg = () => { if (refuseIfReadOnly()) return;
     setRxDlgMedId(medications[0]?.id || '');
     setRxDlgDosage('1 tablet'); setRxDlgRoute('Oral'); setRxDlgFrequency('BD (Twice daily)'); setRxDlgDuration('5 days'); setRxDlgQuantity(10); setRxDlgInstructions('Take after meals with water');
     setRxStaging([]);
@@ -485,8 +613,8 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   };
 
   // management handlers
-  const openMgmtAdd = () => { setMgmtDlgTitle('Treatment Plan'); setMgmtDlgBody(''); setMgmtDlgDate(''); setMgmtDlgCategory('Therapeutics'); setMgmtDlgPriority('Routine'); setEditingMgmtId(null); setShowMgmtDlg(true); };
-  const openMgmtEdit = (m: ManagementEntry)=>{ setMgmtDlgTitle(m.title); setMgmtDlgBody(m.body); setMgmtDlgDate(m.date||''); setMgmtDlgCategory(m.category||'Therapeutics'); setEditingMgmtId(m.id); setShowMgmtDlg(true); };
+  const openMgmtAdd = () => { if (refuseIfReadOnly()) return; setMgmtDlgTitle('Treatment Plan'); setMgmtDlgBody(''); setMgmtDlgDate(''); setMgmtDlgCategory('Therapeutics'); setMgmtDlgPriority('Routine'); setEditingMgmtId(null); setShowMgmtDlg(true); };
+  const openMgmtEdit = (m: ManagementEntry)=>{ if (refuseIfReadOnly()) return; setMgmtDlgTitle(m.title); setMgmtDlgBody(m.body); setMgmtDlgDate(m.date||''); setMgmtDlgCategory(m.category||'Therapeutics'); setEditingMgmtId(m.id); setShowMgmtDlg(true); };
   const saveMgmt = () => {
     if(!mgmtDlgTitle.trim() || !mgmtDlgBody.trim()) return;
     const entry: ManagementEntry = { id: editingMgmtId||'mg-'+Date.now(), title: mgmtDlgTitle, body: mgmtDlgBody, date: mgmtDlgDate, category: mgmtDlgCategory, priority: mgmtDlgPriority };
@@ -498,11 +626,34 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   const handleSaveConsultation = (e: React.FormEvent) => {
     e.preventDefault();
     if (!patient || !activeVisit) return;
+    // The gate, enforced at the point of the write rather than only by hiding the
+    // button. The button is disabled and the dialogs are closed when the patient
+    // has not been sent, so reaching this with `!canWrite` means the two got out
+    // of step - and the right response to that is to refuse the write, not to
+    // save it. A record that must not exist should not be one keystroke away.
+    if (!canWrite) {
+      setSavedSuccess(false);
+      setSaveBlocked(gateReason);
+      return;
+    }
+    setSaveBlocked(null);
     // Build strings for legacy fields
     const presentingComplaint = complaintEntries.find(x=> x.title.toLowerCase().includes('presenting'))?.body || complaintEntries[0]?.body || '';
     const hpcVal = complaintEntries.find(x=> x.title.toLowerCase().includes('history of presenting'))?.body || '';
     const pmhVal = complaintEntries.find(x=> x.title.toLowerCase().includes('past medical'))?.body || '';
-    const surgicalVal = complaintEntries.find(x=> x.title.toLowerCase().includes('surgical'))?.body || '';
+    /**
+     * The Surgery History tab's structured entries, serialised into the column.
+     *
+     * This used to read a *complaint* entry whose title contained "surgical",
+     * which the Surgery History tab never writes, so every operation recorded
+     * there was discarded on save. The free-text complaint entry is still
+     * honoured when the tab is empty, so a clinician who types surgical history
+     * into Complaint & History is not worse off than before - but the structured
+     * tab wins when it has something, because it is the one that was being lost.
+     */
+    const surgicalVal = formatSurgeryHistory(surgeryEntries)
+      || complaintEntries.find(x=> x.title.toLowerCase().includes('surgical'))?.body
+      || '';
     const drugVal = complaintEntries.find(x=> x.title.toLowerCase().includes('drug'))?.body || '';
     const familyVal = complaintEntries.find(x=> x.title.toLowerCase().includes('family'))?.body || '';
     const socialVal = complaintEntries.find(x=> x.title.toLowerCase().includes('social'))?.body || '';
@@ -662,7 +813,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
                 const hasScheduled = db.getVisits(p.id).some(v => ['Awaiting Vitals', 'With Nurse'].includes(v.status));
                 // Doctors attend only patients sent by nurses; otherwise profile only.
                 // Incoming view is always profile only.
-                const profileOnly = activeSubNav === 'consultations_incoming' || !latestVisit || !['With Doctor', 'Awaiting Physician', 'In Consultation', 'Awaiting Lab', 'Awaiting Pharmacy', 'Awaiting Payment', 'Admitted'].includes(latestVisit.status);
+                const profileOnly = activeSubNav === 'consultations_incoming' || !mayDoctorWrite(latestVisit);
                 const dotCls = !latestVisit ? 'bg-slate-300'
                   : ['Treated', 'Completed', 'Discharged'].includes(latestVisit.status) ? 'bg-emerald-500'
                   : latestVisit.status === 'In Consultation' ? 'bg-blue-500 animate-pulse'
@@ -719,7 +870,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
           const items = getPhysicianChecklist(pp);
           const doneCount = items.filter(i => i.done).length;
           const ppLatest = db.getVisits(pp.id)[0];
-          const ppAttendable = activeSubNav !== 'consultations_incoming' && !!ppLatest && ['With Doctor', 'Awaiting Physician', 'In Consultation', 'Awaiting Lab', 'Awaiting Pharmacy', 'Awaiting Payment', 'Admitted'].includes(ppLatest.status);
+          const ppAttendable = activeSubNav !== 'consultations_incoming' && mayDoctorWrite(ppLatest);
           return (
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
               <div className="absolute inset-0 bg-slate-900/60" onClick={() => setProgressPatientId(null)} />
@@ -784,12 +935,12 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
           <button type="button" onClick={() => { setPatientSearch(''); setShowPatientSearch(true); }} className="flex items-center space-x-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 hover:bg-rose-100">
             <User className="w-3 h-3" /><span>Patients</span>
           </button>
-          {activeVisit && ['With Doctor', 'Awaiting Physician', 'In Consultation', 'Awaiting Lab', 'Awaiting Pharmacy', 'Awaiting Payment'].includes(activeVisit.status) && (
+          {activeVisit && mayDoctorWrite(activeVisit) && activeVisit.status !== 'Admitted' && (
             <button type="button" onClick={() => setShowAdmit(true)} className="flex items-center space-x-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-amber-600 hover:bg-amber-700 text-white">
               <Layers className="w-3 h-3" /><span>Admit</span>
             </button>
           )}
-          {activeVisit && ['With Doctor', 'Awaiting Physician', 'In Consultation', 'Awaiting Lab', 'Awaiting Pharmacy', 'Awaiting Payment'].includes(activeVisit.status) && (
+          {activeVisit && mayDoctorWrite(activeVisit) && activeVisit.status !== 'Admitted' && (
             <button type="button" onClick={() => { if (confirm('Mark this patient as Treated? The visit will be closed.')) db.updateVisitStatus(activeVisit.id, 'Treated', currentUser); }} className="flex items-center space-x-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white">
               <CheckCircle2 className="w-3 h-3" /><span>Treated</span>
             </button>
@@ -799,15 +950,51 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
               <CheckCircle2 className="w-3 h-3" /><span>Discharge</span>
             </button>
           )}
-          {savedSuccess && <span className="text-[11px] font-bold text-emerald-600 dark:text-emerald-400 flex items-center space-x-1"><CheckCircle2 className="w-3 h-3" /><span>Saved!</span></span>}
+          {savedSuccess && !saveBlocked && <span className="text-[11px] font-bold text-emerald-600 dark:text-emerald-400 flex items-center space-x-1"><CheckCircle2 className="w-3 h-3" /><span>Saved!</span></span>}
           {onToggleWideMode && (
             <button type="button" onClick={onToggleWideMode} title={isWideMode ? "Restore normal view" : "Expand to broad view"} className="p-1.5 rounded-lg border border-light-border dark:border-dark-border hover:bg-slate-100 text-slate-500">
               {isWideMode ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
             </button>
           )}
-          <button type="button" onClick={handleSaveConsultation} className="flex items-center space-x-1 px-3.5 py-1.5 rounded-lg text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm"><Save className="w-3.5 h-3.5" /><span>Save</span></button>
+          <button
+            type="button"
+            onClick={handleSaveConsultation}
+            disabled={!canWrite}
+            title={canWrite ? 'Save this consultation' : (gateReason ?? 'Read only')}
+            className={`flex items-center space-x-1 px-3.5 py-1.5 rounded-lg text-[11px] font-bold shadow-sm ${canWrite ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : 'bg-slate-200 dark:bg-dark-surface text-slate-400 dark:text-slate-500 cursor-not-allowed shadow-none'}`}
+          >
+            <Save className="w-3.5 h-3.5" /><span>Save</span>
+          </button>
         </div>
       </div>
+
+      {/*
+        The gate, stated where the doctor is looking.
+
+        Without this the Save button is simply greyed out, and a greyed-out button
+        on a screen full of empty boxes reads as "the app is broken" rather than
+        "this patient is not yours yet". Saying which of the two reasons applies
+        is the difference between a doctor waiting for nursing and a doctor
+        filing a bug report.
+      */}
+      {!canWrite && (
+        <div className="flex items-start gap-2 px-4 py-2.5 bg-amber-50 dark:bg-amber-950/30 border-b border-amber-200 dark:border-amber-800 text-[11px] text-amber-900 dark:text-amber-200 flex-shrink-0">
+          <Lock className="w-3.5 h-3.5 flex-shrink-0 mt-px" />
+          <div>
+            <span className="font-extrabold">Read only. </span>
+            <span>{gateReason}</span>
+          </div>
+        </div>
+      )}
+      {saveBlocked && (
+        <div className="flex items-start gap-2 px-4 py-2.5 bg-rose-50 dark:bg-rose-950/30 border-b border-rose-200 dark:border-rose-800 text-[11px] text-rose-900 dark:text-rose-200 flex-shrink-0">
+          <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-px" />
+          <div>
+            <span className="font-extrabold">Not saved. </span>
+            <span>{saveBlocked}</span>
+          </div>
+        </div>
+      )}
 
       {aiSuggestions.length > 0 && (
         <div className="p-3 bg-fuchsia-50 dark:bg-fuchsia-950/40 border-b border-fuchsia-200 dark:border-fuchsia-900 animate-in fade-in">
@@ -993,7 +1180,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
               </h3>
               <div className="flex items-center space-x-2">
                 <button type="button" onClick={() => handleAiAutocomplete('complaint')} className="flex items-center space-x-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-fuchsia-50 dark:bg-fuchsia-950/50 text-fuchsia-700 dark:text-fuchsia-300 border border-fuchsia-200 dark:border-fuchsia-800 hover:bg-fuchsia-100"><Sparkles className="w-3 h-3" /><span>AI Suggest</span></button>
-                <button type="button" onClick={openComplaintAdd} className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm"><Plus className="w-3.5 h-3.5" /><span>Add Entry</span></button>
+                <button type="button" onClick={openComplaintAdd} className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"><Plus className="w-3.5 h-3.5" /><span>Add Entry</span></button>
               </div>
             </div>
             {complaintEntries.length===0 ? (
@@ -1030,7 +1217,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
               </h3>
               <div className="flex items-center space-x-2">
                 <button type="button" onClick={() => handleAiAutocomplete('exam')} className="flex items-center space-x-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-fuchsia-50 dark:bg-fuchsia-950/50 text-fuchsia-700 dark:text-fuchsia-300 border border-fuchsia-200 dark:border-fuchsia-800 hover:bg-fuchsia-100"><Sparkles className="w-3 h-3" /><span>AI Template</span></button>
-                <button type="button" onClick={openExamAdd} className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white shadow-sm"><Plus className="w-3.5 h-3.5" /><span>Add Finding</span></button>
+                <button type="button" onClick={openExamAdd} className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white shadow-sm disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"><Plus className="w-3.5 h-3.5" /><span>Add Finding</span></button>
               </div>
             </div>
             {examEntries.length===0 ? (
@@ -1065,7 +1252,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
                 <FilePlus2 className="w-4 h-4 text-amber-600" /><span>3. Surgery History</span>
                 <span className="ml-2 text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border border-amber-200">{surgeryEntries.length} surgery(ies)</span>
               </h3>
-              <button type="button" onClick={openSurgeryAdd} className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-amber-600 hover:bg-amber-700 text-white shadow-sm"><Plus className="w-3.5 h-3.5" /><span>Add Surgery</span></button>
+              <button type="button" onClick={openSurgeryAdd} className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-amber-600 hover:bg-amber-700 text-white shadow-sm disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"><Plus className="w-3.5 h-3.5" /><span>Add Surgery</span></button>
             </div>
             {surgeryEntries.length===0 ? (
               <div className="p-8 rounded-xl border-2 border-dashed border-light-border dark:border-dark-border text-center">
@@ -1102,7 +1289,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
               <h3 className="text-xs font-extrabold uppercase tracking-wider text-slate-800 dark:text-slate-200 flex items-center space-x-2"><FilePlus2 className="w-4 h-4 text-rose-600" /><span>3. Clinical Impression & ICD-10 Diagnosis</span></h3>
               <div className="flex items-center space-x-2">
                 <button type="button" onClick={() => handleAiAutocomplete('diagnosis')} className="flex items-center space-x-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-fuchsia-50 dark:bg-fuchsia-950/50 text-fuchsia-700 dark:text-fuchsia-300 border border-fuchsia-200 dark:border-fuchsia-800 hover:bg-fuchsia-100"><Sparkles className="w-3 h-3" /><span>AI ICD-10 Match</span></button>
-                <button type="button" onClick={openDiagAdd} className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white shadow-sm"><Plus className="w-3.5 h-3.5" /><span>Add Impression / Diagnosis</span></button>
+                <button type="button" onClick={openDiagAdd} className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white shadow-sm disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"><Plus className="w-3.5 h-3.5" /><span>Add Impression / Diagnosis</span></button>
               </div>
             </div>
             {diagnosisEntries.length===0 ? (
@@ -1140,7 +1327,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
               <div className="flex items-center space-x-2">
                 <span className="text-xs font-bold text-slate-600 dark:text-slate-300 hidden sm:inline">Priority:</span>
                 <span className="text-xs font-black px-2.5 py-1 rounded-full bg-amber-100 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border border-amber-200">{currentPriority}</span>
-                <button type="button" onClick={openLabDlg} className="flex items-center space-x-1.5 px-4 py-2 rounded-xl text-xs font-bold bg-amber-500 hover:bg-amber-600 text-white shadow-sm"><Plus className="w-4 h-4" /><span>Add Lab Order</span></button>
+                <button type="button" onClick={openLabDlg} className="flex items-center space-x-1.5 px-4 py-2 rounded-xl text-xs font-bold bg-amber-500 hover:bg-amber-600 text-white shadow-sm disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"><Plus className="w-4 h-4" /><span>Add Lab Order</span></button>
               </div>
             </div>
             {/* ordered list */}
@@ -1211,7 +1398,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
               </div>
               <div className="flex items-center space-x-3">
                 {rxItems.length>0 && <span className="text-xs font-extrabold text-purple-700 dark:text-purple-400">Total Rx: {settings.currency}{totalRxPrice.toLocaleString()}</span>}
-                <button type="button" onClick={openRxDlg} className="flex items-center space-x-1.5 px-4 py-2 rounded-xl text-xs font-bold bg-purple-600 hover:bg-purple-700 text-white shadow-sm"><Plus className="w-4 h-4" /><span>Add Prescription</span></button>
+                <button type="button" onClick={openRxDlg} className="flex items-center space-x-1.5 px-4 py-2 rounded-xl text-xs font-bold bg-purple-600 hover:bg-purple-700 text-white shadow-sm disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"><Plus className="w-4 h-4" /><span>Add Prescription</span></button>
               </div>
             </div>
             {rxItems.length===0 ? (
@@ -1269,7 +1456,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
               </h3>
               <div className="flex items-center space-x-2">
                 <button type="button" onClick={() => handleAiAutocomplete('plan')} className="flex items-center space-x-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-fuchsia-50 dark:bg-fuchsia-950/50 text-fuchsia-700 dark:text-fuchsia-300 border border-fuchsia-200 dark:border-fuchsia-800 hover:bg-fuchsia-100"><Sparkles className="w-3 h-3" /><span>AI Plan</span></button>
-                <button type="button" onClick={openMgmtAdd} className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-teal-600 hover:bg-teal-700 text-white shadow-sm"><Plus className="w-3.5 h-3.5" /><span>Add Plan Item</span></button>
+                <button type="button" onClick={openMgmtAdd} className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-teal-600 hover:bg-teal-700 text-white shadow-sm disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"><Plus className="w-3.5 h-3.5" /><span>Add Plan Item</span></button>
               </div>
             </div>
             {managementEntries.length===0 ? (

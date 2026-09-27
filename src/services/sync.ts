@@ -121,25 +121,47 @@ const optDate = (v: unknown): string | undefined =>
 /** Postgres arrays arrive as JSON arrays; a null is possible on a loose column. */
 const list = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : []);
 
-/** A model stores `undefined` for "not set"; Postgres wants NULL, not a string. */
-const orNull = <T>(v: T | undefined | null): T | null =>
-  v === undefined || v === null ? null : (v as T);
-
 /**
- * A foreign key value, or NULL.
+ * A model field that is not set, as NULL.
  *
- * The model types a nullable reference as `string` and spells "unset" as an empty
- * string, because that is what the UI binds to. Postgres does not accept that
- * translation: '' is a real value, and a foreign key check against it fails. So a
- * consultation recorded without a physician assigned, or a lab request with no
- * physician on it, would fail to save - and would do so as a constraint violation
- * rather than as anything a clinician could understand.
+ * This is the marker that says "this column is nullable", and it is opt-in: a
+ * column the database declares NOT NULL is written with `?? ''` instead, so
+ * arriving here always means the value is genuinely optional. Every foreign key
+ * goes through here too, which is why there is no separate `fk`.
  *
- * Every column that is a foreign key goes through here, never `orNull`, so the
- * distinction is made in one place.
+ * It has to treat the empty string as "not set", not just `undefined`, because
+ * the model is written against the UI and a controlled input a clinician left
+ * blank holds `''`. `rowToModel` reads that back as `''` too, so `''` is the
+ * model's own spelling of "unset" for any optional field. A nullable reference is
+ * no different: the UI binds to a string, and the model types it as one.
+ *
+ * Postgres does not share the convention, and it fails the whole statement
+ * rather than the one column:
+ *
+ *     upsert consultations: invalid input syntax for type date: ""
+ *
+ * A consultation with no follow-up date - the ordinary case, since the form
+ * only sets one if the doctor fills the follow-up box in the Management Plan -
+ * therefore sent `follow_up_date = ''` and the upsert was rejected outright.
+ * The complaint, the examination, the diagnoses, the plan and the notes were
+ * all in that one request, so every field on the record was lost, and nothing
+ * told the clinician: the error went to the browser console and the form showed
+ * "Saved!". The same shape silently voided 24 other date and timestamp columns
+ * across 17 tables, and a foreign key sent as `''` failed the same way - which is
+ * what `fk` used to exist for, before `orNull` learned to do it. They are the
+ * same rule, so they are one function now: two functions with identical
+ * behaviour is a trap, because the next person to change one of them will not
+ * find out from the other.
+ *
+ * The empty string is not data in any of these columns. It is the absence of a
+ * value, so it is translated to the absence of a value here rather than at each
+ * of the eighty-odd call sites that build rows, which is what makes it impossible
+ * to reintroduce by adding a new optional column to a mapper and forgetting
+ * about it.
  */
-const fk = (v: string | undefined | null): string | null =>
-  v === undefined || v === null || v === '' ? null : v;
+const orNull = <T>(v: T | undefined | null): T | null =>
+  v === undefined || v === null || (v as unknown) === '' ? null : (v as T);
+
 
 // ---------------------------------------------------------------------------
 // Map shapes
@@ -285,7 +307,7 @@ export const TABLES: TableMap[] = [
       id: m.id,
       name: m.name,
       description: m.description ?? '',
-      created_by: fk(m.createdBy),
+      created_by: orNull(m.createdBy),
     }),
     children: [
       {
@@ -351,7 +373,7 @@ export const TABLES: TableMap[] = [
       department: m.department ?? '',
       avatar: m.avatar ?? '',
       pin: m.pin || '1234',
-      custom_role_id: fk(m.customRoleId),
+      custom_role_id: orNull(m.customRoleId),
       must_change_password: Boolean(m.mustChangePassword),
       active: m.active !== false,
     }),
@@ -398,8 +420,15 @@ export const TABLES: TableMap[] = [
       occupation: orNull(m.occupation),
       blood_group: orNull(m.bloodGroup),
       genotype: orNull(m.genotype),
-      allergies: m.allergies ?? [],
-      alerts: m.alerts ?? [],
+      // list(), not `?? []`. `??` only covers null and undefined: anything else
+      // the caller supplies - a string from a text input, an object from a JSON
+      // parse - is passed through untouched and Postgres refuses it with
+      // "malformed array literal", which voids the whole patient record because
+      // an upsert is one request. list() answers the question the column is
+      // actually asking, which is "which entries are in this", and an array of
+      // strings comes through unchanged.
+      allergies: list(m.allergies),
+      alerts: list(m.alerts),
       registered_at: orNull(m.registeredAt),
     }),
   },
@@ -434,11 +463,11 @@ export const TABLES: TableMap[] = [
       visit_time: m.visitTime || '00:00',
       visit_type: m.visitType,
       status: m.status,
-      attending_physician_id: fk(m.attendingPhysicianId),
-      attending_nurse_id: fk(m.attendingNurseId),
+      attending_physician_id: orNull(m.attendingPhysicianId),
+      attending_nurse_id: orNull(m.attendingNurseId),
       reason_for_visit: orNull(m.reasonForVisit),
       notes: orNull(m.notes),
-      ward: fk(m.ward),
+      ward: orNull(m.ward),
       admitted_at: orNull(m.admittedAt),
       admitted_by: orNull(m.admittedBy),
       discharged_at: orNull(m.dischargedAt),
@@ -480,7 +509,7 @@ export const TABLES: TableMap[] = [
       visit_id: m.visitId,
       patient_id: m.patientId,
       recorded_at: orNull(m.recordedAt),
-      nurse_id: fk(m.nurseId),
+      nurse_id: orNull(m.nurseId),
       nurse_name: m.nurseName ?? '',
       temperature_c: m.temperature,
       systolic_bp: m.systolicBp,
@@ -495,8 +524,8 @@ export const TABLES: TableMap[] = [
       pain_score: orNull(m.painScore),
       nursing_notes: orNull(m.nursingNotes),
       nursing_care_plan: orNull(m.nursingCarePlan),
-      nursing_procedures: m.nursingProcedures ?? [],
-      alerts: m.alerts ?? [],
+      nursing_procedures: list(m.nursingProcedures),
+      alerts: list(m.alerts),
     }),
   },
 
@@ -544,7 +573,7 @@ export const TABLES: TableMap[] = [
         id: m.id,
         visit_id: m.visitId,
         patient_id: m.patientId,
-        physician_id: fk(m.physicianId),
+        physician_id: orNull(m.physicianId),
         physician_name: m.physicianName ?? '',
         consultation_date: orNull(m.consultationDate),
         presenting_complaint: m.presentingComplaint ?? '',
@@ -641,7 +670,7 @@ export const TABLES: TableMap[] = [
           unit: p.unit ?? '',
           reference_range: p.referenceRange ?? '',
           result_type: p.resultType,
-          options: p.options ?? [],
+          options: list(p.options),
         }),
       },
     ],
@@ -669,7 +698,7 @@ export const TABLES: TableMap[] = [
       id: m.id,
       visit_id: m.visitId,
       patient_id: m.patientId,
-      physician_id: fk(m.physicianId),
+      physician_id: orNull(m.physicianId),
       physician_name: m.physicianName ?? '',
       requested_at: orNull(m.requestedAt),
       priority: m.priority,
@@ -705,16 +734,16 @@ export const TABLES: TableMap[] = [
         modelToRow: (t: LabTestOrder, requestId: string) => ({
           id: t.id,
           request_id: requestId,
-          test_definition_id: fk(t.testDefinitionId),
+          test_definition_id: orNull(t.testDefinitionId),
           test_name: t.testName,
           category: t.category,
           price: t.price,
           sample_type: t.sampleType ?? '',
           status: t.status,
           collected_at: orNull(t.collectedAt),
-          scientist_id: fk(t.scientistId),
+          scientist_id: orNull(t.scientistId),
           scientist_name: orNull(t.scientistName),
-          verified_by: fk(t.verifiedBy),
+          verified_by: orNull(t.verifiedBy),
           released_at: orNull(t.releasedAt),
           comments: orNull(t.comments),
           critical_alert: Boolean(t.criticalAlert),
@@ -809,7 +838,7 @@ export const TABLES: TableMap[] = [
       id: m.id,
       visit_id: m.visitId,
       patient_id: m.patientId,
-      physician_id: fk(m.physicianId),
+      physician_id: orNull(m.physicianId),
       physician_name: m.physicianName ?? '',
       prescribed_at: orNull(m.prescribedAt),
       status: m.status,
@@ -843,7 +872,7 @@ export const TABLES: TableMap[] = [
         modelToRow: (i: PrescriptionItem, prescriptionId: string) => ({
           id: i.id,
           prescription_id: prescriptionId,
-          medication_id: fk(i.medicationId),
+          medication_id: orNull(i.medicationId),
           medication_name: i.medicationName,
           dosage: i.dosage ?? '',
           route: i.route ?? '',
@@ -1028,7 +1057,7 @@ export const TABLES: TableMap[] = [
       contrast_used: Boolean(m.contrastUsed),
       price: m.price,
       status: m.status,
-      invoice_id: fk(m.invoiceId),
+      invoice_id: orNull(m.invoiceId),
     }),
   },
 
@@ -1071,7 +1100,7 @@ export const TABLES: TableMap[] = [
       price: m.price,
       clinical_indication: orNull(m.clinicalIndication),
       status: m.status,
-      invoice_id: fk(m.invoiceId),
+      invoice_id: orNull(m.invoiceId),
     }),
   },
 
@@ -1122,7 +1151,7 @@ export const TABLES: TableMap[] = [
     }),
     modelToRow: (m: ConsumableStockRequest) => ({
       id: m.id,
-      consumable_id: fk(m.consumableId),
+      consumable_id: orNull(m.consumableId),
       consumable_name: m.consumableName,
       section: m.section ?? 'General',
       quantity_requested: m.quantityRequested,
@@ -1155,7 +1184,7 @@ export const TABLES: TableMap[] = [
     }),
     modelToRow: (m: ConsumableUsageLog) => ({
       id: m.id,
-      consumable_id: fk(m.consumableId),
+      consumable_id: orNull(m.consumableId),
       consumable_name: m.consumableName,
       section: m.section ?? 'General',
       quantity_used: m.quantityUsed,
@@ -1163,9 +1192,9 @@ export const TABLES: TableMap[] = [
       total_charge: m.totalCharge,
       used_by: m.usedBy ?? '',
       used_at: orNull(m.usedAt),
-      patient_id: fk(m.patientId),
-      visit_id: fk(m.visitId),
-      invoice_id: fk(m.invoiceId),
+      patient_id: orNull(m.patientId),
+      visit_id: orNull(m.visitId),
+      invoice_id: orNull(m.invoiceId),
     }),
   },
 
@@ -1186,7 +1215,7 @@ export const TABLES: TableMap[] = [
     }),
     modelToRow: (m: MedicationRequest) => ({
       id: m.id,
-      medication_id: fk(m.medicationId),
+      medication_id: orNull(m.medicationId),
       medication_name: m.medicationName,
       quantity_requested: m.quantityRequested,
       requested_by: m.requestedBy ?? '',
@@ -1220,15 +1249,18 @@ export const TABLES: TableMap[] = [
     modelToRow: (m: AuditLog) => ({
       id: m.id,
       logged_at: orNull(m.timestamp),
-      user_id: fk(m.userId),
+      user_id: orNull(m.userId),
       user_name: m.userName ?? '',
       user_role: m.userRole ?? '',
-      patient_id: fk(m.patientId),
+      patient_id: orNull(m.patientId),
       patient_name: orNull(m.patientName),
       action: m.action,
       category: m.category,
       details: m.details ?? '',
-      metadata: m.metadata ?? {},
+      // A jsonb column rejects anything that is not an object, and `?? {}` only
+      // covers null and undefined. Metadata with no entries is an empty object,
+      // so the value is checked rather than assumed.
+      metadata: m.metadata && typeof m.metadata === 'object' ? m.metadata : {},
     }),
   },
 
@@ -1319,7 +1351,7 @@ export const TABLES: TableMap[] = [
     }),
     modelToRow: (m: LabStockRequest) => ({
       id: m.id,
-      item_id: fk(m.itemId),
+      item_id: orNull(m.itemId),
       item_name: m.itemName,
       quantity_requested: m.quantityRequested,
       requested_by: m.requestedBy ?? '',
@@ -1438,11 +1470,43 @@ function applyOmit(row: Record<string, unknown>, omit?: string[]): Record<string
   return copy;
 }
 
-/** Strip `undefined` so PostgREST does not receive a literal null-by-omission. */
-function compact(row: Record<string, unknown>): Record<string, unknown> {
+/**
+ * The last stop before a row leaves the client, and the only place that is
+ * allowed to decide a value is unsendable.
+ *
+ * Two jobs, both of which have to happen here rather than in the mappers:
+ *
+ * 1. `undefined` is stripped, so PostgREST does not receive a null-by-omission.
+ *
+ * 2. A number that is not finite is refused, by name. Form arithmetic produces
+ *    these constantly - `Number('') / (0 * 0)` is `NaN`, and `NaN` is what a
+ *    weight or a BMI becomes the moment a box is cleared - and 47 numeric columns
+ *    across the schema are declared `NOT NULL` and written straight from the
+ *    model. One `NaN` therefore voided an entire record, and the database's
+ *    complaint was `invalid input syntax for type numeric: "NaN"`, which names
+ *    neither the column nor the screen. Here it names both, and it does so
+ *    before the request is built.
+ *
+ * The empty string is deliberately NOT translated here. `''` is a legitimate
+ * value for the `NOT NULL TEXT` columns - twenty of them on `consultations`
+ * alone - and a mapper writes those as `?? ''` on purpose. The columns where a
+ * blank means "not set" opt in through `orNull`, which is the marker that says
+ * the column is nullable. Two conventions, both applied deliberately, rather
+ * than one blanket rule that would trade a lost consultation for a different
+ * lost consultation.
+ */
+function forPostgres(row: Record<string, unknown>, table: string): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(row)) {
-    if (v !== undefined) out[k] = v;
+    if (v === undefined) continue;
+    if (typeof v === 'number' && !Number.isFinite(v)) {
+      throw new Error(
+        `${table}.${k} is a number and was ${String(v)}. This usually means a value ` +
+          'was typed as empty and then used in a calculation. The record was not ' +
+          'saved; fill the field in and save again.',
+      );
+    }
+    out[k] = v;
   }
   return out;
 }
@@ -1502,7 +1566,7 @@ function planChildOps(
     const key = child.keyOf(item);
     afterKeys.add(key);
     if (beforeByKey.has(key)) continue; // unchanged: nothing to send
-    upserts.push(compact(applyOmit(child.modelToRow(item, parentId), child.omit)));
+    upserts.push(forPostgres(applyOmit(child.modelToRow(item, parentId), child.omit), child.table));
   }
 
   const deletes: string[] = [];
@@ -1599,7 +1663,7 @@ export async function pushDiff(
 
   // --- single-row tables ---------------------------------------------------
   if (map.single) {
-    const row = compact(applyOmit(map.modelToRow(after ?? {}), map.omit));
+    const row = forPostgres(applyOmit(map.modelToRow(after ?? {}), map.omit), map.table);
     assertNoDbOwnedColumns(map, row);
     await upsertRows(client, map.table, [row], 'id');
     return;
@@ -1625,7 +1689,7 @@ export async function pushDiff(
     const changed = isNew || JSON.stringify(prev) !== JSON.stringify(item);
 
     if (changed) {
-      const row = compact(applyOmit(map.modelToRow(item), map.omit));
+      const row = forPostgres(applyOmit(map.modelToRow(item), map.omit), map.table);
       assertNoDbOwnedColumns(map, row);
       if (isNew) inserts.push(row);
       else updates.push(row);
@@ -1687,7 +1751,7 @@ export async function pushDiff(
   const settleFor = touched.filter((t) => !t.isNew);
   if (map.settle?.length && settleFor.length) {
     for (const { after } of settleFor) {
-      const base = compact(applyOmit(map.modelToRow(after), map.omit));
+      const base = forPostgres(applyOmit(map.modelToRow(after), map.omit), map.table);
       const settle: Record<string, unknown> = { id: base.id };
       for (const column of map.settle) settle[column] = base[column];
       await upsertRows(client, map.table, [settle], 'id');
@@ -1824,6 +1888,76 @@ export function pendingKeys(): string[] {
   return [...new Set(queue.map((q) => q.map.key))];
 }
 
+// ---------------------------------------------------------------------------
+// Refused writes
+// ---------------------------------------------------------------------------
+
+/**
+ * A change the database would not accept.
+ *
+ * This exists because a refused write used to be a `console.error` and nothing
+ * else. The entry stayed in localStorage, the UI reported success, and the next
+ * page load replaced the clinician's work with whatever the server held. A
+ * consultation saved with no follow-up date failed exactly this way: every field
+ * on the record was discarded, and the only evidence was a line in a console
+ * nobody opens. The row is safe on this machine and gone from the record of the
+ * patient, which is the worst possible combination to be told nothing about.
+ */
+export interface SyncFailure {
+  /** Storage key of the collection, e.g. `fatclinic_consultations`. */
+  key: string;
+  /** SQL table, which is what a clinician or an administrator will recognise. */
+  table: string;
+  /** The database's own words, unmodified. */
+  message: string;
+  /**
+   * True when retrying cannot help - a constraint violation or a rejected
+   * policy. Those need a human to change something; the rest may clear on their
+   * own once the connection comes back, so the message is worth retrying.
+   */
+  permanent: boolean;
+  /** `Date.now()` when it was refused. */
+  at: number;
+}
+
+/**
+ * One entry per collection, holding its most recent refusal.
+ *
+ * Keyed by collection so that retrying and succeeding clears the warning, rather
+ * than leaving a red badge on screen for something the database has since
+ * accepted. A collection that is retried and fails again overwrites its own
+ * entry with the newer failure.
+ */
+const failures = new Map<string, SyncFailure>();
+const failureListeners = new Set<() => void>();
+
+/** Collections whose last write the database refused, oldest first. */
+export function syncFailures(): SyncFailure[] {
+  return [...failures.values()].sort((a, b) => a.at - b.at);
+}
+
+/** Notified whenever a refusal is recorded or cleared. Returns an unsubscribe. */
+export function onSyncFailuresChanged(fn: () => void): () => void {
+  failureListeners.add(fn);
+  return () => failureListeners.delete(fn);
+}
+
+/** Forget every recorded refusal. Used when a clinician signs out. */
+export function clearSyncFailures(): void {
+  if (!failures.size) return;
+  failures.clear();
+  for (const fn of failureListeners) fn();
+}
+
+function recordFailure(failure: SyncFailure): void {
+  failures.set(failure.key, failure);
+  for (const fn of failureListeners) fn();
+}
+
+function clearFailure(key: string): void {
+  if (failures.delete(key)) for (const fn of failureListeners) fn();
+}
+
 /**
  * Queue the delta for one collection.
  *
@@ -1873,10 +2007,21 @@ async function drain(): Promise<void> {
       const entry = queue.shift()!;
       try {
         await pushDiff(entry.map, entry.before, entry.after, entry.client);
+        // The database has this collection now, so a previous refusal is stale.
+        // Clearing it here is what stops the warning from outliving its cause.
+        clearFailure(entry.map.key);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        const permanent = isPermanent(message);
+        recordFailure({
+          key: entry.map.key,
+          table: entry.map.table,
+          message,
+          permanent,
+          at: Date.now(),
+        });
         console.error(`[sync] could not write ${entry.map.table}:`, message);
-        if (isPermanent(message)) {
+        if (permanent) {
           // A constraint violation or a rejected policy will fail identically on
           // every retry. Retrying forever would spin and hide the real cause, so
           // the entry is dropped and the row stays in localStorage, where the
