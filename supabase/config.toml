@@ -1,19 +1,61 @@
 # Supabase project configuration.
 #
-# ONLY the function declaration is here. There is no local database config
-# because `database/fatclinic.sql` is the single source of truth for the schema
-# and is applied over the connection pooler by `npm run db:apply` - not by
-# `supabase db push`. Two competing schema paths is how a clinic ends up with a
-# database nobody can explain.
+# ONLY the function declaration and the auth URLs are here. There is no local
+# database config because `database/fatclinic.sql` is the single source of truth
+# for the schema and is applied over the connection pooler by `npm run db:apply` -
+# not by `supabase db push`. Two competing schema paths is how a clinic ends up
+# with a database nobody can explain.
+#
+# The `[auth]` block is here for the same reason: a password-reset link only works
+# if its destination is on Supabase's allow-list, and that allow-list is a project
+# setting rather than part of the schema. Declaring it in this file means it is
+# reviewable and applied by `npx supabase config push`, instead of being a toggle
+# somebody remembers in the dashboard.
 
 project_id = "pltcaelohphezknpxpdj"
 
+[auth]
+# Where a reset link lands when the browser strips the token, and the fallback
+# when a link arrives with no destination. This is the deployed app on Cloudflare.
+site_url = "https://fatclinic.oviointernational.workers.dev"
+
+# The allow-list a password-reset link is permitted to redirect to. It has to be
+# declared here, not just in the dashboard, for the same reason the schema is:
+# a redirect allow-list that only exists in a dashboard is one nobody can
+# reproduce, and the failure mode is a link that lands on a blank page.
+#
+# The trailing slash on site_url and the bare origin here are both deliberate and
+# are not the same string on purpose: Supabase compares the redirect target
+# literally, so a mismatch between how the app builds its own URL and how it is
+# listed here is exactly how a working reset silently stops working. The app
+# builds its redirect from `window.location.origin`, which is what the browser
+# will use whatever domain it was reached on, so the list below must contain the
+# origin people actually visit.
+additional_redirect_urls = [
+  "https://fatclinic.oviointernational.workers.dev",
+  "http://localhost:5173",
+]
+
 [functions.staff-accounts]
-# The gateway rejects any request whose bearer token is not a valid Supabase
-# JWT. This is the OUTER of two checks, not the only one: a valid token proves
-# the caller signed in, not that they are an administrator, so the handler
-# re-resolves the caller against public.users and requires an active
-# ADMINISTRATOR row. Both layers are deliberate - the gateway one stops a
-# stranger spending the privileged key, the handler one stops a clinician
-# spending an administrator's session.
-verify_jwt = true
+# verify_jwt is OFF, and that is a deliberate change rather than a loosening.
+#
+# It used to be true. The gateway then refused any request without a valid
+# Supabase JWT before the function body ran, which was sensible while every
+# action here was taken from a signed-in administrator's screen.
+#
+# "Forgot password" breaks that assumption. It exists for the person who is
+# locked out, so a gateway that demands a valid JWT refuses to let the function
+# answer the one request it exists for. The outer check and the need are directly
+# opposed, and the need wins.
+#
+# What replaces it: the handler resolves the caller itself, and strictly more
+# strictly. requireAdmin() exchanges the caller's own bearer token for an
+# identity, resolves that address against public.users, and requires an active
+# ADMINISTRATOR row - so create and reset are still refused for a stranger, for a
+# clinician, and for a disabled account. The gateway check was never more than
+# "is this a valid JWT", which is a subset of what the handler enforces.
+#
+# The one thing genuinely given up is early rejection: an unauthenticated request
+# now costs one function invocation before the handler refuses it. That is a cost
+# and an availability question, not an authorisation one.
+verify_jwt = false

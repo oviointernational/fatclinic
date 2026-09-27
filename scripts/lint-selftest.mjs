@@ -48,7 +48,14 @@ const cases = [
     // src/types/index.ts.
     name: 'ward code present on only one side',
     must: /absent from WARD_OPTIONS/,
-    mutate: (s) => s.replace("('DAY','Day-Care / Observation',15)\n",
+    // Line endings are matched with a regex rather than a literal "\n" on
+    // purpose. This mutation used to search for a bare "\n", which does not
+    // occur anywhere in a CRLF file, so the replace was a silent no-op: the
+    // self-test reported SETUP FAILED rather than "caught", and the real
+    // outcome - that the linter's ward check had stopped working at all - was
+    // hidden behind a line that reads like a linter bug. A mutation that cannot
+    // apply must fail loudly, and \r?\n matches either convention.
+    mutate: (s) => s.replace(/\('DAY','Day-Care \/ Observation',15\)\r?\n/,
       () => "('DAY','Day-Care / Observation',15),\n  ('LONG-STAY','Long Stay',4)\n"),
   },
   {

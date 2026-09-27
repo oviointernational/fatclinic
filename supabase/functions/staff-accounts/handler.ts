@@ -1,6 +1,7 @@
 /**
- * Privileged staff account operations: create a sign-in account, and reset a
- * forgotten password.
+ * Privileged staff account operations: create a sign-in account, reset a
+ * forgotten password, and email a reset link to an administrator who has
+ * forgotten theirs.
  *
  * WHY THIS EXISTS AS A SEPARATE FUNCTION
  * --------------------------------------
@@ -12,7 +13,7 @@
  *
  * The split is the whole point, and it is a narrow one: the browser keeps
  * writing ordinary clinic data straight to Postgres through RLS, and only the
- * two operations that genuinely require the privileged key come here.
+ * three operations that genuinely require the privileged key come here.
  *
  * WHAT IS TRUSTED HERE, AND WHAT IS NOT
  * -------------------------------------
@@ -326,10 +327,18 @@ async function findAuthUser(env: HandlerEnv, email: string): Promise<AuthUser | 
  * administrator unable to onboard anybody during an outage, which is a worse
  * outcome than a gap in one log line - and the failure is surfaced in the
  * function's own logs, where someone is watching.
+ *
+ * `actor` is nullable because "forgot" is asked for BY the person who cannot
+ * sign in, so there is no identity to attribute it to. Inventing one - reusing
+ * the address they typed as though it were an authenticated caller - would put a
+ * false actor in the very log an auditor reads to answer "who asked for this?".
+ * So the row is written unattributed, with `session: 'none'` in the metadata to
+ * say plainly that no session existed. An unattributed entry is visible; a
+ * misattributed one is worse than nothing.
  */
 async function audit(
   env: HandlerEnv,
-  actor: StaffProfile,
+  actor: StaffProfile | null,
   entry: { action: string; targetEmail: string; targetId: string | null; outcome: string },
 ): Promise<void> {
   try {
@@ -339,9 +348,11 @@ async function audit(
         // `SEC-`, not the app's `LOG-`, so a privileged write can never collide
         // with a row the browser produced.
         id: `SEC-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
-        user_id: actor.id,
-        user_name: actor.name,
-        user_role: actor.role,
+        user_id: actor?.id ?? null,
+        user_name: actor?.name ?? '',
+        // `NONE`, not a role: nobody was authenticated to have one. Left blank
+        // this reads as a row the writer forgot to fill in.
+        user_role: actor?.role ?? 'NONE',
         // No patient, and deliberately no password: a log is the wrong place for
         // a credential, and anything written here is readable by every member
         // of staff through the admin audit screen.
@@ -350,7 +361,11 @@ async function audit(
         details:
           `${entry.outcome}: ${entry.action} for ${entry.targetEmail}` +
           (entry.targetId ? ` (profile ${entry.targetId})` : ''),
-        metadata: { source: 'staff-accounts-function', actor_email: actor.email },
+        metadata: {
+          source: 'staff-accounts-function',
+          actor_email: actor?.email ?? null,
+          session: actor ? 'admin' : 'none',
+        },
       }),
     });
   } catch (err) {
@@ -374,6 +389,146 @@ interface ResetBody {
   action: 'reset';
   email: unknown;
   password: unknown;
+}
+
+interface ForgotBody {
+  action: 'forgot';
+  email: unknown;
+}
+
+/**
+ * Sent to anyone whose address is not a clinic administrator.
+ *
+ * Short and directive on purpose, and the only wording: the person reading it
+ * is someone who has just been told this route exists and has found it closed to
+ * them, so it says where to go instead of explaining why they are standing
+ * there. Kept identical for an address with no staff profile at all, which is
+ * what stops this endpoint being used to discover who works here - see
+ * `db:check-forgot-password`, which asserts the two replies are equal rather than
+ * merely alike.
+ */
+const ASK_THE_ADMINISTRATOR = 'Contact Clinic Administrator for reset';
+
+/** Sent once a reset link has been handed to Supabase's mailer. */
+const CHECK_THE_INBOX =
+  'A password reset link is on its way to that address. Check the inbox, including the spam folder.';
+
+/**
+ * Email a password-reset link, but only to a clinic administrator.
+ *
+ * WHAT THIS IS, AND WHY IT IS HERE RATHER THAN IN THE BROWSER
+ * ----------------------------------------------------------
+ * The obvious implementation is one call to `supabase.auth.resetPasswordForEmail`
+ * from the sign-in form, needing no function and no privileged key at all. It is
+ * wrong for this clinic, and precisely because it is too generous: GoTrue will
+ * mail a reset link to ANY registered address, so a clinician who types their own
+ * email gets a working reset and is never routed to their administrator. The
+ * stated rule is that only administrators reset themselves by email, and
+ * everyone else is pointed at the person who can do it for them.
+ *
+ * Deciding that requires reading `public.users`, and while signed out RLS refuses
+ * every read of it - `app_is_staff()` is false without a session, and the column
+ * grant is the whole table. So the decision has to happen somewhere holding the
+ * privileged key: here.
+ *
+ * WHAT IS DELIBERATELY NOT DONE
+ * -----------------------------
+ * The reply is not the same for every address, and that is a knowing trade rather
+ * than an oversight. A uniform "if that address is an administrator, check your
+ * inbox" would hide which addresses are administrators - and this endpoint is
+ * reachable without a session, so it would be a way to enumerate the clinic's
+ * senior staff from the open internet. It is accepted instead because the thing
+ * it gives away is not a secret: any signed-in member of staff can already read
+ * the full staff list, roles included, and the alternative strands a clinician
+ * who has just been told to wait for an email that will never arrive.
+ *
+ * Two things are still hidden, and both matter more:
+ *
+ *  - An address with no staff profile gets the SAME reply as an existing
+ *    clinician, so the endpoint cannot be used to discover who works here.
+ *  - Nothing is revealed about the sign-in account itself, because the decision
+ *    is made on the staff profile, not on whether GoTrue happens to have a
+ *    matching auth user.
+ *
+ * THE REPLY IS DELIBERATELY NOT `ok: false`
+ * -----------------------------------------
+ * Being a clinician rather than an administrator is the expected outcome of
+ * typing your own address, not a failure, so this returns 200 with `sent: false`
+ * and the sentence to show. Modelling it as an error would make every legitimate
+ * use of the form render in the same red box as a genuine outage, and would push
+ * the client toward treating "not an administrator" as something to retry.
+ *
+ * The client shows that sentence in a neutral panel rather than an error box,
+ * because it is a completed request that arrived at a definite answer. The
+ * accompanying form carries no notice about who this route is for; the outcome
+ * is the first and only place the rule is stated.
+ */
+async function opForgot(env: HandlerEnv, body: ForgotBody) {
+  const email = normaliseEmail(body.email);
+  if (!email) {
+    throw new HttpError(400, 'invalid_email', 'Enter a valid email address.');
+  }
+
+  const profile = await findProfile(env, email);
+  const isAdministrator = Boolean(profile?.active) && profile?.role === 'ADMINISTRATOR';
+
+  if (!isAdministrator || !profile) {
+    await audit(env, null, {
+      action: 'SEND_PASSWORD_RESET_EMAIL',
+      targetEmail: email,
+      // The profile id is recorded only when one exists. It is not echoed to the
+      // caller, so this stays a server-side log line and costs the response
+      // nothing: both branches return the same two fields.
+      targetId: profile?.id ?? null,
+      outcome: 'refused:not_administrator',
+    });
+    return { status: 200, body: { ok: true, sent: false, message: ASK_THE_ADMINISTRATOR } };
+  }
+
+  // An administrator profile with no sign-in account. There is nothing to reset,
+  // and asking GoTrue anyway would produce a cheerful "sent" for a mail that can
+  // never be written, which is how a locked-out administrator gets stranded.
+  if (!profile.auth_user_id) {
+    await audit(env, null, {
+      action: 'SEND_PASSWORD_RESET_EMAIL',
+      targetEmail: email,
+      targetId: profile.id,
+      outcome: 'refused:no_sign_in_account',
+    });
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        sent: false,
+        message:
+          'That administrator has no sign-in account yet. Ask another administrator to create one for them.',
+      },
+    };
+  }
+
+  // GoTrue's public recovery endpoint, called with the ANON key rather than the
+  // privileged one. That is not a shortcut: the mail itself is not a privileged
+  // operation, and only the role check above is. Using anon here keeps the
+  // capability this function holds to the one thing it genuinely needs it for,
+  // so widening the endpoint later cannot silently widen this too.
+  const res = await fetch(`${env.SUPABASE_URL}/auth/v1/recover`, {
+    method: 'POST',
+    headers: { apikey: env.SUPABASE_ANON_KEY, ...jsonHeaders },
+    body: JSON.stringify({ email }),
+  });
+
+  if (!res.ok) {
+    console.error('[staff-accounts] recover refused', res.status, await readJson(res));
+    throw new HttpError(502, 'upstream_failure', 'Could not reach the sign-in service. Try again.');
+  }
+
+  await audit(env, null, {
+    action: 'SEND_PASSWORD_RESET_EMAIL',
+    targetEmail: email,
+    targetId: profile.id,
+    outcome: 'sent',
+  });
+  return { status: 200, body: { ok: true, sent: true, message: CHECK_THE_INBOX } };
 }
 
 /**
@@ -586,11 +741,50 @@ export async function handleStaffAccountRequest(req: Request, env: HandlerEnv): 
     return respond(500, { ok: false, code: 'upstream_failure', message: 'This function is not configured.' });
   }
 
-  let body: CreateBody | ResetBody;
+  let body: CreateBody | ResetBody | ForgotBody;
   try {
     body = await req.json();
   } catch {
     return respond(400, { ok: false, code: 'upstream_failure', message: 'Malformed request.' });
+  }
+
+  // `forgot` is answered BEFORE the session check below, and that ordering is the
+  // feature rather than an accident of where the block sits.
+  //
+  // It has to be. "Forgot password" exists for the person who is locked out, so a
+  // gate that demands a valid session refuses to answer the one request it was
+  // built for - and there is nothing to authenticate, because the whole problem
+  // is that they cannot. Everything after this block still requires an active
+  // ADMINISTRATOR; the only thing that changes is which operations exist for
+  // somebody signed out.
+  //
+  // Note what it does NOT do: it does not become a bypass for the other actions.
+  // `create` and `reset` fall straight through to the unchanged token check
+  // below, and an unrecognised action still cannot be distinguished from `create`
+  // or `reset` by a signed-out caller - they get the same 401, so the endpoint
+  // still cannot be used to probe which action names exist.
+  if (body?.action === 'forgot') {
+    try {
+      const result = await opForgot(env, body as ForgotBody);
+      return respond(result.status, result.body);
+    } catch (err) {
+      if (err instanceof HttpError) {
+        // A refusal here is a malformed address rather than a permission
+        // decision, so it is still worth a line: someone hammering this with
+        // junk is visible, and the real address never reaches the mailer.
+        await audit(env, null, {
+          action: 'SEND_PASSWORD_RESET_EMAIL',
+          targetEmail: typeof (body as { email?: unknown }).email === 'string'
+            ? String((body as { email: string }).email).slice(0, 254)
+            : '(not an address)',
+          targetId: null,
+          outcome: `refused:${err.code}`,
+        });
+        return respond(err.status, { ok: false, code: err.code, message: err.message });
+      }
+      console.error('[staff-accounts] forgot failed', err);
+      return respond(500, { ok: false, code: 'upstream_failure', message: 'Something went wrong. Try again.' });
+    }
   }
 
   const auth = req.headers.get('Authorization') ?? '';

@@ -1,24 +1,37 @@
 /**
- * Is the staff-accounts Edge Function actually live, and is the gateway
- * verifying JWTs before the handler runs?
+ * Is the staff-accounts Edge Function actually live, and does it refuse the
+ * privileged actions to a caller who cannot sign in?
  *
  * A deployed function answers. An undeployed one answers 404 with
  * {"message":"Edge Function \"staff-accounts\" not found"}. Neither needs
  * the service_role key, so this is safe to run any time.
  *
- * Two probes, because "it exists" and "it is locked down" are different
- * claims and only the second one is the one that matters:
+ * WHY THE GATEWAY IS NO LONGER THE THING BEING PROVEN
+ * --------------------------------------------------
+ * This check used to assert that the *gateway* rejected an unauthenticated POST
+ * with a 401, which was the point while `verify_jwt = true` and every action
+ * needed a signed-in administrator.
  *
- *   1. no Authorization header  -> 401 from the GATEWAY. The function was
- *      never asked whether this caller is an administrator, because the
- *      gateway stopped the request first. That is verify_jwt doing its job.
- *   2. a token that is not a JWT -> also 401, from the same place, and it
- *      must not be a different answer from probe 1.
+ * `verify_jwt` is now `false` (see supabase/config.toml, and the "Forgotten
+ * password" section of the README for why the need and the check were directly
+ * opposed). The gateway no longer stops anything, so that assertion here would
+ * now pass or fail for a reason that has nothing to do with whether the clinic is
+ * safe. What matters now is the *handler's* refusal, which is strictly stronger:
+ * it resolves the bearer token, looks the address up in public.users, and
+ * requires an active ADMINISTRATOR. That is the check below.
  *
- * If probe 1 returns 401 from the handler instead (a JSON body with a "code"
- * we recognise), the function is live but the gateway is NOT verifying, and
- * the handler is the only thing standing between the public internet and the
- * service_role key. That is the failure worth catching here.
+ * The distinction is kept explicit rather than dropped, because it is exactly the
+ * distinction someone reading an audit log will ask about later. The gateway's
+ * codes are uppercase `UNAUTHORIZED_*`; the handler's are lowercase snake_case
+ * like `missing_token`. A 401 with `missing_token` is the handler refusing, which
+ * is correct and intended. A 401 with `UNAUTHORIZED_*` would mean the gateway is
+ * still verifying and this file's comment is out of date.
+ *
+ * `forgot` is the one action that must NOT be refused without a session, so it is
+ * checked here too: the same unauthenticated caller that is refused `create` must
+ * be answered by `forgot`. If someone ever re-enables `verify_jwt`, this is the
+ * check that fails - which is the right outcome, because the feature would be dead
+ * for exactly the people it exists for.
  */
 import { readFileSync } from 'node:fs';
 
@@ -42,8 +55,8 @@ const check = (label, pass, detail = '') => {
   console.log(`  ${pass ? 'PASS' : 'FAIL'}  ${label}${detail ? `  (${detail})` : ''}`);
 };
 
-async function probe(label, headers) {
-  const r = await fetch(FN, { method: 'POST', headers, body: JSON.stringify({ action: 'create' }) });
+async function probe(label, headers, body) {
+  const r = await fetch(FN, { method: 'POST', headers, body: JSON.stringify(body) });
   const text = await r.text();
   let json;
   try {
@@ -56,46 +69,52 @@ async function probe(label, headers) {
   return { status: r.status, json };
 }
 
+const CRED = { apikey: ANON, 'Content-Type': 'application/json' };
+const FORGED = { ...CRED, Authorization: 'Bearer not.a.real.jwt' };
+
 console.log(`Probing ${FN}\n`);
 
-const noAuth = await probe('no Authorization header at all', {
-  apikey: ANON,
-  'Content-Type': 'application/json',
-});
+// The privileged action, from nobody. This is the refusal that has to hold.
+const noAuth = await probe('no Authorization header, asking to create an account', CRED, { action: 'create' });
+const forged = await probe('a forged token, asking to create an account', FORGED, { action: 'create' });
 
-const notAJwt = await probe('a syntactically valid but unsigned token', {
-  apikey: ANON,
-  'Content-Type': 'application/json',
-  Authorization: 'Bearer not.a.real.jwt',
-});
+// The one action that must be answered without a session.
+const forgot = await probe(
+  'no Authorization header, asking for a reset link for a non-address',
+  CRED,
+  { action: 'forgot', email: 'not-an-address' },
+);
 
 // An undeployed function has its own signature. Distinguish it from a 401 so
-// "not deployed yet" is never reported as "deployed and locked down".
+// "not deployed yet" is never reported as "deployed and refusing".
 const deployed = !/Edge Function .* not found/i.test(JSON.stringify(noAuth.json));
 check('the function is deployed (not a 404 "not found")', deployed,
   noAuth.status === 404 && !deployed ? 'not deployed yet' : `status ${noAuth.status}`);
 
-check('an unauthenticated POST is refused with 401', noAuth.status === 401, `status ${noAuth.status}`);
+check('an unauthenticated create is refused with 401', noAuth.status === 401, `status ${noAuth.status}`);
 
-// Both the gateway and the handler answer with a "code", and they must not be
-// confused. The gateway's codes are always UNAUTHORIZED_* ("no auth header",
-// "invalid JWT format"); the handler's are lowercase snake_case, e.g.
-// missing_token or upstream_failure. Keying on "a code exists" instead would
-// flag the gateway as the handler, which is exactly the distinction this check
-// exists to make.
+// The refusal must come from the handler, and the handler's own code, because
+// "the gateway stopped it" and "the handler checked it" are different claims and
+// only the second one is true any more. See the note at the top of this file.
 const GATEWAY_CODE = /^UNAUTHORIZED_/;
-const gatewayStoppedIt = GATEWAY_CODE.test(String(noAuth.json?.code ?? ''));
-check('the request was stopped by the gateway, not the handler', gatewayStoppedIt,
-  gatewayStoppedIt
-    ? `gateway refused with ${noAuth.json.code}`
-    : `reached the handler, which answered with code=${noAuth.json?.code}`);
+const fromHandler = String(noAuth.json?.code ?? '') === 'missing_token' && !GATEWAY_CODE.test(String(noAuth.json?.code ?? ''));
+check('and it is the handler that refused, not the gateway', fromHandler,
+  fromHandler
+    ? `handler answered ${noAuth.json.code}`
+    : GATEWAY_CODE.test(String(noAuth.json?.code ?? ''))
+      ? `gateway answered ${noAuth.json.code} - verify_jwt is on, so supabase/config.toml and this file disagree`
+      : `answered code=${noAuth.json?.code}`);
 
-check('a forged token is refused identically', notAJwt.status === noAuth.status,
-  `no-auth ${noAuth.status} vs forged ${notAJwt.status}`);
+check('a forged token is refused identically', forged.status === noAuth.status,
+  `no-auth ${noAuth.status} vs forged ${forged.status}`);
+
+check('the same caller is answered for "forgot" rather than refused',
+  forgot.status === 400 && forgot.json?.code === 'invalid_email',
+  `status ${forgot.status} code=${forgot.json?.code} - if this is 401, verify_jwt was re-enabled and the reset link is dead for the people it exists for`);
 
 console.log(
   failures === 0
-    ? '\nThe function is live and the gateway is refusing callers before the handler runs.'
+    ? '\nThe function is live. The handler refuses privileged actions to a caller who cannot sign in, and still answers the one action that must work without a session.'
     : `\n${failures} check(s) failed.`,
 );
 process.exitCode = failures === 0 ? 0 : 1;

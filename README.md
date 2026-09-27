@@ -120,13 +120,15 @@ connection colour, so it cannot show a green light over unsaved work.
 
 ### Staff accounts
 
-Three things, and one small server-side function:
+Four things, and one small server-side function:
 
 | Who | What | How |
 |---|---|---|
 | Staff member | Change their own password | **My Account → Password**. No server component. |
 | Administrator | Create a colleague's account with a password | **Admin → Staff → Add Staff Account** |
-| Administrator | Set a new password for someone who forgot theirs | **Admin → Staff → Reset Password** |
+| Administrator | Set a new password for a colleague who forgot theirs | **Admin → Staff → Reset Password** |
+| Administrator | Reset their **own** forgotten password, by email | **Sign-in screen → "Forgotten your password?"** — see [Forgotten password](#forgotten-password) |
+| Anyone else, locked out | Ask their administrator. There is no email route for them, and the app says so rather than sending a mail that will not arrive | — |
 
 If someone is suddenly told their password is wrong when it is not, read
 [Locked out, but the password is right](#locked-out-but-the-password-is-right)
@@ -282,19 +284,152 @@ apart on the shape of the refusal, and the test pins **both** directions, becaus
 the expensive mistake is the one that shows a wrong-password warning to a
 locked-out colleague.
 
-### If the administrator forgets their own password
+### Forgotten password
 
-**This is the one situation with no in-app answer, so it is worth knowing before
-you need it.**
+**Sign-in screen → "Forgotten your password?"** Enter your email address.
 
-There is no "forgot password" link on the sign-in screen. There cannot be one
-while this project has no working mail relay: a self-service flow ends in an email
-that never arrives, which is worse than no flow at all, because the person waits
-for a message that is not coming. It is left out on purpose.
+| Whose address you type | What happens |
+|---|---|
+| A **clinic administrator** | Supabase emails a reset link to that address. Open it, choose a new password, then sign in as normal. |
+| Anyone else, including an address that has never heard of the clinic | Nothing is sent. The screen reads **"Contact Clinic Administrator for reset"**, and the administrator can set a new password from **Admin → Staff → Reset Password**. |
 
-The administrator is also the only person who can reset passwords, and doing that
-requires being signed in. So an administrator who cannot sign in has to come in
-from outside the app, from a terminal where the project is checked out:
+The form carries no notice about who this route is for. The rule is stated in the
+outcome and nowhere else, so the only person who reads "administrators only" is one
+whose address turns out not to qualify — which is the person who needed to know it.
+That outcome is shown in a neutral panel rather than the red error box: the
+request succeeded, the answer is simply that this route is closed to the address
+typed, and red would say something is broken when nothing is.
+
+The refusal is a single fixed sentence, and that is load-bearing rather than lazy.
+It is the same for a clinician, for a disabled administrator's address, and for an
+address that has never heard of the clinic, so the endpoint cannot be used to
+discover who works here.
+
+**Delivery is not guaranteed on this project.** No SMTP is configured, so
+reset links go out through Supabase's built-in mailer, which is rate-limited
+(one message per minute, per the project's own `max_frequency`) and on many
+projects only delivers to team members' addresses. If an administrator waits a few
+minutes and nothing arrives, use the terminal route below rather than assuming the
+address is wrong. `db:check-forgot-password` proves a link is *generated* and
+correctly addressed; only the recipient can confirm arrival, and that limit is why
+no check claims otherwise.
+
+**A reset link does not sign anybody in.** The link carries a recovery token, and
+the app deliberately handles it with a separate Supabase client created with
+`persistSession: false`, held in one closure and never shared
+(`src/services/passwordReset.ts`). Nothing is written to localStorage. On a shared
+clinic workstation this is the difference between "someone followed a link and
+walked away" and "the next person at this desk has a live administrator session
+nobody noticed". The person who follows the link still signs in normally with the
+password they just chose, and the token is spent and discarded once it is set.
+
+`detectSessionInUrl` stays **off** in `src/services/supabase.ts` for the same
+reason: the shared client would parse the link and persist the token before any of
+this ran.
+
+#### Why the decision is made server-side, and not in the browser
+
+The obvious implementation is one line: `supabase.auth.resetPasswordForEmail(email)`
+from the sign-in form. It needs no function and no privileged key, and it is wrong
+here. GoTrue will mail a working reset link to **any** registered address, so a
+clinician who typed their own email would get one and reset their own password
+without involving anyone — which is exactly what the rule above exists to prevent.
+
+Deciding who gets a link means reading `public.users`, and RLS refuses every read
+of that table without a session. So the decision happens in the
+`staff-accounts` Edge Function, which holds `service_role` and never returns it.
+The mail itself is sent with the **anon** key, not the privileged one: sending
+mail is not a privileged operation, and only the role check is. Keeping the
+capability this narrowly used means widening the endpoint later cannot silently
+widen this too.
+
+#### The one thing this gives away, and the two it does not
+
+The reply is *not* uniform, and that is a knowing trade. It reveals whether an
+address belongs to a clinic administrator, and this endpoint is reachable with no
+session, so it can be used to confirm that a guessed address is senior staff. It
+is accepted because what it exposes is not secret — any signed-in member of staff
+can already read the whole staff list with roles — and because the alternative
+strands a clinician who has just been told to wait for a mail that will never
+arrive. The refusal that results names only the next step: **"Contact Clinic
+Administrator for reset"**.
+
+Two things stay hidden, and both matter more:
+
+- **An address with no staff profile gets the byte-identical reply a clinician
+  gets** — both are exactly `Contact Clinic Administrator for reset`. Otherwise the
+  endpoint is a way to discover who works at the clinic, one guess at a time.
+  `db:check-forgot-password` asserts the two replies are equal, not merely similar,
+  and pins the wording itself so the sentence cannot drift into explaining the rule
+  at the reader instead of telling them where to go.
+- **Nothing about the sign-in account is revealed.** The decision is made on the
+  staff profile, never on whether GoTrue happens to hold a matching auth user, and
+  the reply carries only `{ ok, sent, message }` — no profile id, no auth UUID.
+
+#### Why the function answers callers who are not signed in
+
+`[functions.staff-accounts] verify_jwt` is `false` in `supabase/config.toml`, and
+it was `true` until the email flow was added. The reason is not convenience: the
+gateway rejects any request whose bearer token is not a valid JWT, and
+"forgot password" exists for the person who *cannot* sign in, so a gateway that
+demands a token refuses to answer the one request it was built for. The need and
+the check are directly opposed.
+
+What replaces it is strictly more, not less. `requireAdmin()` exchanges the
+caller's own token for an identity, resolves that address against `public.users`,
+and requires an active `ADMINISTRATOR` — so `create` and `reset` are still refused
+for a stranger, a clinician, and a disabled account. The gateway check was never
+more than "is this a valid JWT", a subset of what the handler enforces. `forgot` is
+dispatched **before** the session check, and `create`/`reset` fall straight through
+to it unchanged. An unrecognised action from a signed-out caller still gets the
+same 401, so the endpoint cannot be used to probe which action names exist.
+
+The genuinely lost thing is early rejection: an unauthenticated request now costs
+one function invocation before the handler refuses it. That is a cost and an
+availability question, not an authorisation one. **Read the comment in
+`supabase/config.toml` before changing it back.**
+
+#### The redirect allow-list is in the repo, not in the dashboard
+
+A reset link only works if its destination is allow-listed, and that is a project
+setting rather than part of the schema. It is declared in `supabase/config.toml`
+(`site_url` and `additional_redirect_urls`) and applied with:
+
+```bash
+npx supabase config push
+```
+
+so a link can never land on a blank page because of a setting somebody changed in
+a dashboard and forgot. `db:check-forgot-password` asserts a generated link comes
+back to the deployed app rather than to `localhost`, and arrives in the URL
+**fragment** (`#access_token=…`), which is the shape `passwordReset.ts` parses. A
+Supabase upgrade that switched it to a `?code=` query would fail that check and
+name the change, instead of leaving the reset screen quietly unreachable.
+
+#### What the audit trail records, and why it has no actor
+
+Every request writes an `audit_logs` row, including refusals. A reset is
+attributed to nobody, and says so: `user_id` null, `user_name` `''`, `user_role`
+`NONE`, and `metadata.session = 'none'`.
+
+This is deliberate and it is the honest answer. The person asking cannot sign in,
+so there is no identity to attribute the request to. Reusing the address they typed
+as though it were an authenticated caller would put a false actor in the very log
+an auditor reads to answer "who asked for this?" — and an unattributed entry is
+visible, while a misattributed one is worse than nothing. `audit_logs` is
+append-only, so these rows cannot be quietly tidied up afterwards either, which is
+also asserted by the check.
+
+The browser-side password rules (`src/services/passwordPolicy.ts`) are applied
+here as an **advisory** check, not as enforcement: this path sets the password with
+`auth.updateUser`, which talks straight to GoTrue and never reaches the handler, so
+the only rule actually applied server-side is GoTrue's own configured minimum. The
+handler's copy remains the one that counts for `create` and `reset`.
+
+#### Still the way back in when no email is coming
+
+The terminal route below needs no mail at all, and does not depend on the mailer,
+the rate limit, or the address being one the built-in service will deliver to:
 
 ```bash
 npm run staff:list                 # find your own id, USR-001 for the first admin
@@ -315,8 +450,9 @@ Two things that make this easier to get wrong than they look:
 - **Stop after a few tries and wait.** Around 15–18 wrong attempts locks the
   account for about a minute, and every retry during that window re-arms it. See
   [Locked out, but the password is right](#locked-out-but-the-password-is-right).
-- **You cannot do this from the app at all.** The Admin → Staff → Reset Password
-  button is inside the workstation you are locked out of.
+- **The admin reset button is inside the workstation you are locked out of.** It
+  is for a signed-in administrator resetting a colleague, not for getting yourself
+  back in.
 
 ### Database checks
 
@@ -327,7 +463,8 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:config:test` | Proves the `.env` password guards and the host resolver behave correctly, including the dotenv `#` truncation trap | no |
 | `npm run db:sync:test` | Proves the sync layer against the schema: mappers emit only real columns, every required column is always sent, values survive a round trip, and inserts/updates/deletes/children/grandchildren/append-only tables/queue coalescing all behave as documented | no |
 | `npm run db:sync:defects` | Breaks `sync.ts` ten ways and requires the self-test to fail each time | no |
-| `npm run db:test` | All six of the above | no |
+| `npm run typecheck:functions` | Type-checks `supabase/functions/staff-accounts/handler.ts`, which the root `tsconfig.json` does not reach — its `include` is `src` only, so both `tsc --noEmit` and `npm run build` report a clean tree while the one file holding the privileged key's only caller goes unchecked | no |
+| `npm run db:test` | All seven of the above | no |
 | `npm run db:apply` | Applies the schema in a transaction, then verifies RLS, grants, triggers, invoice math and seeds. Fails if a retired demo profile is still present, if a verification probe leaked a row, or if a live policy is not declared in `database/fatclinic.sql` (or vice versa) | yes |
 | `npm run db:find-region` | Finds which IPv4 pooler region the project is in, by handshaking | yes |
 | `npm run db:fix-connection` | The same, and writes the answer to `.env` | yes |
@@ -339,7 +476,9 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:check-staff-accounts` | Runs the real `supabase/functions/staff-accounts/handler.ts` under Node against the live project: create and reset succeed, the passwords really authenticate, the profile is linked, refusals hold for a clinician / a disabled admin / a forged token / a weak password, the browser and the function agree on every password rule, and everything it created is removed | yes + a password |
 | `npm run db:check-email` | Inserts a real staff row and proves the live database refuses a second one for the same address, including when only the case differs. The form's message is help; this is the guarantee | yes (service_role) |
 | `npm run db:probe-auth-admin` | Pins the Auth admin API shapes the function depends on (`PUT` is the only update verb, `?filter=` is ignored so an email lookup must page), then deletes the account it made | yes (service_role) |
-| `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, and proves the gateway refuses an unauthenticated POST before the handler runs | no (HTTP) |
+| `npm run db:check-profile-lookup` | Signs in for real as a throwaway clinician and runs the exact `select *` on `users` that sign-in depends on. A column-level grant change once made that query fail, and `fetchProfile` reported it as "Could not reach the sign-in service" — so this pins the query login cannot do without | yes (service_role) |
+| `npm run db:check-forgot-password` | The administrator-only reset link, end to end: the function answers a caller with **no session**, a clinician / a disabled admin / an admin with no sign-in account are all refused, an unknown address gets the byte-identical reply a clinician gets, the reply carries no profile id or auth UUID, a real administrator does get a link, the generated link comes back to the deployed app in the URL fragment the app parses, and every request is audited with no actor. Proves a link is *generated* — only the recipient can confirm it *arrives* | yes (service_role) |
+| `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, proves the **handler** (not the gateway — `verify_jwt` is off) refuses `create` without a session and to a forged token, and proves the same caller is still *answered* for `forgot` | no (HTTP) |
 | `npm run db:check-deployed` | Tests the function **Supabase is actually serving**, not the file on disk: a password containing the staff name is refused, an older rule is still refused, a good password really authenticates, a clinician is refused, and it deletes what it created | yes + a password |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
 | `npm run db:purge-test-audit` | Deletes `SEC-` audit rows the checks left behind. `--dry-run` first | yes |

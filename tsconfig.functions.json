@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "allowImportingTsExtensions": true
+  },
+  "//": [
+    "Type-checking the Edge Function, which the root tsconfig.json does not reach:",
+    "its `include` is [src] only, so `npx tsc --noEmit` and `npm run build` both",
+    "report a clean tree while handler.ts goes unchecked.",
+    "",
+    "That gap is not hypothetical. handler.ts is the file holding the privileged",
+    "key's only caller, and a signature change there would have shipped silently.",
+    "The Node test harness does not catch it either - it runs this file under",
+    "type STRIPPING, which erases annotations without verifying them.",
+    "",
+    "index.ts is deliberately excluded: it is the only file that touches Deno",
+    "globals, Deno.serve and Deno.env, and Deno is not a dependency here. Keeping",
+    "the privileged-key read in a three-line shim means the type-checked surface is",
+    "exactly the part that decides who may reset a password."
+  ],
+  "include": ["supabase/functions/staff-accounts/handler.ts"]
+}

@@ -5,12 +5,14 @@ import { MainContainer } from './components/layout/MainContainer';
 import { Header } from './components/layout/Header';
 import { PinLockModal } from './components/common/PinLockModal';
 import { AuthModal } from './components/common/AuthModal';
+import { PasswordResetModal } from './components/common/PasswordResetModal';
 import { AccountModal } from './components/common/AccountModal';
 import { AuditLogModal } from './components/common/AuditLogModal';
 import { PatientProfileDialog } from './components/patients/PatientProfileDialog';
 import { PatientRegistration } from './components/patients/PatientRegistration';
 import { Patient, Visit } from './types';
 import { db } from './services/db';
+import { hasResetLink } from './services/passwordReset';
 import { useAuth } from './context/AuthContext';
 import { LogIn } from 'lucide-react';
 
@@ -28,6 +30,12 @@ export const App: React.FC = () => {
   const [profileModalPatient, setProfileModalPatient] = useState<Patient | null>(null);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
   const [isRegistrationOpen, setIsRegistrationOpen] = useState<boolean>(false);
+  const [isPasswordResetOpen, setIsPasswordResetOpen] = useState<boolean>(false);
+
+  // Read once, at mount. A reset link arrives in the URL fragment and the
+  // fragment is cleared the moment the new password is accepted, so this has to
+  // be a snapshot rather than a value recomputed on every render.
+  const [arrivedByResetLink] = useState<boolean>(() => hasResetLink());
 
   const { isAuthenticated, isResolvingSession, currentUser, signOut } = useAuth();
 
@@ -109,6 +117,26 @@ export const App: React.FC = () => {
     );
   }
 
+  // A password reset link takes precedence over the signed-out card, including
+  // over the "you signed out" screen. Someone who has just followed an
+  // administrator's reset link has not signed out, and being told they had would
+  // be a confusing thing to read on the way to fixing a password.
+  //
+  // `arrivedByResetLink` is captured once, at mount, and never recomputed: the
+  // URL fragment is cleared as soon as the password is changed, so re-reading it
+  // on every render would dismiss the screen the moment the change succeeded.
+  if (arrivedByResetLink) {
+    return (
+      <div className="w-screen h-screen overflow-hidden flex items-center justify-center bg-light-bg dark:bg-dark-bg">
+        <PasswordResetModal
+          isOpen
+          hasResetLink
+          onClose={() => setIsPasswordResetOpen(false)}
+        />
+      </div>
+    );
+  }
+
   // Signed-out gate: nothing below this line renders without a session, which is
   // what lets every clinical screen treat `useCurrentUser()` as total.
   if (!isAuthenticated) {
@@ -129,11 +157,35 @@ export const App: React.FC = () => {
             <LogIn className="w-4 h-4" />
             <span>Sign In</span>
           </button>
+
+          {/* On the signed-out screen rather than only inside the dialog, because
+              being locked out and having forgotten the password is exactly when
+              the link is needed and there is no reason to make them open a dialog
+              to find it. */}
+          <button
+            onClick={() => setIsPasswordResetOpen(true)}
+            className="text-[11px] font-bold text-emerald-700 hover:text-emerald-800 dark:text-emerald-400 dark:hover:text-emerald-300 underline underline-offset-2"
+          >
+            Forgotten your password?
+          </button>
         </div>
 
         <AuthModal
           isOpen={isAuthModalOpen}
           onClose={() => setIsAuthModalOpen(false)}
+          onOpenPasswordReset={() => {
+            setIsAuthModalOpen(false);
+            setIsPasswordResetOpen(true);
+          }}
+        />
+
+        <PasswordResetModal
+          isOpen={isPasswordResetOpen}
+          hasResetLink={false}
+          onClose={() => {
+            setIsPasswordResetOpen(false);
+            setIsAuthModalOpen(true);
+          }}
         />
       </div>
     );
@@ -229,6 +281,20 @@ export const App: React.FC = () => {
       <AuthModal
         isOpen={isAuthModalOpen}
         onClose={() => setIsAuthModalOpen(false)}
+        onOpenPasswordReset={() => {
+          setIsAuthModalOpen(false);
+          setIsPasswordResetOpen(true);
+        }}
+      />
+
+      {/* Forgotten password. Reachable while signed in too, because an
+          administrator can be working on a shared workstation and realise
+          mid-session that the password they signed in with is the one they will
+          need again tomorrow. */}
+      <PasswordResetModal
+        isOpen={isPasswordResetOpen}
+        hasResetLink={false}
+        onClose={() => setIsPasswordResetOpen(false)}
       />
 
       {/* Patient Profile Dialog (10% side strip + 90% tabs + PDF export) */}

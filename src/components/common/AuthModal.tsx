@@ -5,9 +5,17 @@ import { X, LogIn, ShieldCheck, Lock, Mail } from 'lucide-react';
 interface AuthModalProps {
   isOpen: boolean;
   onClose: () => void;
+  /**
+   * Opens the forgotten-password flow.
+   *
+   * Owned by App rather than rendered here, because that flow is also reachable
+   * from the signed-out screen and from a reset link in the URL, so it has to
+   * exist whether or not this dialog does.
+   */
+  onOpenPasswordReset: () => void;
 }
 
-export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
+export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onOpenPasswordReset }) => {
   const { signIn } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -120,6 +128,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
               <span>{isSubmitting ? 'Signing in…' : 'Sign In to Workstation'}</span>
             </button>
           </form>
+
+          {/* Separate from the form rather than a fourth field on it. A person who
+              has forgotten their password cannot be asked to type one, and a link
+              sitting under the password box reads as part of signing in. */}
+          <button
+            onClick={onOpenPasswordReset}
+            className="mt-4 w-full text-center text-[11px] font-bold text-emerald-700 hover:text-emerald-800 dark:text-emerald-400 dark:hover:text-emerald-300 underline underline-offset-2"
+          >
+            Forgotten your password?
+          </button>
         </div>
       </div>
     </div>
