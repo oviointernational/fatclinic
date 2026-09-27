@@ -9,29 +9,11 @@
 project_id = "pltcaelohphezknpxpdj"
 
 [functions.staff-accounts]
-# verify_jwt is OFF, and that is a deliberate change rather than a loosening.
-#
-# It used to be true. The gateway then refused any request without a valid
-# Supabase JWT before the function body ran, which was sensible when every
-# action here was taken from a signed-in administrator's screen.
-#
-# Password recovery breaks that assumption. It exists for the person who cannot
-# sign in, so a gateway that demands a valid JWT refuses to let the function
-# answer the one request it exists for. The outer check and the need are directly
-# opposed, and the need wins.
-#
-# What replaces it: the handler resolves the caller itself and strictly more
-# strictly. requireAdmin() exchanges the caller's own bearer token for an
-# identity, resolves that address against public.users, and requires an active
-# ADMINISTRATOR row - so create and reset are still refused for a stranger, for a
-# clinician, and for a disabled account. The gateway check was never more than
-# "is this a valid JWT", which is a subset of what the handler enforces.
-#
-# The one thing genuinely given up is early rejection: an unauthenticated request
-# now costs one function invocation before the handler refuses it. That is a cost
-# and an availability question, not an authorisation one.
-#
-# `recover` is the only action reachable without a session, and it carries its
-# own three-fact check. See opRecover in the function, and check-recovery-secrets
-# for the database side that makes the secret half of that check unreadable.
-verify_jwt = false
+# The gateway rejects any request whose bearer token is not a valid Supabase
+# JWT. This is the OUTER of two checks, not the only one: a valid token proves
+# the caller signed in, not that they are an administrator, so the handler
+# re-resolves the caller against public.users and requires an active
+# ADMINISTRATOR row. Both layers are deliberate - the gateway one stops a
+# stranger spending the privileged key, the handler one stops a clinician
+# spending an administrator's session.
+verify_jwt = true

@@ -48,8 +48,6 @@ interface StaffProfile {
   active: boolean;
   auth_user_id: string | null;
   must_change_password: boolean;
-  /** Workstation screen lock. Read here only to verify a recovery attempt. */
-  pin: string;
 }
 
 interface AuthUser {
@@ -63,7 +61,6 @@ export type FailureCode =
   | 'missing_token'
   | 'not_admin'
   | 'invalid_email'
-  | 'invalid_recovery_details'
   | 'weak_password'
   | 'no_staff_profile'
   | 'account_exists'
@@ -287,7 +284,7 @@ async function requireAdmin(
 async function findProfile(env: HandlerEnv, email: string): Promise<StaffProfile | null> {
   const res = await restAsAdmin(
     env,
-    `users?email=ilike.${encodeURIComponent(email)}&select=id,name,email,role,active,auth_user_id,must_change_password,pin&limit=5`,
+    `users?email=ilike.${encodeURIComponent(email)}&select=id,name,email,role,active,auth_user_id,must_change_password&limit=5`,
   );
   if (!res.ok) return null;
   const rows: StaffProfile[] = await readJson(res);
@@ -323,13 +320,6 @@ async function findAuthUser(env: HandlerEnv, email: string): Promise<AuthUser | 
 /**
  * Record a privileged account action.
  *
- * `actor` is null for password recovery, which is the one action taken with no
- * session - there is nobody to attribute it to, and inventing an actor would be
- * a lie in the one log an administrator reads after an incident. The row is
- * still written, with no `user_id` and `session: 'none'` in the metadata, so
- * "somebody reset this password without signing in" is visible afterwards
- * rather than inferred from the absence of a row.
- *
  * Best effort by design, and deliberately so: a failure to write the audit row
  * is logged but does not undo an account change that already succeeded. Refusing
  * to create a staff account because the audit insert failed would leave an
@@ -339,7 +329,7 @@ async function findAuthUser(env: HandlerEnv, email: string): Promise<AuthUser | 
  */
 async function audit(
   env: HandlerEnv,
-  actor: StaffProfile | null,
+  actor: StaffProfile,
   entry: { action: string; targetEmail: string; targetId: string | null; outcome: string },
 ): Promise<void> {
   try {
@@ -349,9 +339,9 @@ async function audit(
         // `SEC-`, not the app's `LOG-`, so a privileged write can never collide
         // with a row the browser produced.
         id: `SEC-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
-        user_id: actor?.id ?? null,
-        user_name: actor?.name ?? '',
-        user_role: actor?.role ?? '',
+        user_id: actor.id,
+        user_name: actor.name,
+        user_role: actor.role,
         // No patient, and deliberately no password: a log is the wrong place for
         // a credential, and anything written here is readable by every member
         // of staff through the admin audit screen.
@@ -359,13 +349,8 @@ async function audit(
         category: 'ADMIN',
         details:
           `${entry.outcome}: ${entry.action} for ${entry.targetEmail}` +
-          (entry.targetId ? ` (profile ${entry.targetId})` : '') +
-          (actor ? '' : ' (no session: password recovery)'),
-        metadata: {
-          source: 'staff-accounts-function',
-          actor_email: actor?.email ?? null,
-          session: actor ? 'signed-in' : 'none',
-        },
+          (entry.targetId ? ` (profile ${entry.targetId})` : ''),
+        metadata: { source: 'staff-accounts-function', actor_email: actor.email },
       }),
     });
   } catch (err) {
@@ -388,14 +373,6 @@ interface CreateBody {
 interface ResetBody {
   action: 'reset';
   email: unknown;
-  password: unknown;
-}
-
-interface RecoverBody {
-  action: 'recover';
-  email: unknown;
-  pin: unknown;
-  id: unknown;
   password: unknown;
 }
 
@@ -574,123 +551,8 @@ async function opReset(env: HandlerEnv, body: ResetBody, actor: StaffProfile) {
   };
 }
 
-/**
- * Change a password for someone who cannot sign in.
- *
- * THE ONLY ACTION HERE THAT RUNS WITHOUT A SESSION
- * -----------------------------------------------
- * Create and reset are done from the admin screen, so the caller's JWT proves
- * they are an administrator. Recovery is for the person who cannot reach that
- * screen, so requiring a session would be requiring the thing they have lost.
- * It is therefore the one path here with no session to check, and it is
- * authenticated by three stored facts instead. All three must match:
- *
- *   1. the address, which is not a secret at all;
- *   2. the workstation PIN, which every member of staff can read, because the
- *      application has to be able to compare it in the browser to unlock a
- *      screen - it ships as 1234 and is not treated as a credential;
- *   3. the account's own `auth_user_id`, which is the only one of the three
- *      that anybody cannot read.
- *
- * So the check is really one factor deep, and that factor is the third. It is
- * the right way round: a 122-bit UUID that only the database owner or the
- * person who wrote it down can supply, verified server-side against a column
- * the browser is no longer permitted to read. The first two do not add
- * entropy, and the copy here does not pretend otherwise - see the README,
- * "Forgotten password".
- *
- * WHY THE FAILURE SAYS NOTHING
- * ---------------------------
- * One reply covers every mismatch, so this cannot be used to find out whether an
- * address has an account, whether a PIN is right, or whether an ID belongs to
- * anyone. The input *shape* is still checked separately and does say what is
- * wrong with the shape, because "that is not a four digit PIN" leaks nothing
- * about any account.
- */
-async function opRecover(env: HandlerEnv, body: RecoverBody) {
-  const email = normaliseEmail(body.email);
-  if (!email) {
-    throw new HttpError(400, 'invalid_email', 'That email address is not valid.');
-  }
-
-  const pin = typeof body.pin === 'string' ? body.pin.trim() : '';
-  if (!/^\d{4}$/.test(pin)) {
-    throw new HttpError(400, 'invalid_recovery_details', 'The PIN is the four digits on your account screen.');
-  }
-
-  const accountId = typeof body.id === 'string' ? body.id.trim().toLowerCase() : '';
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(accountId)) {
-    throw new HttpError(400, 'invalid_recovery_details', 'The ID is the long code on your account screen.');
-  }
-
-  // Every reason to refuse produces this same object, so the reply cannot be
-  // used to narrow down which of the three was wrong - or whether the address
-  // has an account at all.
-  const refused = () =>
-    new HttpError(
-      401,
-      'invalid_recovery_details',
-      'Those details do not match a staff account. Check the email, PIN and ID, then try again.',
-    );
-
-  const profile = await findProfile(env, email);
-  if (!profile || !profile.active || !profile.auth_user_id) throw refused();
-  if (profile.auth_user_id.trim().toLowerCase() !== accountId) throw refused();
-  if (profile.pin !== pin) throw refused();
-
-  const weak = checkPassword(body.password, email, profile.name);
-  if (weak) throw new HttpError(400, 'weak_password', weak);
-
-  const authUser = await findAuthUser(env, email);
-  if (!authUser) throw refused();
-
-  // PUT is the only verb this project routes for an admin user update; PATCH
-  // answers 405. Confirmed by scripts/probe-auth-admin.mjs.
-  const updated = await gotrueAsAdmin(env, `/admin/users/${encodeURIComponent(authUser.id)}`, {
-    method: 'PUT',
-    body: JSON.stringify({ password: body.password }),
-  });
-  if (!updated.ok) {
-    const detail = await readJson(updated);
-    console.error('[staff-accounts] recover failed', { email, status: updated.status, detail });
-    throw new HttpError(502, 'upstream_failure', 'The password could not be changed. Try again.');
-  }
-
-  // Forces the person to set one only they know at their next sign-in, so the
-  // password they have just typed on a shared machine is not the one they keep.
-  await restAsAdmin(env, `users?id=eq.${encodeURIComponent(profile.id)}`, {
-    method: 'PATCH',
-    body: JSON.stringify({ must_change_password: true }),
-  });
-
-  // No actor: there was no session, and saying otherwise would be a fiction in
-  // the log an administrator reads when asking who changed a password.
-  await audit(env, null, {
-    action: 'RECOVER_STAFF_PASSWORD',
-    targetEmail: email,
-    targetId: profile.id,
-    outcome: 'ok',
-  });
-
-  return {
-    status: 200,
-    body: {
-      ok: true,
-      code: 'recovered',
-      // Measured, not assumed: scripts/check-recovery.mjs takes a session before
-      // the change and reuses the access token after, and it is refused. So a
-      // password change really does end every session already issued for the
-      // account, which is what makes a recovery a revocation and not just a
-      // relabelling. The reply says so, because somebody who reset a password
-      // they suspected was stolen needs to know the thief is out.
-      message:
-        'Password changed, and anyone already signed in on this account has been signed out. Sign in with the new password, then choose one of your own when asked.',
-      data: { email, profileId: profile.id, mustChangePassword: true },
-    },
-  };
-}
-
 // --- Entry point ------------------------------------------------------------
+
 const CORS_HEADERS: Record<string, string> = {
   // Safe as a wildcard because nothing here is cookie-authenticated: the caller
   // is proved by a bearer JWT, which a third-party page cannot obtain.
@@ -724,42 +586,11 @@ export async function handleStaffAccountRequest(req: Request, env: HandlerEnv): 
     return respond(500, { ok: false, code: 'upstream_failure', message: 'This function is not configured.' });
   }
 
-  let body: CreateBody | ResetBody | RecoverBody;
+  let body: CreateBody | ResetBody;
   try {
     body = await req.json();
   } catch {
     return respond(400, { ok: false, code: 'upstream_failure', message: 'Malformed request.' });
-  }
-
-  // Password recovery is answered BEFORE the session is looked at, and that
-  // ordering is the whole point of the action rather than an oversight: it
-  // exists for the person who cannot sign in, so demanding a token would
-  // demand the exact thing that is missing. It carries its own three-fact check
-  // instead, and every other action below still requires an administrator's JWT.
-  if (body?.action === 'recover') {
-    try {
-      const result = await opRecover(env, body as RecoverBody);
-      return respond(result.status, result.body);
-    } catch (err) {
-      if (err instanceof HttpError) {
-        // A refusal is logged without a target address on purpose. The reply
-        // says nothing, and a log that named the address someone guessed would
-        // hand back the half of the answer the endpoint is refusing to give.
-        await audit(env, null, {
-          action: 'RECOVER_STAFF_PASSWORD',
-          targetEmail: '',
-          targetId: null,
-          outcome: `refused:${err.code}`,
-        });
-        return respond(err.status, { ok: false, code: err.code, message: err.message });
-      }
-      console.error('[staff-accounts] recover threw', err);
-      return respond(502, {
-        ok: false,
-        code: 'upstream_failure',
-        message: 'The password could not be changed. Try again.',
-      });
-    }
   }
 
   const auth = req.headers.get('Authorization') ?? '';
@@ -794,7 +625,7 @@ export async function handleStaffAccountRequest(req: Request, env: HandlerEnv): 
       return respond(400, {
         ok: false,
         code: 'upstream_failure',
-        message: 'Unknown action. Expected "create", "reset" or "recover".',
+        message: 'Unknown action. Expected "create" or "reset".',
       });
     }
     return respond(result.status, result.body);

@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import { useAuth, useCurrentUser } from '../../context/AuthContext';
 import { db } from '../../services/db';
 import { changePassword } from '../../services/auth';
-import { fetchOwnAccountId } from '../../services/recoveryDetails';
 import { X, User, Lock, KeyRound, CheckCircle2 } from 'lucide-react';
 
 interface AccountModalProps {
@@ -49,10 +48,6 @@ export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose, for
   const [reauthCode, setReauthCode] = useState('');
   const [needsCode, setNeedsCode] = useState(false);
   const [isChanging, setIsChanging] = useState(false);
-  // Fetched rather than read off the profile: the identifier is deliberately not
-  // on the model any more, so the only way to see your own is the self-only
-  // database function. See services/recoveryDetails.ts.
-  const [ownId, setOwnId] = useState<string | null>(null);
 
   React.useEffect(() => {
     if (isOpen) {
@@ -63,9 +58,6 @@ export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose, for
       setNotice(null);
       setError(null);
       setNeedsCode(false);
-      // Only fetched when this dialog is open, and only ever for the person
-      // looking at it.
-      void fetchOwnAccountId().then(setOwnId);
       // A forced change opens on the password form rather than wherever the
       // clinician last was, so the only thing on screen is the thing to do.
       if (forced) setTab('password');
@@ -246,23 +238,6 @@ export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose, for
                 <label className="block font-bold mb-1">New 4-Digit PIN</label>
                 <input type="password" maxLength={4} value={newPin} onChange={e => setNewPin(e.target.value)} placeholder="••••" className="w-full px-3 py-2 rounded-xl bg-slate-50 border tracking-widest text-center font-mono" />
               </div>
-
-              <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 space-y-2">
-                <p className="font-bold text-amber-800">Write these down now</p>
-                <p className="text-amber-700 leading-relaxed">
-                  Forgotten your password? You will be asked for all three. Only this ID is
-                  secret, so keep it somewhere safe rather than on the ward terminal.
-                </p>
-                <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-amber-900">
-                  <dt className="font-bold">Email</dt>
-                  <dd className="font-mono break-all">{currentUser.email}</dd>
-                  <dt className="font-bold">PIN</dt>
-                  <dd className="font-mono">{currentUser.pin}</dd>
-                  <dt className="font-bold">ID</dt>
-                  <dd className="font-mono break-all">{ownId ?? 'unavailable'}</dd>
-                </dl>
-              </div>
-
               <button type="submit" className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold flex items-center justify-center space-x-2">
                 <KeyRound className="w-3.5 h-3.5" /><span>Update PIN</span>
               </button>
