@@ -279,61 +279,44 @@ hostname.
 
 ## Deploying
 
-`npm run deploy` builds locally and publishes the static bundle to Cloudflare
-Workers Static Assets. Run `npx wrangler login` once first.
+**Push to `main`. That is the whole procedure.** Cloudflare builds and deploys
+it. There is nothing to configure in the dashboard, no variables to set, and no
+secret to paste anywhere.
 
-There are two ways to deploy, and they need different setup. Confusing the two is
-how a green local deploy turns into a failed one.
+The two values the bundle needs are committed in `.env.production`:
 
-**1. `npm run deploy` — builds on your machine.** It reads `.env`, so the two
-`VITE_*` values are already present and nothing else is required. Run
-`npx wrangler login` once first.
-
-**2. Cloudflare building from a git push.** The dashboard builds on *Cloudflare's*
-servers, where `.env` does not exist — it is gitignored, and it also holds the
-service_role key. Unless the two `VITE_*` values are set as **build-time**
-variables, this path fails with `[fatclinic] cannot build: VITE_SUPABASE_URL and
-VITE_SUPABASE_ANON_KEY not set`. Print the exact values to paste with:
-
-```bash
-npm run deploy:vars
-```
-
-Workers & Pages → fatclinic → Settings → Environment variables → Add variable, as
-plain text, for both Production and Preview if asked.
-
-**Build-time variables are not runtime variables, and the difference is the whole
-point.** A runtime variable is a binding a Worker reads while serving; a project
-with only static assets has no Worker, so the dashboard rejects runtime variables
-with *"Variables cannot be added to a Worker that only has static assets."*
-Build-time variables exist only during `npm run build` on the build machine and
-are never served, so they are accepted — and they are what the two values above
-need. An earlier version of this README said the project "takes no variables",
-which was true of the runtime and wrong about the git-connected build.
-
-| Variable | Where it comes from | Where it is used |
+| Variable | What it is | Where it is used |
 |---|---|---|
-| `VITE_SUPABASE_URL` | `.env`, from Project Settings → API → Project URL | inlined into the bundle at build time |
-| `VITE_SUPABASE_ANON_KEY` | `.env`, from Project Settings → API → anon public | inlined into the bundle at build time |
+| `VITE_SUPABASE_URL` | the project hostname | inlined into the bundle at build time |
+| `VITE_SUPABASE_ANON_KEY` | the public anon key | inlined into the bundle at build time |
 
-The anon key is designed to be public, so it is safe in the bundle **only**
-because Row Level Security is enabled and forced on all 34 tables. Do not set
-`SUPABASE_SERVICE_ROLE_KEY` here — it bypasses RLS entirely, and any `VITE_`
-variable ends up in the published JavaScript.
+Neither is a secret. The URL is a hostname, and the anon key is designed to be
+public — it already ships inside the JavaScript that every browser downloads. It
+cannot read or write a patient record on its own, because RLS is enabled and
+forced on every table. Committing them is what removes the setup step: a CI
+machine has no `.env` (that file is gitignored, because it holds the
+service_role key) but it does have the repository, so the values are already
+there.
+
+To deploy from this machine instead, run `npx wrangler login` once and then
+`npm run deploy`.
+
+`SUPABASE_SERVICE_ROLE_KEY` must never go in `.env.production` or in any
+Cloudflare setting. It bypasses RLS entirely, and every `VITE_` value is inlined
+into published JavaScript. It belongs in `.env` on an administrator's machine,
+for the `staff:*` and `db:check-*` commands only.
 
 Because those values are baked in at build time, `npm run build` **fails** if
 they are missing or still contain a `[YOUR-…]` placeholder. Without that check a
-build without `.env` would deploy cleanly, render the sign-in screen, and be
+build without them would deploy cleanly, render the sign-in screen, and be
 unable to authenticate — with nothing in the logs to explain it. `npm run dev`
 stays permissive and falls back to local-only mode.
 
-`SUPABASE_SERVICE_ROLE_KEY` belongs in `.env` on an administrator's machine, for
-the `staff:*` and `db:check-orphan` commands only. It is gitignored and must
-never be pasted into chat, committed, or added to the Cloudflare project. Note
-that `wrangler dev` reads `.env` and exposes every value in it as an environment
-binding, so if a Worker is ever added to this project, that key becomes
-reachable from server-side code by accident. `wrangler deploy` publishes only the
-`dist` assets, so nothing in `.env` is uploaded.
+One trap worth knowing: `wrangler dev` reads `.env` and exposes every value in it
+as an environment binding, so if a Worker is ever added to this project the
+service_role key becomes reachable from server-side code by accident.
+`wrangler deploy` publishes only the `dist` assets, so nothing in `.env` is
+uploaded.
 
 To test the built bundle exactly as it will be served — same SPA fallback, same
 headers, no dev server in the way:

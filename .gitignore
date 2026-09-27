@@ -11,9 +11,13 @@ dev.log
 npm-debug.log*
 
 # Environment & secrets
+# .env holds SUPABASE_SERVICE_ROLE_KEY, so it stays out of git.
 .env
 .env.local
 .env.*.local
+# .env.production is deliberately NOT ignored: it holds only the project URL and
+# the public anon key, and committing it is what lets Cloudflare build with no
+# dashboard setup. It must never contain the service_role key.
 
 # Editor & OS
 .vscode/*
