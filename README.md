@@ -174,6 +174,18 @@ gateway and the handler answer with a `code`; the gateway's are always
 `UNAUTHORIZED_*` and the handler's are lowercase, which is how the two are told
 apart.
 
+**Confirm the deploy has the rules you think it has.** The suites above import
+`handler.ts` and run it locally, which proves the code is correct and says
+nothing about what Supabase is serving. Those two come apart in the ordinary
+way: the function is edited, the tests stay green, and production keeps running
+the version from the last deploy. `npm run db:check-deployed` calls the real URL
+and checks the behaviour end to end, which is the only check that can tell the
+two apart:
+
+```bash
+npm run db:check-deployed
+```
+
 **What it checks.** The request body is a request, not a claim. The handler
 resolves the caller from the email inside their own verified JWT, requires an
 `active` `ADMINISTRATOR` row in `public.users`, and ignores any `role`,
@@ -248,6 +260,7 @@ immutability trigger for one statement in order to clean up after itself.
 | `npm run db:check-email` | Inserts a real staff row and proves the live database refuses a second one for the same address, including when only the case differs. The form's message is help; this is the guarantee | yes (service_role) |
 | `npm run db:probe-auth-admin` | Pins the Auth admin API shapes the function depends on (`PUT` is the only update verb, `?filter=` is ignored so an email lookup must page), then deletes the account it made | yes (service_role) |
 | `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, and proves the gateway refuses an unauthenticated POST before the handler runs | no (HTTP) |
+| `npm run db:check-deployed` | Tests the function **Supabase is actually serving**, not the file on disk: a password containing the staff name is refused, an older rule is still refused, a good password really authenticates, a clinician is refused, and it deletes what it created | yes + a password |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
 | `npm run db:purge-test-audit` | Deletes `SEC-` audit rows the checks left behind. `--dry-run` first | yes |
 | `npm run db:verify` | Lint, sync self-test, RLS, orphan, live API and the Auth admin probe in one pass | yes (service_role) |
