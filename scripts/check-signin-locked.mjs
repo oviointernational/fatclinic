@@ -93,12 +93,21 @@ const wrong = fail('invalid-credentials');
 
 check('a lockout does not claim the password is wrong',
   !/incorrect|wrong|is not right/i.test(limited.message), limited.message);
-check('a lockout says the password is not the problem',
-  /not the problem/i.test(limited.message));
+// The other half, and the one that matters for a different person entirely. The
+// screen cannot tell a locked-out user from someone who has simply forgotten
+// their password - both arrive here after the same several wrong tries - so
+// claiming the password is fine would send a forgetful clinician back to the
+// keyboard to retype the one thing they cannot remember.
+check('a lockout does not claim the password is definitely right either',
+  !/not the problem|is correct|is right|is fine/i.test(limited.message), limited.message);
 check('a lockout tells them to wait',
   /wait/i.test(limited.message));
 check('a lockout tells them to sign in once, not retry',
   /once/i.test(limited.message));
+check('a lockout mentions that an administrator can reset it',
+  /administrator/i.test(limited.message), limited.message);
+check('a lockout mentions forgetting, for the person who really has',
+  /forgotten/i.test(limited.message));
 check('a real wrong password still reads as one',
   /incorrect/i.test(wrong.message), wrong.message);
 check('a wrong password does not mention waiting',
@@ -116,7 +125,7 @@ check('no message leaks a password', (() => {
 
 console.log(
   failures === 0
-    ? '\nA locked account is told to wait. A wrong password is still told it is wrong.'
+    ? '\nA locked account is told to wait and never told which half of the problem it is.'
     : `\n${failures} check(s) failed.`,
 );
 process.exitCode = failures === 0 ? 0 : 1;

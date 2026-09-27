@@ -282,6 +282,42 @@ apart on the shape of the refusal, and the test pins **both** directions, becaus
 the expensive mistake is the one that shows a wrong-password warning to a
 locked-out colleague.
 
+### If the administrator forgets their own password
+
+**This is the one situation with no in-app answer, so it is worth knowing before
+you need it.**
+
+There is no "forgot password" link on the sign-in screen. There cannot be one
+while this project has no working mail relay: a self-service flow ends in an email
+that never arrives, which is worse than no flow at all, because the person waits
+for a message that is not coming. It is left out on purpose.
+
+The administrator is also the only person who can reset passwords, and doing that
+requires being signed in. So an administrator who cannot sign in has to come in
+from outside the app, from a terminal where the project is checked out:
+
+```bash
+npm run staff:list                 # find your own id, USR-001 for the first admin
+npm run staff:add -- --link USR-001 --password 'a-new-password-you-choose'
+```
+
+`--link` works on an account that already exists, so this both sets a new
+password and re-links the profile. Verified end to end on a throwaway account: the
+old password is refused and the new one signs in. The profile row, and its audit
+history, are untouched — resetting a password is not a new account.
+
+**Then change it again from inside the app.** That command sets a password you
+type on a shared machine, so treat it as a way back in rather than a way to live.
+Once you are in, **My Account → Password** sets one only you know.
+
+Two things that make this easier to get wrong than they look:
+
+- **Stop after a few tries and wait.** Around 15–18 wrong attempts locks the
+  account for about a minute, and every retry during that window re-arms it. See
+  [Locked out, but the password is right](#locked-out-but-the-password-is-right).
+- **You cannot do this from the app at all.** The Admin → Staff → Reset Password
+  button is inside the workstation you are locked out of.
+
 ### Database checks
 
 | Command | What it does | Needs a database |

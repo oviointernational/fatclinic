@@ -26,13 +26,23 @@
  * wording problem. It sends someone into a loop that cannot succeed and that
  * keeps them locked, and it is the reason a correct password was once believed
  * to have stopped working on its own.
+ *
+ * WHAT THE COPY MUST NOT CLAIM
+ * ----------------------------
+ * That is also why the message is careful in both directions. It must not say the
+ * password is wrong - it may well be right. And it must not say the password is
+ * *right* either, because plenty of people reach that screen having genuinely
+ * forgotten it, and "your password is not the problem" would send them back to
+ * the keyboard to retype the thing they cannot remember. The lock is known;
+ * whether the password is correct is not, and the copy has to be honest about
+ * which of the two it actually knows.
  */
 
 /** Why a sign-in did not produce a staff profile. */
 export type AuthFailure =
   | 'not-configured'
   | 'invalid-credentials'
-  /** Too many failed attempts. The password may well be right. */
+  /** Too many failed attempts. Whether the password is right is not known. */
   | 'too-many-attempts'
   | 'no-profile'
   | 'inactive'
@@ -64,8 +74,9 @@ export const MESSAGES: Record<AuthFailure, string> = {
     'VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY, then rebuild.',
   'invalid-credentials': 'Email or password is incorrect.',
   'too-many-attempts':
-    'Too many failed sign-in attempts for this account. Your password is not the ' +
-    'problem. Wait a minute without trying, then sign in once.',
+    'Too many failed sign-in attempts for this account. Wait a minute without ' +
+    'trying, then try once. If you have forgotten your password, an ' +
+    'administrator can reset it for you.',
   'no-profile':
     'Your sign-in was accepted, but there is no staff profile for this address. ' +
     'An administrator has to create one before you can use the workstation.',
