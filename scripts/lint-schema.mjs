@@ -164,6 +164,39 @@ while ((m = refRe.exec(sql))) {
   }
 }
 
+// An audit trail is a record of who did what. `audit_logs.user_id` and
+// `audit_logs.patient_id` must be ON DELETE RESTRICT so that deleting a
+// clinician or patient with audit history is refused outright, instead of the
+// history being silently rewritten to NULL (SET NULL) or destroyed (CASCADE).
+// A future edit that softens either behaviour is a data-integrity regression,
+// so it is pinned here, the same way a column rename is caught by the seed and
+// RLS checks. (Every other reference to users/patients stays SET NULL or
+// CASCADE by design - only the audit trail is immutable.)
+//
+// The check is scoped to the audit_logs CREATE TABLE body; the same column
+// name exists on many other tables with a different clause, so matching the
+// whole file would latch onto the first `patient_id TEXT ... ON DELETE` line
+// and report the wrong table.
+const auditBodyRe = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?audit_logs\s*\(([\s\S]*?)\n\);/i;
+const auditBody = auditBodyRe.exec(sql);
+if (!auditBody) {
+  errors.push('audit_logs CREATE TABLE not found - cannot pin the audit foreign keys to RESTRICT');
+} else {
+  for (const auditCol of ['user_id', 'patient_id']) {
+    const parent = auditCol === 'user_id' ? 'users' : 'patients';
+    const colRe = new RegExp(
+      `(?:^|,)\\s*${auditCol}\\s+TEXT[^,]*?REFERENCES\\s+${parent}\\s*\\([^)]*\\)\\s+ON\\s+DELETE\\s+([A-Z]+(?:\\s+[A-Z]+)*)`,
+      'i',
+    );
+    const colMatch = colRe.exec(auditBody[1]);
+    if (!colMatch) {
+      errors.push(`audit_logs.${auditCol} has no REFERENCES ... ON DELETE clause; expected ON DELETE RESTRICT`);
+    } else if (colMatch[1].toUpperCase() !== 'RESTRICT') {
+      errors.push(`audit_logs.${auditCol} is ON DELETE ${colMatch[1].toUpperCase()}; it must be RESTRICT so audit history is never silently dropped`);
+    }
+  }
+}
+
 // --- indexes ----------------------------------------------------------------
 
 const idxRe = /CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?[A-Za-z_][A-Za-z0-9_]*\s+ON\s+([A-Za-z_][A-Za-z0-9_.]*)/gi;

@@ -109,6 +109,23 @@ const cases = [
     mutate: (s) => s.replace(/LEFT JOIN wards w ON w\.code = v\.ward/,
       () => 'LEFT JOIN wardz w ON w.code = v.ward'),
   },
+  {
+    // The audit trail is a record of who did what. If either foreign key is
+    // softened, deleting a clinician or patient silently nulls or destroys
+    // their history; the linter pins RESTRICT so that delete is refused.
+    name: 'audit_logs.user_id softened away from RESTRICT',
+    must: /audit_logs\.user_id is ON DELETE SET NULL/,
+    mutate: (s) => s.replace(
+      '  user_id      TEXT REFERENCES users(id) ON DELETE RESTRICT,',
+      () => '  user_id      TEXT REFERENCES users(id) ON DELETE SET NULL,'),
+  },
+  {
+    name: 'audit_logs.patient_id softened away from RESTRICT',
+    must: /audit_logs\.patient_id is ON DELETE CASCADE/,
+    mutate: (s) => s.replace(
+      '  patient_id   TEXT REFERENCES patients(id) ON DELETE RESTRICT,',
+      () => '  patient_id   TEXT REFERENCES patients(id) ON DELETE CASCADE,'),
+  },
 ];
 
 // Control: the real file must pass.

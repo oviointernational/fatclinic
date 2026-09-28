@@ -648,19 +648,68 @@ CREATE TABLE IF NOT EXISTS medication_requests (
 
 -- Append-only. `logged_at` is the audit timestamp; the front end calls it
 -- `timestamp`, which the row mapper translates.
+--
+-- The foreign keys are ON DELETE RESTRICT by deliberate choice: an audit trail
+-- is a record of who did what, and silently rewriting or deleting that history
+-- means a clinician or a patient can be made to vanish from the record along
+-- with everything they touched. A chosen audit log shares the fate of the row
+-- it records, so deleting a clinician or patient with audit history is refused
+-- outright. Staff are deactivated rather than deleted, which keeps the
+-- accounting intact. The delete key in the UI opens for profiles with no audit
+-- rows, and the SQL error texts to the operator rather than to silent data
+-- loss.
 CREATE TABLE IF NOT EXISTS audit_logs (
   id           TEXT PRIMARY KEY,
   logged_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  user_id      TEXT REFERENCES users(id) ON DELETE SET NULL,
+  user_id      TEXT REFERENCES users(id) ON DELETE RESTRICT,
   user_name    TEXT NOT NULL DEFAULT '',
   user_role    TEXT NOT NULL DEFAULT '',
-  patient_id   TEXT REFERENCES patients(id) ON DELETE SET NULL,
+  patient_id   TEXT REFERENCES patients(id) ON DELETE RESTRICT,
   patient_name TEXT,
   action       TEXT NOT NULL,
   category     TEXT NOT NULL CHECK (category IN ('PATIENT','CLINICAL','LABORATORY','PHARMACY','BILLING','ADMIN')),
   details      TEXT NOT NULL DEFAULT '',
   metadata     JSONB NOT NULL DEFAULT '{}'
 );
+
+-- Bring an existing database up to the declared behaviour. CREATE TABLE IF NOT
+-- EXISTS leaves a table that already exists untouched, so a database created
+-- under the older ON DELETE SET NULL would keep that clause forever and this
+-- file would quietly stop describing it. So each of the two constraints is
+-- re-created as RESTRICT unless it already is; a fresh database is a no-op.
+DO $$
+DECLARE
+  v_row record;
+BEGIN
+  FOR v_row IN
+    SELECT conname
+      FROM pg_constraint
+     WHERE conrelid = 'audit_logs'::regclass
+       AND contype = 'f'
+       AND confdeltype <> 'r'
+       AND conname IN ('audit_logs_user_id_fkey', 'audit_logs_patient_id_fkey')
+  LOOP
+    EXECUTE format('ALTER TABLE audit_logs DROP CONSTRAINT %I', v_row.conname);
+  END LOOP;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = 'audit_logs'::regclass AND contype = 'f'
+       AND conname = 'audit_logs_user_id_fkey'
+  ) THEN
+    ALTER TABLE audit_logs ADD CONSTRAINT audit_logs_user_id_fkey
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = 'audit_logs'::regclass AND contype = 'f'
+       AND conname = 'audit_logs_patient_id_fkey'
+  ) THEN
+    ALTER TABLE audit_logs ADD CONSTRAINT audit_logs_patient_id_fkey
+      FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE RESTRICT;
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS online_bookings (
   id                     TEXT PRIMARY KEY,
