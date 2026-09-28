@@ -600,6 +600,67 @@ async function bootstrap() {
   ];
 
   async function run() {
+    // -----------------------------------------------------------------------
+    // Reap what earlier dying runs left behind.
+    // -----------------------------------------------------------------------
+    // A run can die with its throwaway profile still live: on process death a
+    // `finally` is never reached, and the fatal handler only deletes the auth
+    // account over HTTP - the Postgres rows stay. Each suite owns a distinctive
+    // id/email (USR-A.../crudaudit-, USR-FC.../forcedchange-probe,
+    // FB-U.../browserprobe-), so the next run sweeps those leftovers before
+    // doing anything else. Without this, one crashed run leaves a fake
+    // clinician who can sign in and write real-looking records forever.
+    //
+    // The surface is exactly the ids and addresses this repository's probe
+    // machinery generates - a real clinician is never provisioned with them -
+    // and the audit rows removed are only ones that reference those profiles or
+    // the browser fixture patient, never real patients.
+    const { rows: leftover } = await sql.query(
+      `select id, email from users
+        where id like 'USR-A%'
+           or email like 'crudaudit-%@fatclinic.health'
+           or id = 'USR-FC557978'
+           or email = 'forcedchange-probe@fatclinic.health'
+           or id = 'FB-U9108760'
+           or email like 'browserprobe-%@fatclinic.health'`,
+    );
+    if (leftover.length) {
+      const ids = leftover.map((r) => r.id);
+      console.log(`  sweeping ${leftover.length} leftover probe profile(s): ${ids.join(', ')}`);
+      // audit_logs REFUSES the profile delete while its own rows still reference
+      // it (ON DELETE RESTRICT). Those rows go first, with the append-only
+      // trigger disabled for exactly this statement and re-armed immediately -
+      // the same discipline as scripts/purge-test-audit-rows.mjs.
+      await sql.query('alter table audit_logs disable trigger trg_audit_immutable');
+      try {
+        await sql.query(
+          `delete from audit_logs
+            where user_id = any($1::text[]) or patient_id = 'FB-P9108760'`,
+          [ids],
+        );
+      } finally {
+        await sql.query('alter table audit_logs enable trigger trg_audit_immutable');
+      }
+      const swept = await sql.query(`delete from users where id = any($1::text[]) returning id`, [ids]);
+      console.log(`  removed ${swept.rowCount} profile row(s)`);
+      // Credentials behind those profiles, if any survived the same crash.
+      const authList = (await (await fetch(`${BASE}/auth/v1/admin/users?page=1&per_page=200`, { headers: ADMIN })).json()).users ?? [];
+      const probeAuth = authList.filter((u) => /^(crudaudit-|browserprobe-).*@fatclinic\.health$|^forcedchange-probe@fatclinic\.health$/.test(u.email));
+      let removedAuth = 0;
+      for (const u of probeAuth) {
+        const r = await fetch(`${BASE}/auth/v1/admin/users/${u.id}`, { method: 'DELETE', headers: ADMIN });
+        if (r.ok) removedAuth++;
+      }
+      const still = ((await (await fetch(`${BASE}/auth/v1/admin/users?page=1&per_page=200`, { headers: ADMIN })).json()).users ?? [])
+        .filter((u) => /^(crudaudit-|browserprobe-).*@fatclinic\.health$|^forcedchange-probe@fatclinic\.health$/.test(u.email));
+      if (still.length) {
+        console.error(`  WARNING: ${still.length} leftover probe sign-in account(s) SURVIVED the sweep: ${still.map((u) => u.email).join(', ')}`);
+        failures++;
+      } else if (probeAuth.length) {
+        console.log(`  removed ${removedAuth}/${probeAuth.length} leftover probe sign-in account(s)`);
+      }
+    }
+
     // A throwaway clinician, so this proves the real thing: a row written with a
     // real clinician's JWT, through the real RLS policies, not with service_role
     // bypassing them.
