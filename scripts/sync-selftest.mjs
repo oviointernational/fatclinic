@@ -346,6 +346,23 @@ function fakeServer() {
           }
           return { error: null };
         },
+        update: (values) => ({
+          eq: async (column, value) => {
+            await waitForGate();
+            for (const [key, existing] of table(name)) {
+              if (String(existing[column]) === String(value)) {
+                // A real UPDATE touches only the named columns; the row keeps
+                // its other values. This is exactly the property the settle
+                // pass relies on - and why it is an UPDATE and not an upsert,
+                // whose partial row would erase the NOT NULL foreign keys.
+                table(name).set(key, { ...existing, ...values });
+                ops.push({ op: 'update', table: name, key, values });
+                break;
+              }
+            }
+            return { error: null };
+          },
+        }),
         delete: () => ({
           in: async (column, values) => {
             await waitForGate();
@@ -1016,6 +1033,50 @@ await block('diff: invoices leave the arithmetic to the database', async () => {
   // is clamped away and never comes back.
   const writes = server.ops.filter((o) => o.table === 'invoices' && o.op === 'upsert').length;
   check('the invoice is written once on insert', writes === 1, writes);
+});
+
+await block('diff: settle re-asserts discount on UPDATE, never an upsert', async () => {
+  // Regression: the settle pass used to send `{id, discount}` through an upsert.
+  // `INSERT ... ON CONFLICT (id) DO UPDATE` checks every NOT NULL column on the
+  // insert branch, so the row was rejected with `null value in column
+  // "visit_id"` - even though the invoice already existed. The doctor's save was
+  // refused on every visit that had an invoice, and the header badge lit up.
+  //
+  // The settle pass must be a plain UPDATE: it touches only discount, leaves
+  // visit_id/patient_id intact, and cannot clobber a concurrent edit.
+  const map = TABLE_BY_KEY.get('fatclinic_invoices');
+  const make = (discount, totalLine) => {
+    const invoice = map.rowToModel(rowWithoutForeignKeys('invoices'));
+    invoice.id = 'INV-S1';
+    invoice.visitId = 'VISIT-S1';
+    invoice.patientId = 'P-S1';
+    invoice.discount = discount;
+    invoice.items = [
+      { id: 'IT-S1', serviceCategory: 'Laboratory', description: 'PCV', quantity: 1, unitPrice: 1000, totalPrice: totalLine },
+    ];
+    invoice.payments = [];
+    return invoice;
+  };
+
+  const server = fakeServer();
+  await seedVisit(server, 'VISIT-S1', 'P-S1');
+
+  await pushDiff(map, [], [make(0, 1000)], server.client);
+  check('the invoice exists after insert', !!server.find('invoices', 'INV-S1'));
+
+  // Now the line item changes (say, a price correction) and the discount is
+  // non-zero, so a settle is required. The invoice already exists, so this is
+  // the update path the old code broke.
+  await pushDiff(map, [make(0, 1000)], [make(200, 1500)], server.client);
+
+  const ops = server.ops.filter((o) => o.table === 'invoices');
+  const upserts = ops.filter((o) => o.op === 'upsert');
+  const updates = ops.filter((o) => o.op === 'update');
+  check('the second write is an UPDATE', updates.length >= 1, ops.map((o) => o.op).join(','));
+  check('no partial-row upsert follows the update', upserts.every((o) => o.row.visit_id && o.row.patient_id));
+  const finalRow = server.find('invoices', 'INV-S1');
+  check('the settle keeps the foreign keys', finalRow.visit_id === 'VISIT-S1' && finalRow.patient_id === 'P-S1', JSON.stringify(finalRow));
+  check('the discount was re-asserted', finalRow.discount === 200, finalRow.discount);
 });
 
 // ---------------------------------------------------------------------------

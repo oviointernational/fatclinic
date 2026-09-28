@@ -1489,6 +1489,14 @@ export interface SyncClient {
       rows: Record<string, unknown>[],
       options: { onConflict: string },
     ): PromiseLike<{ error: { message: string } | null }>;
+    update(
+      values: Record<string, unknown>,
+    ): {
+      eq(
+        column: string,
+        value: string | number,
+      ): PromiseLike<{ error: { message: string } | null }>;
+    };
     delete(): {
       in(column: string, values: string[]): PromiseLike<{ error: { message: string } | null }>;
     };
@@ -1800,6 +1808,37 @@ async function upsertRows(
   }
 }
 
+/**
+ * Update existing rows in place. Used only by the settle pass.
+ *
+ * This must not be an upsert. An upsert is `INSERT ... ON CONFLICT (id) DO
+ * UPDATE`, and PostgreSQL checks the proposed tuple against every NOT NULL
+ * column before it ever consults the conflict target. The settle row carries
+ * only the columns being re-asserted (e.g. `invoices.discount`), so an upsert
+ * fails with `null value in column ... violates not-null constraint` even
+ * though the row already exists. A plain UPDATE touches only the named
+ * columns, so the rows that are missing from the payload are left untouched -
+ * which is also what makes the settle pass unable to clobber a concurrent
+ * edit to the same row.
+ */
+async function updateRows(
+  client: SyncClient,
+  table: string,
+  rows: Record<string, unknown>[],
+  keyColumn: string,
+): Promise<void> {
+  for (const row of rows) {
+    const keyValue = row[keyColumn];
+    if (keyValue === undefined || keyValue === null) continue;
+    const { [keyColumn]: _key, ...values } = row;
+    const { error } = await client
+      .from(table)
+      .update(values)
+      .eq(keyColumn, keyValue as string | number);
+    if (error) throw new Error(`update ${table}: ${error.message}`);
+  }
+}
+
 async function deleteRows(
   client: SyncClient,
   table: string,
@@ -1920,12 +1959,17 @@ export async function pushDiff(
   // never restored; writing it again after the children land fixes the order.
   const settleFor = touched.filter((t) => !t.isNew);
   if (map.settle?.length && settleFor.length) {
+    const settleRows: Record<string, unknown>[] = [];
     for (const { after } of settleFor) {
       const base = forPostgres(applyOmit(map.modelToRow(after), map.omit), map.table);
       const settle: Record<string, unknown> = { id: base.id };
       for (const column of map.settle) settle[column] = base[column];
-      await upsertRows(client, map.table, [settle], 'id');
+      settleRows.push(settle);
     }
+    // UPDATE, not upsert: see updateRows() for why an upsert of a partial row
+    // is rejected by the NOT NULL columns PostgreSQL checks on the insert path.
+    // The primary key is always 'id' for the tables that declare a settle pass.
+    await updateRows(client, map.table, settleRows, 'id');
   }
 }
 
