@@ -65,6 +65,9 @@ const {
   isInFlight,
   syncFailures,
   clearSyncFailures,
+  recordPersisted,
+  persistedBefore,
+  forgetPersisted,
 } = await import('../src/services/sync.ts');
 
 // ---------------------------------------------------------------------------
@@ -1296,6 +1299,115 @@ await block('write queue: nothing is queued without a client', async () => {
   const before = pendingKeys().length;
   queueDiff(map, [], [{ id: 'P-99' }], null);
   check('a null client is a no-op, for local-only mode', pendingKeys().length === before);
+});
+
+// ---------------------------------------------------------------------------
+// 16. The remembered past has to be a copy
+// ---------------------------------------------------------------------------
+//
+// The worst bug in this file, and it produced no error of any kind.
+//
+// A save is handed a collection, and the sync layer needs to know what that
+// collection looked like before the change in order to work out what to send. So
+// the layer above remembers it. It used to remember the caller's own array, and
+// `db.saveConsultation` updates an existing consultation with
+// `this.consultations[i] = updated` - mutating that very array.
+//
+// So the second save of a consultation compared the new value against itself,
+// found no change, and sent nothing. Not a rejected row, not a slow network: no
+// request at all. The form reported "Saved!", the entry stayed in the list, and
+// the record kept the first version for good. A doctor who corrected a
+// complaint after the first save had no way to learn that their correction went
+// nowhere.
+//
+// The first save worked, which is what made it so hard to see: a new consultation
+// replaces the array (`this.consultations = [result, ...]`), so the remembered
+// past stayed intact. Only the second and later saves were lost.
+
+await block('editing a row in place is still a change', async () => {
+  const server = fakeServer();
+  const map = TABLE_BY_KEY.get('fatclinic_consultations');
+  const KEY = 'fatclinic_consultations';
+  forgetPersisted(KEY);
+
+  // The live array the app holds, exactly as `db` holds it: a real array of real
+  // objects, mutated in place.
+  await seedVisit(server, 'VIS-ALIAS', 'PAT-ALIAS');
+  const original = map.rowToModel(rowWithoutForeignKeys('consultations'));
+  original.id = 'CON-ALIAS';
+  original.visitId = 'VIS-ALIAS';
+  original.patientId = 'PAT-ALIAS';
+  original.presentingComplaint = 'the first version';
+  const held = [original];
+
+  // The first save, on a visit with no consultation yet: a brand new row. This
+  // is `saveStorage`: persist to disk, read the past, diff, then record the
+  // collection as the new past. The order matters - without that last
+  // `recordPersisted`, the second save below has no past to compare against and
+  // the aliasing never gets the chance to show itself.
+  recordPersisted(KEY, []);
+  await pushDiff(map, [], held, server.client);
+  recordPersisted(KEY, held);
+  check('the first save reaches the server', server.find('consultations', 'CON-ALIAS')?.presenting_complaint === 'the first version');
+
+  // The second save, and this is the line that matters: an in-place assignment on
+  // the array `recordPersisted` was just handed. `saveConsultation` writes
+  // `this.consultations[existingIndex] = result`, which is this.
+  held[0] = { ...held[0], presentingComplaint: 'the corrected version' };
+  const before = persistedBefore(KEY);
+  recordPersisted(KEY, held);
+  await pushDiff(map, before, held, server.client);
+
+  check(
+    'the corrected text reaches the server',
+    server.find('consultations', 'CON-ALIAS')?.presenting_complaint === 'the corrected version',
+    `server holds ${JSON.stringify(server.find('consultations', 'CON-ALIAS')?.presenting_complaint)}`,
+  );
+
+  // The remembered past is re-recorded by the save, so it is the corrected text
+  // once the save has happened. What matters is the diff *above*, which read the
+  // past as it was before the save.
+  check(
+    'and the past is re-recorded to the text just saved',
+    persistedBefore(KEY)?.[0]?.presentingComplaint === 'the corrected version',
+    JSON.stringify(persistedBefore(KEY)),
+  );
+  forgetPersisted(KEY);
+});
+
+await block('the remembered past survives an in-place edit', async () => {
+  const KEY = 'probe-collection';
+  forgetPersisted(KEY);
+  const arr = [{ id: 'a', value: 'before' }];
+  recordPersisted(KEY, arr);
+  arr[0].value = 'after';
+  arr.push({ id: 'b', value: 'new' });
+  check('an edit to a remembered row does not rewrite the past', persistedBefore(KEY)?.[0]?.value === 'before', JSON.stringify(persistedBefore(KEY)));
+  check('a row appended afterwards is not in the past either', (persistedBefore(KEY) ?? []).length === 1, JSON.stringify(persistedBefore(KEY)));
+
+  // The mutation that a shallow copy would miss: a nested object, edited in place.
+  const nested = [{ id: 'a', physicalExamination: { general: 'Febrile' } }];
+  recordPersisted(KEY, nested);
+  nested[0].physicalExamination.general = 'Afebrile';
+  check(
+    'a nested value edited in place does not rewrite the past',
+    persistedBefore(KEY)?.[0]?.physicalExamination?.general === 'Febrile',
+    JSON.stringify(persistedBefore(KEY)),
+  );
+  forgetPersisted(KEY);
+});
+
+await block('a collection that was never persisted has no past', async () => {
+  const KEY = 'never-seen';
+  forgetPersisted(KEY);
+  check('an unknown key reads as undefined, not as an empty collection', persistedBefore(KEY) === undefined, String(persistedBefore(KEY)));
+  // The value itself is handed back untouched, so a caller still gets the object
+  // it just gave us.
+  const arr = [{ id: 'x' }];
+  recordPersisted(KEY, arr);
+  check('but recording and reading back the same key works', persistedBefore(KEY)?.[0]?.id === 'x');
+  check('and it is a copy, so the caller\'s object is not what comes back', persistedBefore(KEY) !== arr);
+  forgetPersisted(KEY);
 });
 
 // ---------------------------------------------------------------------------

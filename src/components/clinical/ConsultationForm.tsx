@@ -5,13 +5,23 @@ import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { aiService } from '../../services/aiService';
 import { mayDoctorWrite, readOnlyReason } from '../../services/consultationAccess';
-import {
-  formatSurgeryHistory,
-  isStructuredSurgeryHistory,
-  parseSurgeryHistory,
-  type SurgeryHistoryEntry,
-} from '../../services/surgeryHistory';
+import { formatSurgeryHistory, type SurgeryHistoryEntry } from '../../services/surgeryHistory';
 import { classifyExamEntry, isAdditionalFindings } from '../../services/physicalExam';
+import {
+  entryText,
+  foldHistory,
+  foldImpression,
+  foldNotes,
+  foldPlan,
+  seedComplaintEntries,
+  seedDiagnosisEntries,
+  seedExamEntries,
+  seedManagementEntries,
+  seedSurgeryEntries,
+  type DiagnosisEntry,
+  type EntryItem,
+  type ManagementEntry,
+} from '../../services/consultationSeed';
 import { AdmitDialog } from './AdmitDialog';
 import {
   Stethoscope,
@@ -93,13 +103,11 @@ const DEPARTMENTS: Array<{
   { id: 'MOLECULAR', label: '5. Molecular Biology', shortName: 'Molecular', color: 'bg-indigo-600', badgeBg: 'bg-indigo-50 dark:bg-indigo-950/60', badgeText: 'text-indigo-700 dark:text-indigo-300', borderActive: 'border-indigo-400 dark:border-indigo-700' }
 ];
 
-// generic entry types
-// `SurgeryHistoryEntry` is imported from services/surgeryHistory, which owns the
-// shape because it also owns the serialisation into the single text column. A
-// second, local copy of the interface is a second thing to forget to update.
-interface EntryItem { id: string; title: string; body: string; complaint?: string; }
-interface DiagnosisEntry { id: string; title: string; body: string; isCoded: boolean; code: string; type: 'Primary' | 'Secondary'; }
-interface ManagementEntry { id: string; title: string; body: string; date?: string; priority?: string; category?: string; }
+// The generic entry types are imported from services/consultationSeed, which owns
+// them because it owns the seeding. `SurgeryHistoryEntry` is imported from
+// services/surgeryHistory, which owns that shape because it also owns the
+// serialisation into the single text column. A second, local copy of an interface
+// is a second thing to forget to update.
 
 export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   patient: initialPatient,
@@ -246,60 +254,22 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
 
 
   // ---- dynamic entries initialisation ----
-  const initComplaint = (): EntryItem[] => {
-    if (!existingConsultation) return [];
-    const arr: EntryItem[] = [];
-    if (existingConsultation.presentingComplaint) arr.push({ id: 'c0', title: 'Presenting Complaint', body: existingConsultation.presentingComplaint });
-    if (existingConsultation.historyOfPresentingComplaint) arr.push({ id: 'c1', title: 'History of Presenting Complaint', body: existingConsultation.historyOfPresentingComplaint });
-    if (existingConsultation.pastMedicalHistory) arr.push({ id: 'c2', title: 'Past Medical History', body: existingConsultation.pastMedicalHistory });
-    // Only when it is free text. Once the Surgery History tab owns the column the
-    // same operations would appear twice, and saving would keep whichever copy the
-    // Complaint tab happened to hold - silently discarding the structured one.
-    if (existingConsultation.surgicalHistory && !isStructuredSurgeryHistory(existingConsultation.surgicalHistory)) arr.push({ id: 'c3', title: 'Surgical History', body: existingConsultation.surgicalHistory });
-    if (existingConsultation.drugHistory) arr.push({ id: 'c4', title: 'Drug / Medication History', body: existingConsultation.drugHistory });
-    if (existingConsultation.familyHistory) arr.push({ id: 'c5', title: 'Family History', body: existingConsultation.familyHistory });
-    if (existingConsultation.socialHistory) arr.push({ id: 'c6', title: 'Social / Occupational History', body: existingConsultation.socialHistory });
-    if (existingConsultation.allergyHistory) arr.push({ id: 'c7', title: 'Allergy History', body: existingConsultation.allergyHistory });
-    return arr;
-  };
-  const initExam = (): EntryItem[] => {
-    if (!existingConsultation) return [];
-    const pe = existingConsultation.physicalExamination;
-    const arr: EntryItem[] = [];
-    if (pe?.general) arr.push({ id: 'e0', title: 'General Examination', body: pe.general });
-    if (pe?.cardiovascular) arr.push({ id: 'e1', title: 'Cardiovascular System', body: pe.cardiovascular });
-    if (pe?.respiratory) arr.push({ id: 'e2', title: 'Respiratory System', body: pe.respiratory });
-    if (pe?.abdomen) arr.push({ id: 'e3', title: 'Abdomen & GI', body: pe.abdomen });
-    if (pe?.neurological) arr.push({ id: 'e4', title: 'Central Nervous System', body: pe.neurological });
-    if (pe?.musculoskeletal) arr.push({ id: 'e5', title: 'Musculoskeletal', body: pe.musculoskeletal });
-    if (pe?.other) arr.push({ id: 'e6', title: 'Other Systems / Findings', body: pe.other });
-    if (existingConsultation.clinicalFindings) arr.push({ id: 'e7', title: 'Additional Clinical Findings', body: existingConsultation.clinicalFindings });
-    return arr;
-  };
-  const initDiagnosis = (): DiagnosisEntry[] => {
-    if (!existingConsultation) return [{ id: 'd1', title: 'Plasmodium falciparum malaria, unspecified', body: 'Acute uncomplicated malaria', isCoded: true, code: 'B50.9', type: 'Primary' }];
-    const arr: DiagnosisEntry[] = [];
-    if (existingConsultation.assessment) arr.push({ id: 'dx-assess', title: 'Clinical Impression', body: existingConsultation.assessment, isCoded: false, code: '', type: 'Primary' });
-    existingConsultation.diagnoses.forEach(d => arr.push({ id: d.id, title: d.description, body: d.description, isCoded: true, code: d.code, type: d.type }));
-    return arr;
-  };
-  const initManagement = (): ManagementEntry[] => {
-    if (!existingConsultation) return [];
-    const arr: ManagementEntry[] = [];
-    if (existingConsultation.plan) arr.push({ id: 'm0', title: 'Treatment Plan', body: existingConsultation.plan, date: existingConsultation.followUpDate || '', category: 'Therapeutics' });
-    if (existingConsultation.clinicalNotes) arr.push({ id: 'm1', title: 'Clinical Notes', body: existingConsultation.clinicalNotes, category: 'Notes' });
-    return arr;
-  };
-  /**
-   * The Surgery History tab, read back out of the single text column.
-   *
-   * `surgeryEntries` used to start empty and stay empty across page loads, which
-   * is the other half of the tab not saving: there was nothing to seed it from
-   * even if the save had written something.
-   */
-  const initSurgery = (): SurgeryHistoryEntry[] =>
-    parseSurgeryHistory(existingConsultation?.surgicalHistory);
-
+  //
+  // The seeding itself lives in src/services/consultationSeed.ts, not here,
+  // because it could not be tested from in here - and it was wrong. See the note
+  // at the top of that file: a visit with no consultation yet used to be seeded
+  // with a fabricated malaria diagnosis, so pressing Save on an untouched
+  // consultation wrote invented clinical data into the patient's record.
+  //
+  // The Surgery History tab is read back out of the single text column, which is
+  // the other half of that tab not saving: it used to start empty and stay empty
+  // across page loads, so there was nothing to seed it from even once the save
+  // had written something.
+  const initComplaint = (): EntryItem[] => seedComplaintEntries(existingConsultation);
+  const initExam = (): EntryItem[] => seedExamEntries(existingConsultation);
+  const initDiagnosis = (): DiagnosisEntry[] => seedDiagnosisEntries(existingConsultation);
+  const initManagement = (): ManagementEntry[] => seedManagementEntries(existingConsultation);
+  const initSurgery = (): SurgeryHistoryEntry[] => seedSurgeryEntries(existingConsultation);
   const [complaintEntries, setComplaintEntries] = useState<EntryItem[]>(initComplaint());
   const [examEntries, setExamEntries] = useState<EntryItem[]>(initExam());
   const [diagnosisEntries, setDiagnosisEntries] = useState<DiagnosisEntry[]>(initDiagnosis());
@@ -345,6 +315,23 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
     setAiSuggestions([]);
   }, [canWrite]);
 
+  /**
+   * A refusal is cleared the moment the gate opens.
+   *
+   * The visit dropdown lists every visit a patient has ever had, and a doctor
+   * refused on the visit still waiting for nursing can move straight to the one
+   * they were sent. The message they were given - "this patient has not been sent
+   * to a doctor yet" - is then not merely stale but false, and it sits above the
+   * Save button of a form that is now perfectly writable. A warning that outlives
+   * the thing it warned about trains people to ignore warnings.
+   */
+  useEffect(() => {
+    if (canWrite) {
+      setSaveBlocked(null);
+      setSaveBlockedKind('blocked');
+    }
+  }, [canWrite]);
+
   const seededFor = useRef<string>('');
   useEffect(() => {
     const key = activeVisit?.id ?? `no-visit:${currentPatientId}`;
@@ -363,7 +350,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   }, [activeVisit?.id, currentPatientId]);
 
   // fallback old state for save compatibility still kept as derived
-  const complaint = useMemo(() => complaintEntries.map(e => `${e.title}: ${e.body}`).join('\n'), [complaintEntries]);
+  const complaint = useMemo(() => complaintEntries.map(e => `${e.title}: ${entryText(e)}`).join('\n'), [complaintEntries]);
   const hpc = useMemo(() => { const f = complaintEntries.find(e=>e.title.toLowerCase().includes('history of presenting')); return f?f.body:'' }, [complaintEntries]);
   /**
    * The examination, folded from the titled entries into the seven columns.
@@ -393,14 +380,23 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
 
   // diagnoses derived for save
   const diagnoses: ClinicalDiagnosis[] = useMemo(()=> diagnosisEntries.filter(d=>d.isCoded).map(d=>({id:d.id, code:d.code||'R69', description:d.title, type:d.type})), [diagnosisEntries]);
+  /**
+   * The impression and the plan, folded under their own titles.
+   *
+   * `stripTitlePrefix` is what stops the column growing a prefix on every save:
+   * the seed reads the stored value back as one entry whose body is the whole
+   * string, title included, so re-saving produced "Treatment Plan: Treatment
+   * Plan: Appendicectomy..." and the next save another one. Both live in the
+   * seeded module now, where the round trip can be checked.
+   */
   const assessment = useMemo(()=> {
-    const imp = diagnosisEntries.filter(d=>!d.isCoded).map(d=> `${d.title}: ${d.body}`).join('\n');
+    const imp = foldImpression(diagnosisEntries);
     const fallback = diagnosisEntries.filter(d=>d.isCoded).map(d=> `${d.title} (${d.code})`).join('; ');
     return imp || fallback;
   }, [diagnosisEntries]);
-  const plan = useMemo(()=> managementEntries.map(m=> `${m.title}: ${m.body}`).join('\n'), [managementEntries]);
+  const plan = useMemo(()=> foldPlan(managementEntries), [managementEntries]);
   const followUpDate = useMemo(()=> managementEntries.find(m=>m.date)?.date || '', [managementEntries]);
-  const clinicalNotes = useMemo(()=> managementEntries.filter(m=>m.title.toLowerCase().includes('note')).map(m=>m.body).join('\n'), [managementEntries]);
+  const clinicalNotes = useMemo(()=> foldNotes(managementEntries), [managementEntries]);
   const clinicalFindings = useMemo(()=> examEntries.find(e=>isAdditionalFindings(e.title))?.body || '', [examEntries]);
 
   // lab & rx state
@@ -412,6 +408,13 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   const [savedSuccess, setSavedSuccess] = useState(false);
   /** Set when a save was refused by the gate, so the doctor is told why. */
   const [saveBlocked, setSaveBlocked] = useState<string | null>(null);
+  /**
+   * Whether the message above the Save button is about a save that was refused
+   * or about an editor that would not open. Same reason, two different sentences:
+   * "Not saved." is alarming and, after a click that never opened anything,
+   * untrue.
+   */
+  const [saveBlockedKind, setSaveBlockedKind] = useState<'refused' | 'blocked'>('blocked');
   const [aiSuggestions, setAiSuggestions] = useState<string[]>([]);
   const [activeAiField, setActiveAiField] = useState<'complaint' | 'exam' | 'plan' | 'diagnosis' | null>(null);
 
@@ -527,6 +530,12 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
    */
   const refuseIfReadOnly = (): boolean => {
     if (canWrite) return false;
+    // 'refused', not 'blocked': the doctor asked to *open* an editor, and since
+    // it never opened there was nothing to save. The banner says "Not saved" for
+    // a genuinely blocked save, where the doctor did believe their work had been
+    // written - and a warning that turns out to be about something that never
+    // happened is how the real one gets ignored.
+    setSaveBlockedKind('refused');
     setSaveBlocked(gateReason);
     return true;
   };
@@ -633,14 +642,25 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
     // save it. A record that must not exist should not be one keystroke away.
     if (!canWrite) {
       setSavedSuccess(false);
+      setSaveBlockedKind('blocked');
       setSaveBlocked(gateReason);
       return;
     }
     setSaveBlocked(null);
-    // Build strings for legacy fields
-    const presentingComplaint = complaintEntries.find(x=> x.title.toLowerCase().includes('presenting'))?.body || complaintEntries[0]?.body || '';
-    const hpcVal = complaintEntries.find(x=> x.title.toLowerCase().includes('history of presenting'))?.body || '';
-    const pmhVal = complaintEntries.find(x=> x.title.toLowerCase().includes('past medical'))?.body || '';
+    /**
+     * The seven history columns, folded from the titled entries.
+     *
+     * This used to be six inline `find(...)?.body` expressions, and `body` only.
+     * The dialog has two required boxes - "Complaint" and "Details" - and the
+     * complaint was written to neither, so a clinician who typed the reason the
+     * patient came in and the elaboration of it lost the reason. The fold lives
+     * in the seeded module now, with the rest of the logic that cannot be checked
+     * from inside a component, and it keeps both boxes.
+     */
+    const history = foldHistory(complaintEntries);
+    const presentingComplaint = history.presentingComplaint;
+    const hpcVal = history.historyOfPresentingComplaint;
+    const pmhVal = history.pastMedicalHistory;
     /**
      * The Surgery History tab's structured entries, serialised into the column.
      *
@@ -652,12 +672,12 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
      * tab wins when it has something, because it is the one that was being lost.
      */
     const surgicalVal = formatSurgeryHistory(surgeryEntries)
-      || complaintEntries.find(x=> x.title.toLowerCase().includes('surgical'))?.body
+      || history.surgicalHistory
       || '';
-    const drugVal = complaintEntries.find(x=> x.title.toLowerCase().includes('drug'))?.body || '';
-    const familyVal = complaintEntries.find(x=> x.title.toLowerCase().includes('family'))?.body || '';
-    const socialVal = complaintEntries.find(x=> x.title.toLowerCase().includes('social'))?.body || '';
-    const allergyVal = complaintEntries.find(x=> x.title.toLowerCase().includes('allergy'))?.body || patient?.allergies?.join(', ') || '';
+    const drugVal = history.drugHistory;
+    const familyVal = history.familyHistory;
+    const socialVal = history.socialHistory;
+    const allergyVal = history.allergyHistory || patient?.allergies?.join(', ') || '';
 
     const phyExam = {
       general: examMap['general'] || '',
@@ -990,7 +1010,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
         <div className="flex items-start gap-2 px-4 py-2.5 bg-rose-50 dark:bg-rose-950/30 border-b border-rose-200 dark:border-rose-800 text-[11px] text-rose-900 dark:text-rose-200 flex-shrink-0">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-px" />
           <div>
-            <span className="font-extrabold">Not saved. </span>
+            <span className="font-extrabold">{saveBlockedKind === 'refused' ? 'Read only. ' : 'Not saved. '}</span>
             <span>{saveBlocked}</span>
           </div>
         </div>
@@ -1200,7 +1220,11 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
                         <button type="button" onClick={()=> setComplaintEntries(prev=> prev.filter(x=>x.id!==entry.id))} className="p-1.5 rounded-lg hover:bg-rose-50 dark:hover:bg-rose-950/40 text-slate-400 hover:text-rose-600"><Trash2 className="w-3.5 h-3.5" /></button>
                       </div>
                     </div>
-                    <div className="px-4 py-3 text-xs leading-relaxed text-slate-700 dark:text-slate-300 whitespace-pre-wrap">{entry.body}</div>
+                    {/* entryText, not entry.body: the dialog has a Complaint box and
+                        a Details box, and showing only Details hid half of what the
+                        doctor wrote - and, before the fold was fixed, hid what
+                        actually got saved. */}
+                    <div className="px-4 py-3 text-xs leading-relaxed text-slate-700 dark:text-slate-300 whitespace-pre-wrap">{entryText(entry)}</div>
                   </div>
                 ))}
               </div>

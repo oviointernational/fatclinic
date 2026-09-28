@@ -157,6 +157,39 @@ Because an upsert is a single request, any one of these refusals used to void
 *every* field on the record while the form said "Saved!". That is why the refusals
 are surfaced, and why the audit exists.
 
+#### The remembered past has to be a copy
+
+This is the bug that lost a doctor's corrections without a trace, and it is the
+one rule here that is enforced by the *shape* of an API rather than by
+discipline.
+
+`saveStorage` is handed a whole collection and works out what changed by
+comparing it with what the collection looked like before. So something has to
+remember that "before" — and if it holds the caller's own object, the caller's
+next in-place edit rewrites the memory. `arr[0].field = x`, and the past becomes
+the present: the diff finds nothing changed, the write is dropped, and nothing at
+all happens. No request, no error, no failure badge, and the form says "Saved!".
+
+This was not theoretical. `db.saveConsultation` updates an existing consultation
+with `this.consultations[i] = updated`, mutating the array it was given, so the
+**first** save of a consultation reached the database and the second and every
+later one did not. A doctor who corrected a typo, or added the complaint they had
+left out of a previous visit, saw no error, no loss of the entry, and a record
+that kept the first version forever. It was found by reading the browser's network
+log: the Save produced an `audit_logs` POST and nothing else.
+
+So the map lives in `sync.ts` as `recordPersisted` / `persistedBefore`, and
+`recordPersisted` **always copies**. Deliberately, the copy is the only available
+way in — there is no function that accepts a caller's object as the remembered
+past, so no caller can forget to copy and no future caller can reintroduce the
+bug. `db:test` asserts it both ways: an in-place edit of a remembered row, of a
+row appended afterwards, and of a nested value, and the past is unchanged.
+
+The same self-test also pins the two properties this depends on: an unchanged
+save issues no request at all, and a collection that was never persisted has no
+past (`undefined`, not an empty collection — otherwise the first save of every
+row would look like a change to nothing).
+
 #### When a doctor may write
 
 A doctor's queue is built by nurses: a patient arrives, a nurse records vitals and
@@ -186,6 +219,60 @@ doctor and an administrator all write there and they do not write the same rows.
 Protecting the *record* is RLS's job; protecting the *workflow* is this gate's
 job. `npm run db:crud` states that distinction rather than pretending the gate is
 a database constraint.
+
+#### The consultation's lists, and what they are allowed to say
+
+Four of the six Patient's Info tabs are not columns. They are lists of entries
+that get **folded** into a handful of free-text columns when the doctor saves, and
+**seeded** back out of those columns when the tab is opened. That is a lossy
+shape, and it is where this app lost clinical text three separate times. All of it
+now lives in `src/services/consultationSeed.ts` rather than in
+`ConsultationForm.tsx`, because logic a component owns is logic no test can check
+— and every one of these bugs was found in a component.
+
+Four rules, and each one has a test that fails if it is broken:
+
+**A list describes what was recorded. It never invents anything.** When a visit
+has no consultation, every list starts empty. The diagnosis list used to start with
+a worked example — `Plasmodium falciparum malaria / B50.9 / Primary` — so a
+doctor who opened a patient they had never consulted and pressed Save wrote
+invented clinical data into that patient's record. `seededLists()` returns all
+five lists at once, so one assertion covers the whole rule.
+
+**One function decides what an entry's text is, and it serves both the screen and
+the save.** The entry dialog has a *Complaint* box and a *Details* box; the save
+folded only `body`, so the complaint — the reason the patient came in — was
+discarded while appearing on screen the whole time. `entryText()` joins both boxes
+and is called by the list renderer *and* by the fold. Two code paths that each
+choose their own subset of what was typed are two chances to show a clinician
+something different from what gets stored, and the one that shows more than it
+stores is the one that loses the text.
+
+**A round trip has to settle, not merely arrive.** The plan and the impression are
+folded as `"<title>: <text>"` so that several items stay distinguishable in one
+column. The seed then read that column back with its own title still attached, so
+every save added another: `"Treatment Plan: Treatment Plan: Appendicectomy..."`.
+`stripTitlePrefix()` removes one leading title on the way in, and
+`db:consultation-test` asserts **stability** — five save-and-reload cycles leave
+the column byte-identical. A one-time-correctness check would not have caught this
+class of bug, because the value is briefly right before it starts to grow.
+
+**A note is not a plan.** The plan fold covered every management entry, so a
+clinician's note was written into the treatment plan as well as into the notes —
+twice on the record, once in a column where it reads as part of the treatment.
+`isNotesEntry()` is the single substring test both folds use, so they cannot
+disagree about which entry is which, and `splitStoredPlan()` lifts the note lines
+back out of records already written that way. Only the module's own notes title is
+lifted: a plan can contain a line beginning with anything at all, and treating an
+arbitrary "something: text" as a heading would break a clinician's prose into
+pieces that were not headings.
+
+`npm run db:consultation-test` runs 144 checks over this module, the doctor's gate,
+the examination column mapping and the surgery list, and
+`db:consultation:defects` breaks it seventeen ways to prove those checks are real;
+`db:crud` then proves the six sections against the live database as a signed-in
+clinician and reads every value back with SQL rather than with the app's own
+reader.
 
 ### Staff accounts
 
@@ -591,10 +678,10 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:lint` | Static checks on the SQL: every seed column, foreign key, index and view target exists, seed values satisfy their own CHECK constraints, ward codes match the TypeScript model, no credential column | no |
 | `npm run db:lint:test` | Injects known defects to prove `db:lint` actually catches them | no |
 | `npm run db:config:test` | Proves the `.env` password guards and the host resolver behave correctly, including the dotenv `#` truncation trap | no |
-| `npm run db:sync:test` | Proves the sync layer against the schema: mappers emit only real columns, every required column is always sent, values survive a round trip, and inserts/updates/deletes/children/grandchildren/append-only tables/queue coalescing all behave as documented | no |
-| `npm run db:sync:defects` | Breaks `sync.ts` ten ways and requires the self-test to fail each time | no |
-| `npm run db:consultation-test` | The consultation's own logic, off-database: every visit status is either writable or explained, the doctor's read-only gate names the reason, an examination finding lands in the column its dialog title named (all eleven systems), and a surgery entry survives the round trip through the one text column including notes containing the separator | no |
-| `npm run db:consultation:defects` | Breaks the consultation logic twelve ways and requires the self-test to fail each time | no |
+| `npm run db:sync:test` | 296 checks against the schema: mappers emit only real columns, every required column is always sent, values survive a round trip, and inserts/updates/deletes/children/grandchildren/append-only tables/queue coalescing all behave as documented. Includes the rule that the remembered past is a **copy**, so an in-place edit cannot make a save vanish without a word | no |
+| `npm run db:sync:defects` | Breaks `sync.ts` twelve ways — the last one re-introducing the reference-holding bug — and requires the self-test to fail each time | no |
+| `npm run db:consultation-test` | 144 checks on the consultation's own logic, off-database: every visit status is either writable or explained, the doctor's read-only gate names the reason, a visit with no consultation seeds no invented diagnosis, one function decides an entry's text for both the screen and the save, an examination finding lands in the column its dialog title named (all eleven systems), a surgery entry survives the round trip through the one text column including notes containing the separator, and the plan and impression **settle** over five save-and-reload cycles instead of growing a prefix | no |
+| `npm run db:consultation:defects` | Breaks the consultation logic seventeen ways across the four modules — gate, examination mapping, surgery list and seeding/folding — and requires the self-test to fail each time | no |
 | `npm run typecheck:functions` | Type-checks `supabase/functions/staff-accounts/handler.ts`, which the root `tsconfig.json` does not reach — its `include` is `src` only, so both `tsc --noEmit` and `npm run build` report a clean tree while the one file holding the privileged key's only caller goes unchecked | no |
 | `npm run db:test` | All nine of the above | no |
 | `npm run db:apply` | Applies the schema in a transaction, then verifies RLS, grants, triggers, invoice math and seeds. Fails if a retired demo profile is still present, if a verification probe leaked a row, or if a live policy is not declared in `database/fatclinic.sql` (or vice versa) | yes |
@@ -614,9 +701,9 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, proves the **handler** (not the gateway - `verify_jwt` is off) refuses `create` without a session and to a forged token, and proves the same caller is still *answered* for `forgot` | no (HTTP) |
 | `npm run db:check-deployed` | Tests the function **Supabase is actually serving**, not the file on disk: a password containing the staff name is refused, an older rule is still refused, a good password really authenticates, a clinician is refused, and it deletes what it created | yes + a password |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
-| `npm run db:crud` | The clinical record against the live database, as a real signed-in clinician, through the real write path. Sweeps all 350 columns of all 24 tables for a blank value sent where the column could have taken NULL, then creates, edits and deletes the chain a doctor writes — patient, visit, vitals, consultation, both diagnoses, lab request with its test, prescription with its item — and reads every assertion back with SQL rather than with the app's own reader. Everything it creates, including the throwaway account, it removes | yes (service_role) |
+| `npm run db:crud` | 46 checks against the live database, as a real signed-in clinician, through the real write path. Sweeps all 350 columns of all 24 tables for a blank value sent where the column could have taken NULL, then creates, edits and deletes the chain a doctor writes — patient, visit, vitals, consultation, both diagnoses, lab request with its test, prescription with its item — and reads every assertion back with SQL rather than with the app's own reader. It has a dedicated section for all six Patient's Info sections, because a whole tab failing to save is the bug this app actually had: each section is written and read back individually, an unfilled box must land as empty rather than missing, and a removed diagnosis must be gone from the server. Everything it creates, including the throwaway account, it removes | yes (service_role) |
 | `npm run db:purge-test-audit` | Deletes `SEC-` audit rows the checks left behind. `--dry-run` first | yes |
-| `npm run db:verify` | Lint, sync self-test, RLS, orphan, live API, the live clinical CRUD audit and the Auth admin probe in one pass | yes (service_role) |
+| `npm run db:verify` | The live gate, in one pass: lint, the sync self-test, RLS, the orphan account, the live API surface, the clinical CRUD audit, the Auth admin probe, the reset link, and the forced password change. Pair it with `npm run db:test`, which is the off-database gate and covers the consultation suites `db:verify` does not | yes (service_role) |
 | `npm run staff:list` | Every staff profile, and whether each one can actually sign in | yes (service_role) |
 | `npm run staff:add` | Create a staff sign-in account, or reset one with `--link` | yes (service_role) |
 | `npm run staff:clean-demo` | Deletes the nine demo profiles a previous schema version seeded. `--dry-run` first | yes (service_role) |
@@ -629,6 +716,20 @@ database says so.
 The `:test` scripts exist because a linter that silently checks nothing
 looks exactly like a linter that passes. Each one injects a defect and requires
 the linter to name it.
+
+There are two gates, and the split is deliberate. `npm run db:test` needs no
+database: it proves the *logic* against the schema file, so it runs on a laptop
+on a train and it runs on every save. `npm run db:verify` needs the live project
+and proves the *record*: that the columns really exist, that RLS really refuses,
+and that a signed-in clinician's save really lands — read back with SQL, not with
+the app's own reader. The consultation suites are in the first gate only, because
+the folding and seeding bugs they cover were all reproducible without a database.
+`db:crud` is in the second because the symptom only exists in the column.
+
+Adding a rule to this table without adding a check that fails when the rule is
+broken is how this app ended up with a consultation screen that said "Saved!" six
+times over. The count in each row is the count the suite actually runs, and it is
+there so that a check quietly shrinking back is visible.
 
 `db:check-api` and `db:check-rls` need no Postgres connection — only the project
 URL and the anon key, over HTTPS. That matters because a machine that cannot

@@ -143,6 +143,25 @@ const DEFECTS = [
     to: "    key: 'fatclinic_staff',",
     count: 1,
   },
+  {
+    name: 'the remembered past holds the caller\'s own collection instead of a copy',
+    // The worst of the silent ones, because there is nothing to see at all: no
+    // rejected row, no failure badge, no request. `db.saveConsultation` updates
+    // an existing consultation with `this.consultations[i] = updated`, mutating
+    // the array it was handed, so with a reference held here the "before" the
+    // diff compares against is the "after". The second and every later save of a
+    // consultation decided nothing had changed and sent nothing, while the form
+    // reported "Saved!" and the entry stayed on screen. A doctor who corrected a
+    // complaint after the first save had no way to learn the correction went
+    // nowhere - and the record kept the first version for good.
+    //
+    // The first save was unaffected, which is what hid it: a new consultation
+    // replaces the array (`this.consultations = [result, ...this.consultations]`),
+    // so the remembered past stayed intact and only later saves were lost.
+    from: '  persisted.set(key, copyForDiff(value));',
+    to: '  persisted.set(key, value);',
+    count: 1,
+  },
 ];
 
 function run() {

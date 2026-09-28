@@ -1409,6 +1409,56 @@ export const TABLES: TableMap[] = [
 export const TABLE_BY_KEY = new Map(TABLES.map((t) => [t.key, t]));
 
 // ---------------------------------------------------------------------------
+// What was last persisted, per collection
+// ---------------------------------------------------------------------------
+//
+// `saveStorage` is handed a whole collection, and the diff has to be worked out
+// against what that collection looked like *before* the change. So the layer
+// above has to remember it.
+//
+// It has to remember it **by copy**, and that word is the whole fix. Holding the
+// caller's own object means the caller's next in-place edit rewrites the
+// remembered past: `arr[0].field = x` and the "before" becomes the "after", the
+// diff finds nothing changed, and the write is dropped without a request, without
+// an error and without the failure badge. The form still says "Saved!".
+//
+// That is not hypothetical. `db.saveConsultation` updates an existing
+// consultation with `this.consultations[i] = updated`, mutating the array it was
+// given, so the second and every later save of a consultation reached the
+// database as nothing at all. A doctor who corrected a typo, or added the
+// complaint they had left out, saw no error and no loss of the entry - and the
+// record kept the first version.
+//
+// Keeping the map here rather than in `db.ts` is deliberate: it is the only way
+// to make the copy unavoidable. There is no longer a way to put a caller's
+// object in, only a way to record one, and `recordPersisted` always copies.
+
+const persisted = new Map<string, unknown>();
+
+function copyForDiff<T>(value: T): T {
+  // Already plain JSON - every one of these collections round-trips through
+  // localStorage - so this preserves values exactly, with no class instances to
+  // lose. `undefined` is the one input JSON cannot represent.
+  if (value === undefined) return value;
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/** Records a collection as persisted, keeping a copy of it as it is now. */
+export function recordPersisted<T>(key: string, value: T): void {
+  persisted.set(key, copyForDiff(value));
+}
+
+/** The copy taken when this collection was last persisted, if it ever was. */
+export function persistedBefore<T>(key: string): T | undefined {
+  return persisted.get(key) as T | undefined;
+}
+
+/** Forgets a collection's history. The self-test uses this between scenarios. */
+export function forgetPersisted(key: string): void {
+  persisted.delete(key);
+}
+
+// ---------------------------------------------------------------------------
 // Diff
 // ---------------------------------------------------------------------------
 

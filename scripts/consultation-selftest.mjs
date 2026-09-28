@@ -58,6 +58,24 @@ const {
   isStructuredSurgeryHistory,
 } = await import('../src/services/surgeryHistory.ts');
 const { classifyExamEntry, isAdditionalFindings } = await import('../src/services/physicalExam.ts');
+const {
+  entryText,
+  foldHistory,
+  foldImpression,
+  foldPlan,
+  seedComplaintEntries,
+  seedDiagnosisEntries,
+  seedExamEntries,
+  seedManagementEntries,
+  seedSurgeryEntries,
+  foldNotes,
+  seededLists,
+  stripTitlePrefix,
+  isNotesEntry,
+  ASSESSMENT_TITLE,
+  NOTES_TITLE,
+  PLAN_TITLE,
+} = await import('../src/services/consultationSeed.ts');
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -329,6 +347,397 @@ check(
 function surgeryEntriesFixture(list) {
   return list;
 }
+
+// ---------------------------------------------------------------------------
+// Seeding a consultation from what is already stored
+// ---------------------------------------------------------------------------
+//
+// This is the check for the worst bug found in this screen, and it is worth
+// stating plainly what it was. `initDiagnosis` seeded a visit that had never
+// been consulted with a worked example:
+//
+//   Plasmodium falciparum malaria, unspecified / B50.9 / Primary
+//
+// A doctor opening a patient they had never seen, and pressing Save without
+// typing anything, wrote that fabricated diagnosis into the patient's medical
+// record. Every other list correctly started empty. The earlier bug in this
+// screen lost data silently; this one invented it, which is worse: the record
+// then asserts that a clinician diagnosed malaria, and no amount of care later
+// can tell that nobody did.
+//
+// The rule, in one line: a list describes what was recorded. If nothing was
+// recorded, the list is empty.
+
+section('a consultation that has never been saved seeds nothing at all');
+
+const noConsultation = seededLists(undefined);
+for (const [name, list] of Object.entries(noConsultation)) {
+  check(
+    `a visit with no consultation seeds no ${name} entries`,
+    list.length === 0,
+    `${list.length} invented: ${JSON.stringify(list)}`,
+  );
+}
+check(
+  'and specifically no diagnosis, which is where the example was',
+  seedDiagnosisEntries(undefined).length === 0,
+  JSON.stringify(seedDiagnosisEntries(undefined)),
+);
+
+// Guard the reintroduced example by name, not just by behaviour: a "helpful"
+// default is easy to add back and hard to notice, and the behaviour check above
+// would still pass if it were added somewhere that a doctor cannot reach.
+//
+// Comments are stripped first, because this file's own header explains the defect
+// in full and quotes the example. A check that flagged its own explanation would
+// be a check that gets deleted the first time somebody tidies the comment.
+const stripComments = (src) =>
+  src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^[ \t]*\/\/.*$/gm, ' ').replace(/\/\/.*$/gm, ' ');
+const seedSource = stripComments(fs.readFileSync(path.join(ROOT, 'src/services/consultationSeed.ts'), 'utf8'));
+for (const [label, needle] of [
+  ['a malaria diagnosis', 'B50.9'],
+  ['the example description', 'Acute uncomplicated malaria'],
+]) {
+  check(
+    `${label} is nowhere in the seeding module`,
+    !seedSource.includes(needle),
+    `found ${JSON.stringify(needle)} in src/services/consultationSeed.ts`,
+  );
+}
+
+section('a consultation that has been saved seeds what was actually stored');
+
+const stored = {
+  id: 'C-1',
+  visitId: 'V-1',
+  patientId: 'P-1',
+  physicianId: 'USR-1',
+  physicianName: 'Dr Who',
+  consultationDate: '2026-09-27T09:00:00.000Z',
+  presentingComplaint: 'Fever and headache',
+  historyOfPresentingComplaint: 'Three days, worse at night',
+  pastMedicalHistory: '',
+  surgicalHistory: '2010-04-02 | LUTH | Appendicectomy | No recurrence',
+  drugHistory: 'Paracetamol as needed',
+  familyHistory: '',
+  socialHistory: '',
+  allergyHistory: '',
+  physicalExamination: {
+    general: 'Febrile',
+    cardiovascular: '',
+    respiratory: '',
+    abdomen: 'Tender right iliac fossa',
+    neurological: '',
+    musculoskeletal: '',
+    other: '',
+  },
+  clinicalFindings: '',
+  assessment: 'Acute appendicitis',
+  diagnoses: [
+    { id: 'CDX-1', code: 'K35.8', description: 'Acute appendicitis', type: 'Primary' },
+    { id: 'CDX-2', code: 'R50.9', description: 'Fever, unspecified', type: 'Secondary' },
+  ],
+  plan: 'Appendicectomy. Review in one week.',
+  followUpDate: '2026-10-04',
+  clinicalNotes: 'Patient counselled',
+};
+
+const seeded = seededLists(stored);
+check('the complaint list holds only the fields that were filled in', (() => {
+  const titles = seeded.complaint.map((e) => e.title);
+  return (
+    titles.includes('Presenting Complaint') &&
+    titles.includes('History of Presenting Complaint') &&
+    titles.includes('Drug / Medication History') &&
+    !titles.includes('Past Medical History') &&
+    !titles.includes('Family History')
+  );
+})(), JSON.stringify(seeded.complaint.map((e) => e.title)));
+
+check('a filled examination system becomes its own entry', (() => {
+  const titles = seeded.exam.map((e) => e.title);
+  return titles.includes('General Examination') && titles.includes('Abdomen & GI') && titles.includes('Cardiovascular System') === false;
+})(), JSON.stringify(seeded.exam.map((e) => e.title)));
+
+check('the surgery column is read back as surgery entries', (() => {
+  return seeded.surgery.length === 1 && seeded.surgery[0].surgeryType === 'Appendicectomy' && seeded.surgery[0].date === '2010-04-02';
+})(), JSON.stringify(seeded.surgery));
+
+check(
+  'the operations do not also appear in the complaint list',
+  !seeded.complaint.some((e) => e.title === 'Surgical History'),
+  JSON.stringify(seeded.complaint.map((e) => e.title)),
+);
+
+check('both diagnoses come back with their codes and types', (() => {
+  const coded = seeded.diagnosis.filter((d) => d.isCoded);
+  return (
+    coded.length === 2 &&
+    coded[0].code === 'K35.8' &&
+    coded[0].type === 'Primary' &&
+    coded[1].code === 'R50.9' &&
+    coded[1].type === 'Secondary'
+  );
+})(), JSON.stringify(seeded.diagnosis));
+
+check('the assessment comes back as the clinical impression', (() => {
+  const imp = seeded.diagnosis.find((d) => d.id === 'dx-assess');
+  return !!imp && imp.body === 'Acute appendicitis' && imp.isCoded === false;
+})(), JSON.stringify(seeded.diagnosis));
+
+check('the plan and the notes both come back', (() => {
+  const titles = seeded.management.map((e) => e.title);
+  return titles.includes('Treatment Plan') && titles.includes('Clinical Notes');
+})(), JSON.stringify(seeded.management.map((e) => e.title)));
+
+check(
+  'every seeder agrees with seededLists, so the two cannot drift',
+  seedComplaintEntries(stored).length === seeded.complaint.length &&
+    seedExamEntries(stored).length === seeded.exam.length &&
+    seedSurgeryEntries(stored).length === seeded.surgery.length &&
+    seedDiagnosisEntries(stored).length === seeded.diagnosis.length &&
+    seedManagementEntries(stored).length === seeded.management.length,
+);
+
+// ---------------------------------------------------------------------------
+// Folding the entries back into the seven history columns
+// ---------------------------------------------------------------------------
+//
+// The dialog has two required boxes per entry - "Complaint" and "Details" - and
+// the save folded only the Details box into the record. A clinician who wrote
+// "Fever and headache for three days" into the Complaint box and "worse at night"
+// into Details kept the second and lost the first, with no error and no warning:
+// the form said "Saved!". Found by saving one in a browser and reading the
+// database, which is the only way to see this class of thing at all.
+
+section('both boxes a doctor filled in reach the record');
+
+const both = [
+  { id: 'x1', title: 'Presenting Complaint', complaint: 'Fever and headache for three days', body: 'Worse at night, no rigors' },
+  { id: 'x2', title: 'History of Presenting Complaint', complaint: 'No previous episode', body: '' },
+  { id: 'x3', title: 'Past Medical History', complaint: 'Hypertension since 2019', body: '' },
+  { id: 'x4', title: 'Drug History', complaint: 'Amlodipine 5mg daily', body: 'Started 3 years ago' },
+  { id: 'x5', title: 'Family History', complaint: 'Father diabetic', body: '' },
+  { id: 'x6', title: 'Social History', complaint: 'Non-smoker', body: '' },
+  { id: 'x7', title: 'Allergy History', complaint: 'No known allergies', body: '' },
+];
+const folded = foldHistory(both);
+
+check(
+  'the Complaint box reaches presenting_complaint',
+  folded.presentingComplaint.includes('Fever and headache for three days'),
+  folded.presentingComplaint,
+);
+check(
+  'and so does the Details box, rather than one replacing the other',
+  folded.presentingComplaint.includes('Worse at night, no rigors'),
+  folded.presentingComplaint,
+);
+check('history of presenting complaint folds into its own column', folded.historyOfPresentingComplaint === 'No previous episode', folded.historyOfPresentingComplaint);
+check('past medical history folds into its own column', folded.pastMedicalHistory === 'Hypertension since 2019', folded.pastMedicalHistory);
+check('drug history keeps both boxes too', (() => {
+  return folded.drugHistory.includes('Amlodipine 5mg daily') && folded.drugHistory.includes('Started 3 years ago');
+})(), folded.drugHistory);
+check('family history folds into its own column', folded.familyHistory === 'Father diabetic', folded.familyHistory);
+check('social history folds into its own column', folded.socialHistory === 'Non-smoker', folded.socialHistory);
+check('allergy history folds into its own column', folded.allergyHistory === 'No known allergies', folded.allergyHistory);
+
+check(
+  'a complaint with only a Details box still folds, for records written before',
+  foldHistory([{ id: 'y1', title: 'Presenting Complaint', body: 'Legacy free text' }]).presentingComplaint === 'Legacy free text',
+  JSON.stringify(foldHistory([{ id: 'y1', title: 'Presenting Complaint', body: 'Legacy free text' }])),
+);
+
+check(
+  'an entry titled something else becomes the presenting complaint, as before',
+  foldHistory([{ id: 'z1', title: 'Patient walked in unwell', complaint: 'Cough', body: '' }]).presentingComplaint === 'Cough',
+  JSON.stringify(foldHistory([{ id: 'z1', title: 'Patient walked in unwell', complaint: 'Cough', body: '' }])),
+);
+
+check('no entries fold to empty columns, not to undefined', (() => {
+  const empty = foldHistory([]);
+  return Object.values(empty).every((v) => v === '');
+})(), JSON.stringify(foldHistory([])));
+
+check(
+  'a structured surgical history in the Complaint tab is not mistaken for free text',
+  foldHistory([{ id: 'w1', title: 'Surgical History', complaint: '2010-04-02 | LUTH | Appendicectomy | none', body: '' }]).surgicalHistory
+    === '2010-04-02 | LUTH | Appendicectomy | none',
+);
+
+section('what the screen shows is what gets stored');
+
+// The whole reason entryText is a single function rather than two independent
+// selections. A display that shows more than it saves is how a doctor ends up
+// believing a finding is on the record when it is not.
+check('entryText shows the Complaint box when Details is empty', entryText({ id: 'a', title: 't', complaint: 'Only complaint', body: '' }) === 'Only complaint');
+check('entryText shows the Details box when Complaint is empty', entryText({ id: 'b', title: 't', complaint: '', body: 'Only details' }) === 'Only details');
+check('entryText shows both when both are filled', (() => {
+  const t = entryText({ id: 'c', title: 't', complaint: 'A', body: 'B' });
+  return t.includes('A') && t.includes('B');
+})());
+check('entryText skips a box holding only whitespace', entryText({ id: 'd', title: 't', complaint: 'A', body: '   ' }) === 'A');
+check('entryText of an empty entry is empty, not "undefined"', entryText({ id: 'e', title: 't' }) === '');
+
+check(
+  'a stored consultation re-seeds and folds back to the same text',
+  foldHistory(seedComplaintEntries(stored)).presentingComplaint === stored.presentingComplaint,
+  JSON.stringify(foldHistory(seedComplaintEntries(stored)).presentingComplaint),
+);
+check(
+  'and it survives a second round trip unchanged, so editing twice is not lossy',
+  (() => {
+    const once = seedComplaintEntries(stored);
+    const refolded = foldHistory(once);
+    const rebuilt = { ...stored, presentingComplaint: refolded.presentingComplaint, historyOfPresentingComplaint: refolded.historyOfPresentingComplaint, pastMedicalHistory: refolded.pastMedicalHistory, drugHistory: refolded.drugHistory, familyHistory: refolded.familyHistory, socialHistory: refolded.socialHistory };
+    const twice = seedComplaintEntries(rebuilt);
+    return foldHistory(twice).presentingComplaint === refolded.presentingComplaint
+      && foldHistory(twice).drugHistory === refolded.drugHistory;
+  })(),
+);
+
+// ---------------------------------------------------------------------------
+// Saving a consultation that is already stored must not change it
+// ---------------------------------------------------------------------------
+//
+// The plan and the impression are single free-text columns, and each is folded as
+// "Title: text". The seed read that column back as one entry whose *body* was the
+// whole string, title and all - so the fold put a second title in front of it:
+//
+//   Treatment Plan: Treatment Plan: Appendicectomy. Review in one week
+//
+// and every save after that added another. A doctor's own words were pushed
+// further down the column each time they opened the patient, and nothing said so.
+//
+// The property that matters is not that the text is right once, but that it does
+// not move: save, reload, save again, and the column must be byte-identical
+// however many times the pair is run. These checks run it several times over.
+
+section('saving a stored consultation again changes nothing');
+
+const withPlanAndImpression = {
+  ...stored,
+  plan: `${PLAN_TITLE}: Appendicectomy. Review in one week.`,
+  assessment: `${ASSESSMENT_TITLE}: Acute appendicitis`,
+};
+
+check(
+  'the plan comes back as the text, not the text with the title still on it',
+  seedManagementEntries(withPlanAndImpression)[0].body === 'Appendicectomy. Review in one week.',
+  JSON.stringify(seedManagementEntries(withPlanAndImpression)),
+);
+check(
+  'and the impression likewise',
+  seedDiagnosisEntries(withPlanAndImpression).find((d) => d.id === 'dx-assess')?.body === 'Acute appendicitis',
+  JSON.stringify(seedDiagnosisEntries(withPlanAndImpression)),
+);
+check(
+  're-folding the seeded plan reproduces the stored column exactly',
+  foldPlan(seedManagementEntries(withPlanAndImpression)) === withPlanAndImpression.plan,
+  `${foldPlan(seedManagementEntries(withPlanAndImpression))} vs ${withPlanAndImpression.plan}`,
+);
+check(
+  're-folding the seeded impression reproduces the stored column exactly',
+  foldImpression(seedDiagnosisEntries(withPlanAndImpression)) === withPlanAndImpression.assessment,
+  `${foldImpression(seedDiagnosisEntries(withPlanAndImpression))} vs ${withPlanAndImpression.assessment}`,
+);
+
+// The real test: the same value after any number of round trips.
+const settle = (start, key) => {
+  let value = start;
+  for (let i = 0; i < 5; i++) {
+    const next = key === 'plan'
+      ? foldPlan(seedManagementEntries({ plan: value }))
+      : foldImpression(seedDiagnosisEntries({ assessment: value }));
+    if (next !== value) return { stable: false, at: i + 1, value: next };
+    value = next;
+  }
+  return { stable: true, value };
+};
+const planSettle = settle(withPlanAndImpression.plan, 'plan');
+const impSettle = settle(withPlanAndImpression.assessment, 'impression');
+check('the plan is the same after five save-and-reload cycles', planSettle.stable, `changed on cycle ${planSettle.at}: ${planSettle.value}`);
+check('the impression is the same after five save-and-reload cycles', impSettle.stable, `changed on cycle ${impSettle.at}: ${impSettle.value}`);
+
+check(
+  'a plan a clinician wrote without any title is left alone, and then stays put',
+  (() => {
+    const once = foldPlan(seedManagementEntries({ plan: 'Bed rest, fluids, review Friday' }));
+    const twice = foldPlan(seedManagementEntries({ plan: once }));
+    return once === `${PLAN_TITLE}: Bed rest, fluids, review Friday` && twice === once;
+  })(),
+);
+check(
+  'a plan that genuinely begins with the words is trimmed once, then stable',
+  (() => {
+    const once = foldPlan(seedManagementEntries({ plan: 'Treatment Plan: rest and fluids' }));
+    const twice = foldPlan(seedManagementEntries({ plan: once }));
+    return once === `${PLAN_TITLE}: rest and fluids` && twice === once;
+  })(),
+);
+check(
+  'a clinician who renames the entry keeps their title and does not gain a second one',
+  (() => {
+    const entries = [{ id: 'm0', title: 'Advice Given', body: 'Avoid strenuous activity', date: '', category: 'Advice' }];
+    const once = foldPlan(entries);
+    const twice = foldPlan([{ id: 'm0', title: 'Advice Given', body: stripTitlePrefix(once, 'Advice Given'), date: '', category: 'Advice' }]);
+    return once === 'Advice Given: Avoid strenuous activity' && twice === once;
+  })(),
+);
+check('several plan items each keep their own title', (() => {
+  const out = foldPlan([
+    { id: 'a', title: PLAN_TITLE, body: 'Appendicectomy', date: '', category: 'Therapeutics' },
+    { id: 'b', title: 'Patient Advice', body: 'Avoid lifting for six weeks', date: '', category: 'Advice' },
+  ]);
+  return out === 'Treatment Plan: Appendicectomy\nPatient Advice: Avoid lifting for six weeks';
+})(), foldPlan([{ id: 'a', title: PLAN_TITLE, body: 'Appendicectomy', date: '', category: 'Therapeutics' }]));
+check('no plan items fold to an empty string, not to "undefined"', foldPlan([]) === '', JSON.stringify(foldPlan([])));
+check('no impression entries fold to an empty string', foldImpression([]) === '', JSON.stringify(foldImpression([])));
+check('a coded diagnosis is not treated as an impression', foldImpression([{ id: 'x', title: 'Acute appendicitis', body: 'Acute appendicitis', isCoded: true, code: 'K35.8', type: 'Primary' }]) === '');
+
+// The clinical notes have their own column. Folding them into the plan as well
+// wrote a clinician's note into the treatment plan and into the notes, so it sat
+// on the record twice and read as part of the plan the first time.
+section('the notes stay out of the plan');
+
+const seededMgmt = seedManagementEntries(withPlanAndImpression);
+check('a seeded consultation produces a plan entry and a notes entry', (() => {
+  const titles = seededMgmt.map((m) => m.title);
+  // Compared against the module's own test, not a hardcoded 'note': the whole
+  // point of `isNotesEntry` is that the seed and the fold agree on which entries
+  // are notes, and a test that spelled the word out again would pass even if the
+  // two disagreed with each other.
+  return titles.includes(PLAN_TITLE) && seededMgmt.filter(isNotesEntry).length === 1;
+})(), JSON.stringify(seededMgmt.map((m) => m.title)));
+
+check('the plan column does not contain the note', !foldPlan(seededMgmt).includes('Patient counselled'), foldPlan(seededMgmt));
+check('the notes column holds the note', foldNotes(seededMgmt) === 'Patient counselled', JSON.stringify(foldNotes(seededMgmt)));
+check('a notes entry alone leaves the plan empty', foldPlan([{ id: 'n', title: NOTES_TITLE, body: 'Counselled', category: 'Notes' }]) === '', foldPlan([{ id: 'n', title: NOTES_TITLE, body: 'Counselled', category: 'Notes' }]));
+check('a plan entry alone leaves the notes empty', foldNotes([{ id: 'p', title: PLAN_TITLE, body: 'Appendicectomy', category: 'Therapeutics' }]) === '');
+check('a renamed notes entry is still recognised as notes', foldPlan([{ id: 'n', title: 'Ward Round Notes', body: 'Seen on the ward', category: 'Notes' }]) === '' && foldNotes([{ id: 'n', title: 'Ward Round Notes', body: 'Seen on the ward', category: 'Notes' }]) === 'Seen on the ward');
+check(
+  'and the note is not in the plan after a save-and-reload cycle either',
+  (() => {
+    let planValue = withPlanAndImpression.plan;
+    for (let i = 0; i < 5; i++) {
+      planValue = foldPlan(seedManagementEntries({ plan: planValue, clinicalNotes: 'Patient counselled' }));
+      if (planValue.includes('Patient counselled')) return false;
+    }
+    return planValue === withPlanAndImpression.plan;
+  })(),
+  foldPlan(seedManagementEntries({ plan: withPlanAndImpression.plan, clinicalNotes: 'Patient counselled' })),
+);
+check(
+  'a stored column that already contains the note has it removed on the next save',
+  (() => {
+    // A record written by the old fold. The note is in the plan column, and
+    // fixing the record means it stops being there.
+    const legacy = `${PLAN_TITLE}: Appendicectomy\nClinical Notes: Patient counselled`;
+    const next = foldPlan(seedManagementEntries({ plan: legacy, clinicalNotes: 'Patient counselled' }));
+    return next === `${PLAN_TITLE}: Appendicectomy`;
+  })(),
+  foldPlan(seedManagementEntries({ plan: `${PLAN_TITLE}: Appendicectomy\nClinical Notes: Patient counselled`, clinicalNotes: 'Patient counselled' })),
+);
 
 // ---------------------------------------------------------------------------
 

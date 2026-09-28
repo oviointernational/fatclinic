@@ -21,6 +21,7 @@ const TARGETS = {
   access: path.join(ROOT, 'src', 'services', 'consultationAccess.ts'),
   surgery: path.join(ROOT, 'src', 'services', 'surgeryHistory.ts'),
   exam: path.join(ROOT, 'src', 'services', 'physicalExam.ts'),
+  seed: path.join(ROOT, 'src', 'services', 'consultationSeed.ts'),
 };
 
 /**
@@ -205,6 +206,88 @@ const DEFECTS = [
     // line with the separators still in its text - and re-saving writes them back.
     from: '    .filter((line) => line.trim() !== \'\')\n    .forEach((line, index) => {',
     to: '    .map((line) => line.trim())\n    .filter((line) => line !== \'\')\n    .forEach((line, index) => {',
+    count: 1,
+  },
+  {
+    file: 'seed',
+    name: 'an untouched consultation is seeded with a worked example again',
+    // This is the real bug, restored verbatim from the code that shipped it. A
+    // doctor who opened a patient they had never consulted and pressed Save
+    // without typing anything wrote "Plasmodium falciparum malaria, unspecified /
+    // B50.9 / Primary" into that patient's medical record. The record then asserts
+    // that a clinician diagnosed malaria, and nothing later can show that nobody
+    // did. The earlier bug in this screen lost data silently; this one invented
+    // it, which is the worse of the two.
+    from: `  if (!c) return [];
+  const arr: DiagnosisEntry[] = [];`,
+    to: `  if (!c) return [{ id: 'd1', title: 'Plasmodium falciparum malaria, unspecified', body: 'Acute uncomplicated malaria', isCoded: true, code: 'B50.9', type: 'Primary' }];
+  const arr: DiagnosisEntry[] = [];`,
+    count: 1,
+  },
+  {
+    file: 'seed',
+    name: 'the complaint list stops being cleared for a visit with no consultation',
+    // The other half of the same rule. A list describes what was recorded; if the
+    // guard goes, one list keeps inventing content and the rest do not, which is
+    // why the rule is checked for all five rather than for the one that broke.
+    from: `export function seedComplaintEntries(c: Consultation | undefined): EntryItem[] {
+  if (!c) return [];`,
+    to: `export function seedComplaintEntries(c: Consultation | undefined): EntryItem[] {
+  if (!c) return [{ id: 'c0', title: 'Presenting Complaint', body: 'Fever and headache' }];`,
+    count: 1,
+  },
+  {
+    file: 'seed',
+    name: 'the plan column grows another title on every save',
+    // The seed reads the plan column back with its own title still attached, and
+    // the fold puts a title in front of every entry, so a stored consultation
+    // saved once more reads
+    //   Treatment Plan: Treatment Plan: Appendicectomy. Review in one week
+    // and the save after that adds a third. Nothing warns: the record still looks
+    // plausible, and the clinician's own words are pushed further down the column
+    // each time they open the patient. The check that catches it is not that the
+    // text is right once - it is that the value does not move after five
+    // save-and-reload cycles.
+    from: '  if (plan) arr.push({ id: \'m0\', title: PLAN_TITLE, body: stripTitlePrefix(plan, PLAN_TITLE), date: c.followUpDate || \'\', category: \'Therapeutics\' });',
+    to: '  if (plan) arr.push({ id: \'m0\', title: PLAN_TITLE, body: plan, date: c.followUpDate || \'\', category: \'Therapeutics\' });',
+    count: 1,
+  },
+  {
+    file: 'seed',
+    name: 'the clinical notes are written into the plan as well',
+    // The notes have their own column, but the plan fold covered every management
+    // entry, so a clinician's note was stored twice: once in `plan`, where it
+    // reads as part of the treatment, and once in `clinical_notes`. Two problems
+    // in one - the duplication, and the fact that a record saved that way carried
+    // the note in the plan for ever, because the notes fold only ever read the
+    // notes column.
+    from: `export function foldPlan(entries: ManagementEntry[]): string {
+  return entries
+    .filter((m) => !isNotesEntry(m))
+    .map((m) => \`\${m.title}: \${stripTitlePrefix(m.body, m.title)}\`)
+    .join('\\n');
+}`,
+    to: `export function foldPlan(entries: ManagementEntry[]): string {
+  return entries
+    .map((m) => \`\${m.title}: \${stripTitlePrefix(m.body, m.title)}\`)
+    .join('\\n');
+}`,
+    count: 1,
+  },
+  {
+    file: 'seed',
+    name: 'the fold goes back to keeping only the Details box',
+    // The original shape, restored. The dialog asks for a Complaint and a
+    // Details, and the save read only `body`, so the complaint a doctor typed was
+    // discarded while the form reported "Saved!". The clinical significance is
+    // the reverse of the usual: the discarded box was the reason the patient came
+    // in. Found by saving one consultation in a browser and reading the row back
+    // with SQL - the automated checks could not see it, because the form and the
+    // fold agreed with each other and only the database disagreed.
+    from: `export function entryText(entry: EntryItem): string {
+  return [entry.complaint, entry.body]`,
+    to: `export function entryText(entry: EntryItem): string {
+  return [undefined, entry.body]`,
     count: 1,
   },
 ];

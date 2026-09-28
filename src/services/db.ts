@@ -56,7 +56,9 @@ import {
   hydrateAll,
   isSyncEnabled,
   isInFlight,
+  persistedBefore,
   queueDiff,
+  recordPersisted,
 } from './sync';
 
 const STORAGE_KEYS = {
@@ -126,23 +128,30 @@ const STORAGE_FIELD: Record<string, string> = {
  * `saveStorage` is handed a whole collection, so the sync layer needs to know
  * what the collection looked like *before* the change in order to work out which
  * rows are new, which changed and which went away. That prior state is exactly
- * what was last persisted, which is what this holds.
+ * what was last persisted.
+ *
+ * The sync layer owns the map itself rather than this file, because it has to
+ * hold a **copy** of each collection. A reference held here would be silently
+ * rewritten by the next in-place edit - `db.saveConsultation` assigns
+ * `this.consultations[i] = updated` on the very array it was handed - and the
+ * diff would then compare the new value against itself, decide nothing had
+ * changed, and send nothing at all. A consultation would keep whatever was
+ * stored first, for ever, with no error and no failure badge to explain why.
  *
  * It is also the baseline for a fresh page load: `loadStorage` seeds it, so the
  * first save after a reload diffs against what was actually on disk rather than
  * against an empty array (which would make every row look like a new row).
  */
-const baseline = new Map<string, unknown>();
 
 function loadStorage<T>(key: string, fallback: T): T {
   try {
     const data = localStorage.getItem(key);
     const value = data ? (JSON.parse(data) as T) : fallback;
-    baseline.set(key, value);
+    recordPersisted(key, value);
     return value;
   } catch (err) {
     console.error(`Error loading ${key} from storage:`, err);
-    baseline.set(key, fallback);
+    recordPersisted(key, fallback);
     return fallback;
   }
 }
@@ -158,8 +167,8 @@ function saveStorage<T>(key: string, value: T): void {
   // only genuinely new, changed and removed rows are sent; a save that changed
   // nothing sends nothing at all.
   const map = TABLE_BY_KEY.get(key);
-  const before = baseline.get(key);
-  baseline.set(key, value);
+  const before = persistedBefore(key);
+  recordPersisted(key, value);
   // Returns synchronously: the localStorage write above must not wait on the
   // network, and a failed sync leaves the data intact on disk.
   if (map) queueDiff(map, before, value);
@@ -341,7 +350,7 @@ class FatClinicDatabase {
           continue;
         }
 
-        const local = baseline.get(map.key);
+        const local = persistedBefore(map.key);
         const localList = Array.isArray(local) ? (local as any[]) : [];
         const remoteList = Array.isArray(remote) ? (remote as any[]) : [];
 
@@ -386,7 +395,7 @@ class FatClinicDatabase {
     } catch (err) {
       console.error(`Error persisting ${key} after sync:`, err);
     }
-    baseline.set(key, value);
+    recordPersisted(key, value);
   }
 
   public subscribe(listener: () => void): () => void {
@@ -497,7 +506,7 @@ class FatClinicDatabase {
     } catch (err) {
       console.error('Error saving users to storage:', err);
     }
-    baseline.set(STORAGE_KEYS.USERS, this.users);
+    recordPersisted(STORAGE_KEYS.USERS, this.users);
     this.notify();
   }
 
