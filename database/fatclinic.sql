@@ -1218,6 +1218,61 @@ BEGIN
   COMMENT ON FUNCTION public.app_clear_own_must_change_password() IS
     'Clears must_change_password on the caller''s own profile and nothing else. Takes no arguments and writes one column, so it cannot be used to change a role or reach another person. Returns FALSE when the caller has no active profile.';
 
+  -- Self-service edit of a clinician's own profile details and device PIN.
+  --
+  -- WHY THIS IS A FUNCTION AND NOT A POLICY
+  -- ----------------------------------------
+  -- The same argument as app_clear_own_must_change_password: `users` is in
+  -- admin_tables, so users_update requires app_is_admin(), and a clinician
+  -- writing their own row matches no RLS policy - the change is silently
+  -- dropped and the header badge lights up. Widening users_update to "your own
+  -- row" would instead hand every staff member role, active and email, which
+  -- is self-promotion to administrator. So the permission is expressed as the
+  -- four columns someone actually needs to change about themselves: name,
+  -- department, avatar, and the screen-lock PIN.
+  --
+  -- No id is accepted: the row is resolved with app_current_staff_id(), which
+  -- already requires an active profile whose email matches the JWT, so an
+  -- orphaned token matches nothing and changes nothing. Email is deliberately
+  -- absent: it is the login identity the RLS lookup matches on, so letting a
+  -- person edit it would lock them out of the account they just edited. role,
+  -- active, auth_user_id and must_change_password are absent too.
+  --
+  -- A NULL argument leaves that column alone. An empty name or a PIN that is
+  -- not exactly four digits is refused. Returns TRUE when a row was updated,
+  -- so a caller can tell a saved change from a refused one.
+  EXECUTE $fn$
+    CREATE OR REPLACE FUNCTION public.app_update_own_profile(
+      p_name        TEXT,
+      p_department  TEXT,
+      p_avatar      TEXT,
+      p_pin         TEXT
+    ) RETURNS BOOLEAN AS $body$
+    DECLARE
+      v_staff_id TEXT := public.app_current_staff_id();
+    BEGIN
+      IF v_staff_id IS NULL THEN
+        RETURN FALSE;
+      END IF;
+      IF p_name IS NOT NULL AND length(trim(p_name)) = 0 THEN
+        RAISE EXCEPTION 'name cannot be empty';
+      END IF;
+      IF p_pin IS NOT NULL AND p_pin !~ '^[0-9]{4}$' THEN
+        RAISE EXCEPTION 'PIN must be exactly 4 digits';
+      END IF;
+      UPDATE public.users
+         SET name       = CASE WHEN p_name IS NULL       THEN name       ELSE trim(p_name) END,
+             department = CASE WHEN p_department IS NULL THEN department ELSE trim(p_department) END,
+             avatar     = CASE WHEN p_avatar IS NULL     THEN avatar     ELSE p_avatar END,
+             pin        = CASE WHEN p_pin IS NULL        THEN pin        ELSE p_pin END
+       WHERE id = v_staff_id;
+      RETURN FOUND;
+    END $body$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+  $fn$;
+
+  COMMENT ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) IS
+    'Updates a clinician''s own name, department, avatar and device PIN. No id is accepted - the row is the caller''s profile resolved from the JWT, so it cannot reach another person. role, active, email and auth_user_id are not settable through it. NULL leaves a column unchanged; an empty name or malformed PIN is refused. Returns TRUE when a row was updated.';
+
   FOREACH t IN ARRAY staff_tables LOOP
     IF to_regclass('public.' || quote_ident(t)) IS NULL THEN CONTINUE; END IF;
     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
@@ -1273,6 +1328,7 @@ BEGIN
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_is_staff() FROM PUBLIC';
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_current_staff_id() FROM PUBLIC';
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_clear_own_must_change_password() FROM PUBLIC';
+  EXECUTE 'REVOKE ALL ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) FROM PUBLIC';
   -- A revoke from PUBLIC is not enough on its own. PostgREST has to be able to
   -- reach RPCs as the anon role, so this database also carries a
   -- default-privileges entry giving that role EXECUTE on functions in this
@@ -1287,12 +1343,14 @@ BEGIN
   -- comment phrased as SQL fails the schema as a table that does not exist.)
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
     EXECUTE 'REVOKE ALL ON FUNCTION public.app_clear_own_must_change_password() FROM anon';
+    EXECUTE 'REVOKE ALL ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) FROM anon';
   END IF;
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_admin() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_staff() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_clear_own_must_change_password() TO authenticated';
+  EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) TO authenticated';
 
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO service_role';
@@ -1300,6 +1358,7 @@ BEGIN
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_staff() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_clear_own_must_change_password() TO service_role';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) TO service_role';
   END IF;
 
   ALTER DEFAULT PRIVILEGES IN SCHEMA public

@@ -528,6 +528,30 @@ class FatClinicDatabase {
     this.notify();
   }
 
+  /**
+   * Persist a clinician's edit of their OWN profile after the server confirmed
+   * it. `updateUser` above is for edits the admin table policy admits; a
+   * clinician's own name/department/avatar/PIN is written by the
+   * app_update_own_profile function (see AccountModal), so pushing the same
+   * change through saveStorage would queue a users write RLS refuses and light
+   * the "not saved" badge for a change that is already on the server.
+   * applyServerConfirmedUser records the row as persisted, so the sync has
+   * nothing left to disagree about; the audit entry is still queued, because
+   * audit_logs insertion is open to staff and the trail should record who
+   * changed their own account.
+   */
+  public updateOwnUser(user: User): void {
+    this.applyServerConfirmedUser(user);
+    this.log({
+      userId: user.id,
+      userName: user.name,
+      userRole: user.role,
+      action: 'UPDATE_OWN_ACCOUNT',
+      category: 'ADMIN',
+      details: `${user.name} updated their own account details.`,
+    });
+  }
+
   public assignCustomRole(userId: string, customRoleId: string | null, adminUser: User): void {
     const target = this.users.find(u => u.id === userId);
     if (!target) throw new Error(`User ${userId} not found`);

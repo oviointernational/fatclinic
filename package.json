@@ -40,7 +40,9 @@
     "staff:clean-demo": "node scripts/remove-demo-staff.mjs",
     "db:consultation-test": "node scripts/consultation-selftest.mjs",
     "db:consultation:defects": "node scripts/consultation-defects.mjs",
-    "db:crud": "node scripts/check-clinical-crud.mjs"
+    "db:crud": "node scripts/check-clinical-crud.mjs",
+    "db:check-self-edit": "node scripts/check-self-edit.mjs",
+    "db:purge-probe-data": "node scripts/purge-probe-data.mjs"
   },
   "engines": {
     "node": ">=20"

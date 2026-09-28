@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useAuth, useCurrentUser } from '../../context/AuthContext';
 import { db } from '../../services/db';
-import { changePassword, clearOwnMustChangePassword } from '../../services/auth';
+import { changePassword, clearOwnMustChangePassword, updateOwnProfile } from '../../services/auth';
 import { X, User, Lock, KeyRound, CheckCircle2 } from 'lucide-react';
 // Aliased: `User` above is the lucide icon, not the staff profile.
 import type { User as StaffProfile } from '../../types';
@@ -83,29 +83,58 @@ export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose, for
     setNotice(null);
   };
 
-  const handleSaveDetails = (e: React.FormEvent) => {
+  const handleSaveDetails = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim() || !email.trim()) {
       fail('Name and email are required.');
       return;
     }
-    const updated = { ...currentUser, name: name.trim(), email: email.trim(), department: department.trim(), avatar };
-    db.updateUser(updated, currentUser);
-    setCurrentUser(updated);
-    ok('Account details updated.');
+    // public.users is an admin table; a clinician writing their own row matches
+    // no RLS policy, so this goes through the app_update_own_profile function,
+    // which updates the server and resolves the row from the JWT. Only the
+    // server's answer settles the UI - a local-only save would report success
+    // for a change the database refused.
+    setIsChanging(true);
+    try {
+      const result = await updateOwnProfile({
+        name: name.trim(),
+        department: department.trim(),
+        avatar,
+      });
+      if (!result.ok) {
+        fail(result.message);
+        return;
+      }
+      const updated = { ...currentUser, name: name.trim(), email: email.trim(), department: department.trim(), avatar };
+      db.updateOwnUser(updated);
+      setCurrentUser(updated);
+      ok('Account details updated.');
+    } finally {
+      setIsChanging(false);
+    }
   };
 
-  const handleSavePin = (e: React.FormEvent) => {
+  const handleSavePin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!/^\d{4}$/.test(newPin)) {
       fail('PIN must be exactly 4 digits.');
       return;
     }
-    const updated = { ...currentUser, pin: newPin };
-    db.updateUser(updated, currentUser);
-    setCurrentUser(updated);
-    setNewPin('');
-    ok('Device PIN updated.');
+    setIsChanging(true);
+    try {
+      const result = await updateOwnProfile({ pin: newPin });
+      if (!result.ok) {
+        fail(result.message);
+        return;
+      }
+      const updated = { ...currentUser, pin: newPin };
+      db.updateOwnUser(updated);
+      setCurrentUser(updated);
+      setNewPin('');
+      ok('Device PIN updated.');
+    } finally {
+      setIsChanging(false);
+    }
   };
 
   const handleSavePassword = async (e: React.FormEvent) => {
@@ -231,7 +260,13 @@ export const AccountModal: React.FC<AccountModalProps> = ({ isOpen, onClose, for
               </div>
               <div>
                 <label className="block font-bold mb-1">Email</label>
-                <input type="email" value={email} onChange={e => setEmail(e.target.value)} className="w-full px-3 py-2 rounded-xl bg-slate-50 border" />
+                <input
+                  type="email"
+                  value={email}
+                  disabled
+                  className="w-full px-3 py-2 rounded-xl bg-slate-50 border opacity-70 cursor-not-allowed"
+                />
+                <p className="mt-1 text-slate-400">This is how you sign in. Email changes are made by Administration.</p>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>

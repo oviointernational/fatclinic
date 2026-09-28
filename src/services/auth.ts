@@ -309,6 +309,46 @@ export async function clearOwnMustChangePassword(): Promise<boolean> {
 }
 
 /**
+ * The columns of a staff profile that a clinician may change about themselves.
+ * Email, role, active and auth_user_id are deliberately not here - see the
+ * comment on app_update_own_profile in database/fatclinic.sql.
+ */
+export interface OwnProfileEdits {
+  name?: string;
+  department?: string;
+  avatar?: string;
+  pin?: string;
+}
+
+/**
+ * Save the signed-in clinician's own profile details or device PIN.
+ *
+ * `public.users` is an admin table, so a self-edit written through the normal
+ * sync would match no RLS policy and be dropped while the UI reported success.
+ * The write instead goes through the security-definer function, which resolves
+ * the row from the JWT (no id is accepted, so it cannot reach another person)
+ * and updates only the four columns a person owns about themselves. Returns
+ * plain booleans and a message rather than throwing, mirroring
+ * clearOwnMustChangePassword().
+ */
+export async function updateOwnProfile(edits: OwnProfileEdits): Promise<{ ok: boolean; message: string }> {
+  const client = getSupabase();
+  if (!client) return { ok: false, message: 'Not signed in.' };
+
+  const { error } = await client.rpc('app_update_own_profile', {
+    p_name: edits.name ?? null,
+    p_department: edits.department ?? null,
+    p_avatar: edits.avatar ?? null,
+    p_pin: edits.pin ?? null,
+  });
+  if (error) {
+    console.error('[auth] could not update the profile:', error.message);
+    return { ok: false, message: error.message };
+  }
+  return { ok: true, message: 'Saved.' };
+}
+
+/**
  * Ask Supabase to email a re-authentication code.
  *
  * Returns whether the request was accepted, not whether the email arrived; there
