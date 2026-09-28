@@ -198,6 +198,28 @@ if (!ADMIN_PW) {
       const del = await api(`/auth/v1/admin/users/${createdAuthId}`, { method: 'DELETE' });
       check('deleted the throwaway auth account', del.status === 200 || del.status === 204,
         `status ${del.status}`);
+      // The status is not the evidence. `check-clinical-crud` reported 200 for two
+      // accounts that were still live an hour later, so the only acceptable proof
+      // is the id absent from a fresh listing - and the comment above explains
+      // why looking it up by *email* would not do: a just-created account does not
+      // appear in the list at all, which is the trap that leaves a credential
+      // behind. By id, absent means absent.
+      //
+      // The listing is read into `json`, not off the response - `api` returns
+      // `{ status, json }`, so `after.users` is always undefined and "is it gone"
+      // would compare undefined to an id and answer *yes, gone* on every run. A
+      // check that cannot fail is not a check, so the readability of the listing is
+      // itself asserted first: a 401 here must fail the run rather than read as
+      // a clean sweep.
+      const after = await api('/auth/v1/admin/users?page=1&per_page=200');
+      const listed = after.json?.users;
+      check('the account list could be read, so "it is gone" means something',
+        after.status === 200 && Array.isArray(listed),
+        `status ${after.status}, users ${Array.isArray(listed) ? 'present' : 'missing'}`);
+      const stillListed = Array.isArray(listed) && listed.some((u) => u.id === createdAuthId);
+      check('and the throwaway auth account is confirmed gone, not just accepted',
+        !stillListed,
+        stillListed ? `account ${createdAuthId} is still listed` : '');
     } else {
       // Only reached when the create failed, so there should be nothing to remove.
       check('no auth account was created, so none to delete', true);

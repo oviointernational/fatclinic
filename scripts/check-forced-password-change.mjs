@@ -238,7 +238,32 @@ try {
   console.error('\nprobe failed:', err.message);
   failures++;
 } finally {
-  if (authId) await fetch(`${BASE}/auth/v1/admin/users/${authId}`, { method: 'DELETE', headers: ADMIN });
+  if (authId) {
+    await fetch(`${BASE}/auth/v1/admin/users/${authId}`, { method: 'DELETE', headers: ADMIN });
+    // A 200 is not proof, and this is the script that matters most for it: the
+    // probe signs in, is given a real role, and drives the forced-password-change
+    // flow end to end. An account that outlives the run is a working credential
+    // for a fake clinician, left on a system holding patient records. So the
+    // delete is confirmed against a fresh listing rather than trusted.
+    //
+    // Guarded, because this runs in a `finally`: an unguarded throw here would
+    // replace whatever failure it was cleaning up after, and hide the reason the
+    // run failed behind a network error about the cleanup.
+    try {
+      const stillThere = (
+        (await (await fetch(`${BASE}/auth/v1/admin/users?page=1&per_page=200`, { headers: ADMIN })).json()).users ?? []
+      ).some((u) => u.email === EMAIL);
+      if (stillThere) {
+        failures++;
+        console.log(`\ncleanup: WARNING the probe account ${EMAIL} SURVIVED deletion and must be removed by hand`);
+      } else {
+        console.log('\ncleanup: the probe auth account is gone, confirmed by listing');
+      }
+    } catch (err) {
+      failures++;
+      console.log(`\ncleanup: WARNING could not confirm the probe account is gone (${err.message}); remove ${EMAIL} by hand`);
+    }
+  }
   await db.query('DELETE FROM users WHERE id = $1', [PROFILE]).catch(() => {});
   const left = await db.query('SELECT count(*)::int AS n FROM users WHERE id = $1', [PROFILE]);
   console.log(`\ncleanup: the throwaway profile is gone = ${left.rows[0].n === 0}`);

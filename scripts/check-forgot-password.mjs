@@ -373,7 +373,26 @@ try {
   check('the probe profiles are gone', left.rows[0].n === 0, `${left.rows[0].n} left`);
 
   const accounts = await (await fetch(`${BASE}/auth/v1/admin/users?page=1&per_page=200`, { headers: ADMIN })).json();
-  check('and no auth account was created by any of this', (accounts.users ?? []).length === 2, `${(accounts.users ?? []).length} accounts`);
+  // Matched on the *prefix* of the local part, never the domain. The probe
+  // accounts live on the clinic's own `@fatclinic.health` so they exercise the
+  // real uniqueness and rate-limit paths, and a domain match would therefore
+  // also match every genuine member of staff - which is the mistake
+  // scripts/demo-staff.mjs warns about in a comment.
+  //
+  // The total is reported but not asserted. It used to be asserted as exactly 2,
+  // which caught a real leak - two `crudaudit-` accounts left behind by a run
+  // that died before its `finally` - and would equally have failed the build the
+  // day a third clinician was hired, which is not a defect in anything.
+  const PROBE_PREFIXES = [
+    'crudaudit-', 'orphan-probe-', 'zainab-probe-', 'someone-else-probe-',
+    'constraint-probe-', 'forcedcheck-', 'signin-probe-', 'reset-clinician-',
+    'reset-disabled-', 'reset-orphan-', 'stranger-',
+  ];
+  const survivors = (accounts.users ?? [])
+    .map((u) => u.email ?? '')
+    .filter((email) => PROBE_PREFIXES.some((p) => email.split('@')[0].startsWith(p)));
+  check('and no probe account was left behind by any of this', survivors.length === 0, survivors);
+  console.log(`      ${(accounts.users ?? []).length} auth account(s) exist in total; ${survivors.length} of them are probes`);
 
   await db.end();
 }

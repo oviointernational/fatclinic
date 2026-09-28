@@ -242,6 +242,83 @@ That last one is the one that matters most, because it is the only one that can
 catch the file being wrong. The other two would happily pass forever against a
 schema the app no longer matches.
 
+#### A test that creates a credential has to prove it removed it
+
+The live checks sign in as throwaway clinicians, with real roles, against a
+database of patient records. That is the only way to prove the RLS policies and
+the write path are what they claim — and it means every one of them creates a
+working credential that must not survive the run.
+
+Two did. `db:crud` reported `removed the throwaway sign-in account (200)` and
+the accounts were still there an hour later, found by a *different* check that
+counted auth accounts and expected two. The lesson is not "use a better delete" —
+the delete worked when it was actually issued. It is that **a `200` is not
+evidence of an effect**, and a cleanup that prints success on a status code alone
+is a false all-clear, which is worse than no cleanup at all because it stops
+anyone looking.
+
+So every live script now confirms by listing: `db:crud` and
+`db:check-profile-lookup` already did, `db:check-forced-password-change` and
+`db:check-deployed` now do, and `db:check-forgot-password` is the backstop that
+notices a probe account left by *any* of them — matched on the prefix of the
+local part, never the domain, because the probes deliberately live on the
+clinic's own `@fatclinic.health`.
+
+The one subtlety: a just-created account does not show up in the admin listing
+straight away, so "look for it by email and see it is absent" is satisfied by an
+account that was never listed either. `db:check-deployed` therefore looks by
+**id** — absence of an id that came from the create response means absence — and
+asserts separately that the listing was readable at all, because a `401` there
+would otherwise read as a clean sweep. That is the same "assert the thing the
+answer depends on" rule the rest of this suite is built on, applied to the test
+itself — and it is only worth anything because it was checked: run against the
+live API, the predicate does find a live account, does report a never-existed id
+as gone, and does flip from present to absent across a real create-and-delete. A
+predicate that can only ever answer "gone" would have passed every run.
+
+`db:crud` also has a `finally` that cannot cover a process that has died, and the
+direct-Postgres connection to Supabase does intermittently drop mid-run, so the
+credential is removed from a process-level handler as well. `CRUD_AUDIT_DIE=now`
+makes it die on purpose, and `CRUD_AUDIT_DIE=signin` takes the earlier exit, so
+both are proven rather than asserted.
+
+That fix found a second bug in the same file. All three of the audit's early
+exits did `failures++` and `return`, and the summary that sets the exit code sat
+*after* them — so a run that could not even create its throwaway clinician
+printed nothing and **exited 0**. The gate reported success because the audit had
+not run. The summary now sits in a `finally` those returns cannot step over, and
+a run that completes zero checks fails rather than reporting "all 0 checks behaved
+as expected".
+
+#### The schema file has to be the whole database
+
+`database/fatclinic.sql` is meant to be a complete description of the database,
+and the checks that make that true were only ever applied to tables and views.
+Functions were the hole, and it had already swallowed something.
+
+`db:apply` compared the policies the file declares against the policies the
+database has, in both directions, because `CREATE POLICY IF NOT EXISTS` can only
+add — a policy added straight to the database outlives every apply and a rebuild
+loses it. It does the same thing for nothing else. Extending it to functions
+immediately found `app_own_account_id()`: live, written on purpose alongside
+`app_current_staff_id()`, and in no file, so a rebuild would have dropped it with
+nothing to notice. It is now declared, with a note that nothing calls it.
+
+The parallel check that caught the other half — a function the file *uses* but
+never creates, which is a rebuild that dies on the policy naming a function that
+is nowhere in the file you would be reading to fix it — belongs in `db:lint`,
+and it scans only the `USING`/`WITH CHECK` predicates and `EXECUTE FUNCTION`.
+That is deliberate: those are the only places a project function is called from
+policy and trigger wiring, and there are no Postgres built-ins there to confuse a
+name-based check, so the rule needs no allow-list to stay honest. Calls inside a
+function *body* are not scanned, because those do need one; that gap is covered
+instead by applying the file to an empty database, where Postgres refuses the
+body itself.
+
+Both sides of both comparisons drop a `public.` qualifier, because the file
+declares some functions qualified and some bare. Comparing them as written would
+report every policy call in the file as missing.
+
 #### The remembered past has to be a copy
 
 This is the bug that lost a doctor's corrections without a trace, and it is the
@@ -760,8 +837,8 @@ Two things that make this easier to get wrong than they look:
 
 | Command | What it does | Needs a database |
 |---|---|---|
-| `npm run db:lint` | Static checks on the SQL: every seed column, foreign key, index and view target exists, seed values satisfy their own CHECK constraints, ward codes match the TypeScript model, no credential column | no |
-| `npm run db:lint:test` | Injects known defects to prove `db:lint` actually catches them | no |
+| `npm run db:lint` | Static checks on the SQL: every seed column, foreign key, index and view target exists, every function a **policy or trigger calls** is created by the file, seed values satisfy their own CHECK constraints, ward codes match the TypeScript model, no credential column | no |
+| `npm run db:lint:test` | Injects 15 known defects to prove `db:lint` actually catches them, including a policy and a trigger calling a function the file never creates | no |
 | `npm run db:config:test` | Proves the `.env` password guards and the host resolver behave correctly, including the dotenv `#` truncation trap | no |
 | `npm run db:sync:test` | 388 checks against the schema: mappers emit only real columns, every required column is always sent, values survive a round trip, and inserts/updates/deletes/children/grandchildren/append-only tables/queue coalescing all behave as documented. Includes the rule that the remembered past is a **copy**, so an in-place edit cannot make a save vanish without a word, and that every guarded numeric range is the range the schema declares, in both directions | no |
 | `npm run db:sync:defects` | Breaks `sync.ts` fourteen ways — the last two removing the boundary range guard and widening one of its bounds — and requires the self-test to fail each time | no |
@@ -769,7 +846,7 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:consultation:defects` | Breaks the clinical logic twenty-three ways across the five modules — gate, examination mapping, surgery list, seeding/folding and the vitals limits — and requires the self-test to fail each time | no |
 | `npm run typecheck:functions` | Type-checks `supabase/functions/staff-accounts/handler.ts`, which the root `tsconfig.json` does not reach — its `include` is `src` only, so both `tsc --noEmit` and `npm run build` report a clean tree while the one file holding the privileged key's only caller goes unchecked | no |
 | `npm run db:test` | All nine of the above | no |
-| `npm run db:apply` | Applies the schema in a transaction, then verifies RLS, grants, triggers, invoice math and seeds. Fails if a retired demo profile is still present, if a verification probe leaked a row, or if a live policy is not declared in `database/fatclinic.sql` (or vice versa) | yes |
+| `npm run db:apply` | Applies the schema in a transaction, then verifies RLS, grants, triggers, invoice math and seeds. Fails if a retired demo profile is still present, if a verification probe leaked a row, or if a live **policy or function** is not declared in `database/fatclinic.sql` (or vice versa) | yes |
 | `npm run db:find-region` | Finds which IPv4 pooler region the project is in, by handshaking | yes |
 | `npm run db:fix-connection` | The same, and writes the answer to `.env` | yes |
 | `npm run db:check-rls` | Proves the anon key is blocked by RLS over the public API, and that email self-signup is off | no (HTTP) |
@@ -781,12 +858,12 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:check-email` | Inserts a real staff row and proves the live database refuses a second one for the same address, including when only the case differs. The form's message is help; this is the guarantee | yes (service_role) |
 | `npm run db:probe-auth-admin` | Pins the Auth admin API shapes the function depends on (`PUT` is the only update verb, `?filter=` is ignored so an email lookup must page), then deletes the account it made | yes (service_role) |
 | `npm run db:check-profile-lookup` | Signs in for real as a throwaway clinician and runs the exact `select *` on `users` that sign-in depends on. A column-level grant change once made that query fail, and `fetchProfile` reported it as "Could not reach the sign-in service" — so this pins the query login cannot do without | yes (service_role) |
-| `npm run db:check-forgot-password` | The administrator-only reset link, end to end: the function answers a caller with **no session**, a clinician / a disabled admin / an admin with no sign-in account are all refused, an unknown address gets the byte-identical reply a clinician gets, the reply carries no profile id or auth UUID, a real administrator does get a link, the generated link comes back to the deployed app in the URL fragment the app parses, and every request is audited with no actor. Proves a link is *generated* — only the recipient can confirm it *arrives* | yes (service_role) |
-| `npm run db:check-forced-password-change` | The first sign-in after an administrator has issued a password, end to end: the function exists, takes no argument, runs as the definer with a pinned search_path, and only `authenticated` can execute it; a clinician can clear **their own** flag and the database records it; nobody else's row is touched; it cannot grant a role, deactivate an account, or reach a colleague; `anon` cannot call it; a clinician still **cannot** write `users` by any other route (asserted on purpose - it is why the function exists); and Supabase's "you already have that password" refusal is refused, recognised, and not sent to an administrator. This is the check for the lockout where the change *succeeded*, the screen stayed, and the retry was reported as a fault | yes (service_role) |
+| `npm run db:check-forgot-password` | The administrator-only reset link, end to end: the function answers a caller with **no session**, a clinician / a disabled admin / an admin with no sign-in account are all refused, an unknown address gets the byte-identical reply a clinician gets, the reply carries no profile id or auth UUID, a real administrator does get a link, the generated link comes back to the deployed app in the URL fragment the app parses, and every request is audited with no actor. It is also the check that notices a **probe account left behind** by any of the live scripts, matched on the prefix of the local part rather than the domain — the probes live on the clinic's own `@fatclinic.health` so they exercise the real uniqueness and rate-limit paths, so a domain match would also match every member of staff. Proves a link is *generated* — only the recipient can confirm it *arrives* | yes (service_role) |
+| `npm run db:check-forced-password-change` | The first sign-in after an administrator has issued a password, end to end: the function exists, takes no argument, runs as the definer with a pinned search_path, and only `authenticated` can execute it; a clinician can clear **their own** flag and the database records it; nobody else's row is touched; it cannot grant a role, deactivate an account, or reach a colleague; `anon` cannot call it; a clinician still **cannot** write `users` by any other route (asserted on purpose - it is why the function exists); and Supabase's "you already have that password" refusal is refused, recognised, and not sent to an administrator. This is the check for the lockout where the change *succeeded*, the screen stayed, and the retry was reported as a fault. Its throwaway account is confirmed gone by listing, because this is the script that hands a real role to a fake clinician and drives sign-in end to end | yes (service_role) |
 | `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, proves the **handler** (not the gateway - `verify_jwt` is off) refuses `create` without a session and to a forged token, and proves the same caller is still *answered* for `forgot` | no (HTTP) |
-| `npm run db:check-deployed` | Tests the function **Supabase is actually serving**, not the file on disk: a password containing the staff name is refused, an older rule is still refused, a good password really authenticates, a clinician is refused, and it deletes what it created | yes + a password |
+| `npm run db:check-deployed` | Tests the function **Supabase is actually serving**, not the file on disk: a password containing the staff name is refused, an older rule is still refused, a good password really authenticates, a clinician is refused, and it deletes what it created — then confirms the account is absent from a fresh listing rather than trusting the `200` | yes + a password |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
-| `npm run db:crud` | 62 checks against the live database, as a real signed-in clinician, through the real write path. Sweeps all 350 columns of all 24 tables for a blank value sent where the column could have taken NULL, then creates, edits and deletes the chain a doctor writes — patient, visit, vitals, consultation, both diagnoses, lab request with its test, prescription with its item — and reads every assertion back with SQL rather than with the app's own reader. It has a dedicated section for all six Patient's Info sections, because a whole tab failing to save is the bug this app actually had: each section is written and read back individually, an unfilled box must land as empty rather than missing, and a removed diagnosis must be gone from the server. It also holds the vitals ranges and the boundary range guard to the **deployed** constraints, in both directions. Everything it creates, including the throwaway account, it removes | yes (service_role) |
+| `npm run db:crud` | 62 checks against the live database, as a real signed-in clinician, through the real write path. Sweeps all 350 columns of all 24 tables for a blank value sent where the column could have taken NULL, then creates, edits and deletes the chain a doctor writes — patient, visit, vitals, consultation, both diagnoses, lab request with its test, prescription with its item — and reads every assertion back with SQL rather than with the app's own reader. It has a dedicated section for all six Patient's Info sections, because a whole tab failing to save is the bug this app actually had: each section is written and read back individually, an unfilled box must land as empty rather than missing, and a removed diagnosis must be gone from the server. It also holds the vitals ranges and the boundary range guard to the **deployed** constraints, in both directions. Everything it creates, including the throwaway account, it removes — and confirms the account is gone rather than trusting the `200`. `CRUD_AUDIT_DIE=now` makes it die on purpose to prove that too | yes (service_role) |
 | `npm run db:purge-test-audit` | Deletes `SEC-` audit rows the checks left behind. `--dry-run` first | yes |
 | `npm run db:verify` | The live gate, in one pass: lint, the sync self-test, RLS, the orphan account, the live API surface, the clinical CRUD audit, the Auth admin probe, the reset link, and the forced password change. Pair it with `npm run db:test`, which is the off-database gate and covers the consultation suites `db:verify` does not | yes (service_role) |
 | `npm run staff:list` | Every staff profile, and whether each one can actually sign in | yes (service_role) |

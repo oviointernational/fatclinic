@@ -121,6 +121,85 @@ async function bootstrap() {
 
   let checks = 0;
   let failures = 0;
+  /** The id of the throwaway auth account, once it exists. */
+  let throwawayId = null;
+  /** What happened to it, so a second call reports that rather than "nothing to do". */
+  let throwawayNote = null;
+
+  /**
+   * Delete the throwaway sign-in account, and confirm it is gone.
+   *
+   * A `200` from the admin endpoint is not proof: two runs reported success and
+   * the accounts were still there, which is the worst possible outcome for a
+   * cleanup - a false all-clear. So the only acceptable evidence is the account
+   * absent from a fresh listing, and the run fails if it is not.
+   *
+   * Returns a one-line outcome rather than printing it, so the fatal path below
+   * can write it synchronously: `process.exit` does not flush a piped stdout, and
+   * the line that says whether a credential is still live is the last thing that
+   * should be lost.
+   */
+  async function removeThrowaway() {
+    // Called more than once: the `finally` removes it, and the fatal handler runs
+    // afterwards. So a second call must report what the first one actually did.
+    // Saying "no throwaway account was created" here would be a lie in the one
+    // direction that matters - it would read as "no credential is at risk" on a
+    // run that had made one.
+    if (!throwawayId) return throwawayNote ?? 'no throwaway sign-in account was ever created';
+    // The id is cleared only once the account is *confirmed* gone. Clearing it
+    // first would mean a retry cannot retry: the fatal handler below calls this
+    // again, and finding nothing to do would report success for a credential that
+    // is still live. Every unhappy path therefore leaves the id in place.
+    const id = throwawayId;
+    let res;
+    try {
+      res = await fetch(`${BASE}/auth/v1/admin/users/${id}`, { method: 'DELETE', headers: ADMIN });
+    } catch (err) {
+      throwawayNote = `the throwaway account could not be reached to delete it (${err.message}); remove ${EMAIL} by hand`;
+      return throwawayNote;
+    }
+    if (!res.ok) {
+      throwawayNote = `the throwaway account refused deletion (${res.status} ${await res.text()}); remove ${EMAIL} by hand`;
+      return throwawayNote;
+    }
+    const still = ((await (await fetch(`${BASE}/auth/v1/admin/users?page=1&per_page=200`, { headers: ADMIN })).json()).users ?? [])
+      .some((u) => u.email === EMAIL);
+    // One complete line either way, because the teardown discards the return value
+    // and a bare "WARNING" with no sentence after it is the one thing that must not
+    // reach the person who has to clean this up by hand.
+    throwawayNote = still
+      ? `WARNING: the throwaway account ${EMAIL} SURVIVED deletion and must be removed by hand`
+      : 'removed the throwaway sign-in account, and confirmed it is gone';
+    if (still) failures++;
+    else throwawayId = null;
+    console.log(`      ${throwawayNote}`);
+    return throwawayNote;
+  }
+
+  // A `finally` is not reached when the process dies, and this one has died: the
+  // direct-Postgres connection to Supabase intermittently drops mid-run and
+  // surfaces as an unhandled 'error' event, which ends the process with the
+  // account still live. The row cleanup cannot be saved then - the client is gone -
+  // but the credential is deleted over HTTP, and a working sign-in for a fake
+  // clinician is the part that must not be left behind.
+  let alreadyHandled = false;
+  const onFatal = (what, err) => {
+    if (alreadyHandled) return;
+    alreadyHandled = true;
+    fs.writeSync(2, `\n  FATAL: ${what}\n${err?.stack ? `${err.stack}\n` : ''}`);
+    removeThrowaway().then(
+      (outcome) => {
+        fs.writeSync(2, `  ${outcome}\n`);
+        process.exit(1);
+      },
+      (e) => {
+        fs.writeSync(2, `  could not remove the throwaway account: ${e.message}\n  delete ${EMAIL} by hand\n`);
+        process.exit(1);
+      },
+    );
+  };
+  process.on('uncaughtException', (err) => onFatal('the run died on an uncaught error', err));
+  process.on('unhandledRejection', (err) => onFatal('the run died on an unhandled rejection', err));
 
   function check(name, ok, detail) {
     checks++;
@@ -520,9 +599,7 @@ async function bootstrap() {
     },
   ];
 
-  async function main() {
-    await sql.connect();
-
+  async function run() {
     // A throwaway clinician, so this proves the real thing: a row written with a
     // real clinician's JWT, through the real RLS policies, not with service_role
     // bypassing them.
@@ -542,6 +619,34 @@ async function bootstrap() {
       await sql.end();
       return;
     }
+    // Recorded the moment it exists, so every exit path can remove it. It used to
+    // be found by email in the teardown, which is only reached from the `finally`
+    // - and the two `return`s above sit before that `try`, so a run that created
+    // the account and then failed to sign in left a working credential behind.
+    // Two were found on 2026-09-28, which is how this was noticed.
+    throwawayId = (await created.json()).id;
+
+    // Fault injection, for the one path that cannot be reached any other way: the
+    // process dying with a live credential on the server. A `finally` cannot cover
+    // it, and that is exactly how the two `crudaudit-` accounts found on
+    // 2026-09-28 were left - the direct-Postgres connection dropped mid-run and
+    // surfaced as an unhandled 'error' event. Set CRUD_AUDIT_DIE=now to prove the
+    // handler above removes the account anyway, and CRUD_AUDIT_DIE=signin to
+    // prove the earlier exit path does the same.
+    //
+    // Read from `process.env`, not the `env` built from .env above: a switch that
+    // has to be written into the project's secrets file to be testable is a
+    // switch nobody tests.
+    const die = process.env.CRUD_AUDIT_DIE;
+    if (die === 'now') throw new Error('CRUD_AUDIT_DIE=now: fault injection, on purpose');
+    if (die === 'signin') {
+      console.error('  could not sign the throwaway account in (CRUD_AUDIT_DIE=signin)');
+      failures++;
+      await removeThrowaway();
+      await sql.end();
+      return;
+    }
+
     const grant = await (
       await fetch(`${BASE}/auth/v1/token?grant_type=password`, {
         method: 'POST',
@@ -552,6 +657,7 @@ async function bootstrap() {
     if (!grant.access_token) {
       console.error('  could not sign the throwaway account in');
       failures++;
+      await removeThrowaway();
       await sql.end();
       return;
     }
@@ -1020,14 +1126,7 @@ async function bootstrap() {
         if (r.rowCount) console.log(`      removed ${r.rowCount} ${table} row(s)`);
       }
       await sql.query(`delete from users where id = $1`, [PROFILE]);
-      const list = await (await fetch(`${BASE}/auth/v1/admin/users?page=1&per_page=200`, { headers: ADMIN })).json();
-      const mine = (list.users ?? []).find((u) => u.email === EMAIL);
-      if (mine) {
-        const d = await fetch(`${BASE}/auth/v1/admin/users/${mine.id}`, { method: 'DELETE', headers: ADMIN });
-        console.log(`      removed the throwaway sign-in account (${d.status})`);
-      } else {
-        console.log('      the throwaway sign-in account was already gone');
-      }
+      await removeThrowaway();
       const leftover = await sql.query(
         `select
            (select count(*)::int from patients where id like 'FC-A${stamp}') +
@@ -1043,13 +1142,43 @@ async function bootstrap() {
     }
 
     await sql.end();
+  }
 
+  /**
+   * The verdict, printed and set on every exit from `run`.
+   *
+   * It used to sit at the end of `run` itself, behind the code that runs the
+   * audit - so all three of its early exits, each of which does `failures++` and
+   * `return`, skipped it. A run that could not even create its throwaway
+   * clinician printed nothing and **exited 0**: the gate reported success
+   * because the audit had not run. A failure that reports success is worse than
+   * the failure, so the summary moved into a `finally` the early exits cannot
+   * step over.
+   */
+  function report() {
     console.log('');
-    if (failures) {
+    if (!checks) {
+      // Zero checks means the audit never got started - a refused connection, or
+      // an account it could not create. "All 0 checks behaved as expected" is the
+      // same false all-clear in a different costume, so it is called out first.
+      console.log(
+        `[clinical CRUD audit] the audit failed before any check could run${failures ? ` (${failures} problem(s))` : ''}`,
+      );
+      process.exitCode = 1;
+    } else if (failures) {
       console.log(`[clinical CRUD audit] ${failures} of ${checks} checks FAILED`);
       process.exitCode = 1;
     } else {
       console.log(`[clinical CRUD audit] all ${checks} checks behaved as expected`);
+    }
+  }
+
+  async function main() {
+    await sql.connect();
+    try {
+      await run();
+    } finally {
+      report();
     }
   }
 

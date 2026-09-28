@@ -1104,6 +1104,28 @@ BEGIN
     $body$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
   $fn$;
 
+  -- The signed-in staff member's Supabase Auth id, for the places that need the
+  -- auth account rather than the staff profile: matching a row in `auth.users`,
+  -- or an admin function keyed on the account. Same lookup as
+  -- app_current_staff_id(), one column over, so a deactivated profile and an
+  -- orphaned token resolve to NULL here exactly as they do there.
+  --
+  -- It was live in the database before it was written down here, which is how it
+  -- was found: `db:apply` compares the functions the file declares against the
+  -- functions the database has, and reported this one as live and undeclared. A
+  -- rebuild from this file would have lost it with nothing to notice. Nothing
+  -- calls it today - the app reads auth_user_id straight off its own profile row
+  -- - so it is here for completeness rather than because anything needs it.
+  EXECUTE $fn$
+    CREATE OR REPLACE FUNCTION public.app_own_account_id() RETURNS uuid AS $body$
+      SELECT u.auth_user_id
+        FROM public.users u
+       WHERE lower(u.email) = lower(auth.jwt() ->> 'email')
+         AND u.active
+       LIMIT 1;
+    $body$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+  $fn$;
+
   -- Clear the signed-in staff member's own must_change_password flag.
   --
   -- WHY THIS IS A FUNCTION AND NOT A POLICY

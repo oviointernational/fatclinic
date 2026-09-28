@@ -288,6 +288,64 @@ if (isSupabase) {
     problems.push(`${missing.length} declared policy(ies) are absent from the database: ${missing.join(', ')}`);
   }
   if (!undeclared.length && !missing.length) console.log('  policy drift      : none - schema and database agree');
+
+  // --- drift: functions the schema does not declare --------------------------
+  //
+  // The same argument as policies, and the same bug: `users_delete` was a live
+  // policy nobody had written down. `CREATE OR REPLACE FUNCTION` has the same
+  // one-way property - applying the file can change a function it declares and
+  // cannot remove one it does not - so a function added straight to the database
+  // outlives every future apply and a rebuild from this file silently loses it.
+  //
+  // There is one already: `app_own_account_id` is live, is called by nothing, and
+  // is in no file. Harmless today because nothing depends on it, which is exactly
+  // why it is worth naming now rather than the first time something does.
+  //
+  // Names only, never bodies. `pg_get_functiondef` reformats whitespace and
+  // casing, so comparing its output to the file text would report every function
+  // as drifted. "The file does not mention this one" is the claim that can
+  // actually be made honestly, and it is the one that matters.
+  //
+  // Platform functions are separated structurally rather than by name, so there is
+  // no list here to fall out of date: Supabase's own helpers are pinned to
+  // `pg_catalog`, while everything this file creates resolves in `public`. An
+  // exception is still printed, never swallowed.
+  const declaredFns = new Set(
+    [...schemaCode.matchAll(/CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)/gi)]
+      .map((m) => m[1].toLowerCase()),
+  );
+  const { rows: liveFns } = await client.query(`
+    SELECT p.proname AS name,
+           coalesce(array_to_string(p.proconfig, ','), '') AS config
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+     ORDER BY p.proname
+  `);
+  const platform = liveFns.filter((f) => /pg_catalog/.test(f.config));
+  const projectFns = liveFns.filter((f) => !/pg_catalog/.test(f.config));
+  const undeclaredFns = projectFns.filter((f) => !declaredFns.has(f.name.toLowerCase()));
+  const absentFns = [...declaredFns].filter((name) => !projectFns.some((f) => f.name.toLowerCase() === name));
+
+  console.log(`  declared functions: ${declaredFns.size}`);
+  console.log(`  live functions    : ${liveFns.length}`);
+  if (platform.length) console.log(`  platform functions: ${platform.map((f) => f.name).join(', ')} (not this project's)`);
+  if (undeclaredFns.length) {
+    console.log('  UNDECLARED FUNCTIONS (live but not in database/fatclinic.sql):');
+    for (const f of undeclaredFns) console.log(`    - ${f.name}`);
+    problems.push(
+      `${undeclaredFns.length} function(s) exist in the database but not in the schema: ` +
+        undeclaredFns.map((f) => f.name).join(', '),
+    );
+  }
+  if (absentFns.length) {
+    console.log('  MISSING FUNCTIONS (declared but not live):');
+    for (const name of absentFns) console.log(`    - ${name}`);
+    problems.push(`${absentFns.length} declared function(s) are absent from the database: ${absentFns.join(', ')}`);
+  }
+  if (!undeclaredFns.length && !absentFns.length) {
+    console.log('  function drift   : none - schema and database agree');
+  }
 } else {
   console.log('  RLS               : SKIPPED (no auth schema). This database must not be exposed.');
   problems.push('no auth schema: Row Level Security was not applied');

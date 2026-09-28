@@ -112,6 +112,49 @@ const cases = [
 ];
 
 // Control: the real file must pass.
+// --- functions a policy or trigger calls must be declared -------------------
+//
+// The file is meant to be the whole database. A policy calling a function it
+// never creates is a rebuild that dies on the policy, naming a function that is
+// nowhere in the schema someone would be reading to fix it.
+//
+// Every case here renames the *call site* and leaves the declaration alone, which
+// is the shape of the mistake: a function renamed on one side of the file only.
+// A whole-file rename would edit both sides, the check would correctly stay
+// silent, and the case would pass without testing anything.
+function pushFunctionCases(add) {
+  add({
+    name: 'schema-qualified policy call to an undeclared function',
+    must: /USING calls app_is_staff_v2\(\), which is not created by this file/,
+    mutate: (s) => s.replace(
+      "USING (public.app_is_staff())', t || '_select'",
+      () => "USING (public.app_is_staff_v2())', t || '_select'",
+    ),
+  });
+  add({
+    // The same mistake with the qualifier dropped at the call site. Worth its own
+    // case because the check has to drop the qualifier on *both* sides to compare
+    // them, and a check that only handled the qualified spelling would report
+    // nothing here - the call and the declaration would look like two different
+    // names, neither of which it could recognise.
+    name: 'bare policy call to an undeclared function',
+    must: /USING calls app_is_staff_v2\(\), which is not created by this file/,
+    mutate: (s) => s.replace(
+      "USING (public.app_is_staff())', t || '_select'",
+      () => "USING (app_is_staff_v2())', t || '_select'",
+    ),
+  });
+  add({
+    name: 'trigger executing an undeclared function',
+    must: /EXECUTE FUNCTION calls touch_updated_at_v2\(\), which is not created by this file/,
+    mutate: (s) => s.replace(
+      "FOR EACH ROW EXECUTE FUNCTION touch_updated_at()",
+      () => "FOR EACH ROW EXECUTE FUNCTION touch_updated_at_v2()",
+    ),
+  });
+}
+pushFunctionCases((c) => cases.push(c));
+
 const control = await runLint(path.join(ROOT, 'database', 'fatclinic.sql'));
 const controlOk = control.code === 0;
 console.log(`  control (unmodified file passes) : ${controlOk ? 'ok' : 'FAILED'}`);

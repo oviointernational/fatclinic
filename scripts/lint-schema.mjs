@@ -336,6 +336,62 @@ while ((m = viewStartRe.exec(sql))) {
   }
 }
 
+// --- functions the policies and triggers call must be declared ---------------
+
+// A policy that calls a function the file does not create is a rebuild that dies
+// on the policy, with the error naming a function that appears nowhere in the
+// schema anyone is reading. `database/fatclinic.sql` is meant to be the whole
+// database; the checks above already hold it to that for tables and for views,
+// and functions were the last hole in it.
+//
+// Only the two places a project function is called from policy/trigger wiring
+// are scanned - the `USING (...)` / `WITH CHECK (...)` predicates and
+// `EXECUTE FUNCTION`. That is deliberate rather than lazy: it is where a missing
+// function silently weakens access control on a rebuild, and it is the only part
+// of the file with no built-ins to confuse a name-based check, so no allow-list
+// of Postgres functions is needed to keep it honest. Calls *inside* a function
+// body are not scanned, because those need a built-in list to avoid false
+// alarms; that gap is caught elsewhere, by applying the file to an empty
+// database, which makes Postgres itself refuse the body.
+//
+// Both sides drop any `public.` qualifier. The file declares some functions
+// qualified and some not, and calls them qualified, so comparing the names as
+// written would report every policy call as missing.
+const declaredFunctions = new Set(
+  [...sql.matchAll(/CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)/gi)].map(
+    (m) => m[1].toLowerCase(),
+  ),
+);
+
+// The last segment before the parenthesis is the function's own name: for
+// `public.app_is_staff()` the leading `public` is the schema, not the function.
+// Capturing the first segment instead yields `public`, which is not in the
+// declared set, and every policy in the file would be reported as broken - a
+// loud false alarm rather than a silent miss, but still a linter nobody runs.
+const bareName = (qualified) => qualified.split('.').pop().toLowerCase();
+
+const calledFunctions = [];
+// One level of nesting, which is all `app_is_staff()` itself introduces.
+const predicateRe = /\b(USING|WITH\s+CHECK)\s*\(((?:[^()]|\([^()]*\))*)\)/gi;
+let p;
+while ((p = predicateRe.exec(sql))) {
+  for (const c of p[2].matchAll(/([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\(/g)) {
+    calledFunctions.push({ name: bareName(c[1]), line: lineAt(p.index), where: p[1] });
+  }
+}
+const executeRe = /EXECUTE\s+(?:FUNCTION|PROCEDURE)\s+([A-Za-z_][A-Za-z0-9_.]*)/gi;
+while ((p = executeRe.exec(sql))) {
+  calledFunctions.push({ name: bareName(p[1]), line: lineAt(p.index), where: 'EXECUTE FUNCTION' });
+}
+
+for (const c of calledFunctions) {
+  if (declaredFunctions.has(c.name)) continue;
+  errors.push(`line ${c.line}: ${c.where} calls ${c.name}(), which is not created by this file`);
+}
+notes.push(
+  `functions declared: ${declaredFunctions.size}; calls from policies and triggers: ${calledFunctions.length}`,
+);
+
 // --- sensitive data ---------------------------------------------------------
 
 if (/\bpassword_hash\b|\bpassword_digest\b/i.test(raw)) {
@@ -353,6 +409,7 @@ for (const t of ['users']) {
 console.log(`\n[db:lint] ${LABEL}`);
 console.log(`  tables declared : ${tables.size}`);
 console.log(`  views declared  : ${views.size}`);
+console.log(`  functions       : ${declaredFunctions.size}`);
 console.log(`  seed inserts    : ${seeded}`);
 console.log(`  size            : ${raw.split('\n').length} lines\n`);
 
