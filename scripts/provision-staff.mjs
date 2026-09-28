@@ -117,7 +117,7 @@ const usage = () =>
     .replace(/^ \* ?/gm, '')
     .trimEnd();
 
-if (args.help || (!args.link && !args.email && !args.list)) {
+if (args.help || (!args.link && !args.email && !args.list && !args.disable)) {
   say(usage());
   if (!args.help) say('\nRun with --help for the full reference.\n');
   bail(args.help ? 0 : 1);

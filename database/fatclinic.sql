@@ -1273,6 +1273,205 @@ BEGIN
   COMMENT ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) IS
     'Updates a clinician''s own name, department, avatar and device PIN. No id is accepted - the row is the caller''s profile resolved from the JWT, so it cannot reach another person. role, active, email and auth_user_id are not settable through it. NULL leaves a column unchanged; an empty name or malformed PIN is refused. Returns TRUE when a row was updated.';
 
+  -- Public self-booking: a visitor's appointment request, submitted with no
+  -- session and no sign-in.
+  --
+  -- WHY THIS IS A FUNCTION AND NOT A POLICY
+  -- ----------------------------------------
+  -- Every table in this database - online_bookings included - has FORCE ROW
+  -- LEVEL SECURITY, and the anon role holds no grants on any table at all
+  -- (REVOKE ALL ... FROM anon, plus matching default privileges). An RLS INSERT
+  -- policy on online_bookings could fix the grants but not the inputs: a policy
+  -- cannot limit VALUES, so a visitor could insert a row with any id,
+  -- patient_code or status, and a policy granted to anon would be a standing
+  -- hole wider than the form. A SECURITY DEFINER function is the narrowest
+  -- thing that works: it accepts exactly the twelve fields a visitor can
+  -- truthfully type, validates each inside the database, builds the row itself
+  -- (a fresh id, a fresh REG-#### patient code, status pinned to
+  -- 'Pending Arrival') and returns only the row it just created. It never reads
+  -- anything else in the schema, so a caller who can reach it gets one
+  -- controlled insert and nothing more.
+  --
+  -- This is the single deliberate exception to "anon cannot call a function".
+  -- It is granted to anon EXPLICITLY - never through PUBLIC, which stays
+  -- revoked - so a future regrant to PUBLIC cannot silently widen anon's reach
+  -- over the other functions in this schema.
+  EXECUTE $fn$
+    CREATE OR REPLACE FUNCTION public.app_submit_online_booking(
+      p_first_name      TEXT,
+      p_middle_name     TEXT,
+      p_last_name       TEXT,
+      p_dob             DATE,
+      p_age             INTEGER,
+      p_sex             TEXT,
+      p_phone           TEXT,
+      p_email           TEXT,
+      p_address         TEXT,
+      p_reason          TEXT,
+      p_preferred_date  DATE,
+      p_preferred_time  TEXT
+    ) RETURNS TABLE (
+      id TEXT,
+      patient_code TEXT,
+      first_name TEXT,
+      middle_name TEXT,
+      last_name TEXT,
+      dob DATE,
+      age INTEGER,
+      sex TEXT,
+      phone TEXT,
+      email TEXT,
+      address TEXT,
+      reason_for_appointment TEXT,
+      preferred_date DATE,
+      preferred_time TEXT,
+      booked_at TIMESTAMPTZ,
+      status TEXT
+    ) AS $body$
+    DECLARE
+      v_code    TEXT;
+      v_age     INTEGER;
+      v_attempt INTEGER := 0;
+    BEGIN
+      -- Required free text. NULL, blank or overlong is refused outright: the
+      -- form is a convenience, the database is the gate.
+      IF p_first_name IS NULL OR length(trim(p_first_name)) = 0 OR length(p_first_name) > 80 THEN
+        RAISE EXCEPTION 'first name is required (max 80 characters)';
+      END IF;
+      IF p_last_name IS NULL OR length(trim(p_last_name)) = 0 OR length(p_last_name) > 80 THEN
+        RAISE EXCEPTION 'last name is required (max 80 characters)';
+      END IF;
+      IF p_middle_name IS NOT NULL AND length(p_middle_name) > 80 THEN
+        RAISE EXCEPTION 'middle name is too long (max 80 characters)';
+      END IF;
+      IF p_phone IS NULL OR length(trim(p_phone)) = 0 OR length(p_phone) > 30
+         OR p_phone !~ '^[0-9+()\-\. ]+$' THEN
+        RAISE EXCEPTION 'phone number must be 7-30 characters, e.g. +234 800 000 0000';
+      END IF;
+      IF p_reason IS NULL OR length(trim(p_reason)) = 0 OR length(p_reason) > 500 THEN
+        RAISE EXCEPTION 'reason for appointment is required (max 500 characters)';
+      END IF;
+      IF p_address IS NOT NULL AND length(p_address) > 500 THEN
+        RAISE EXCEPTION 'address is too long (max 500 characters)';
+      END IF;
+      IF p_email IS NOT NULL
+         AND length(trim(p_email)) > 0
+         AND (length(p_email) > 200 OR p_email !~ '^[^@\s]+@[^@\s]+\.[^@\s]+$') THEN
+        RAISE EXCEPTION 'email address does not look valid';
+      END IF;
+
+      -- Date of birth: required, in the past, and recent enough that the derived
+      -- age stays inside the table's own CHECK (0-130).
+      IF p_dob IS NULL OR p_dob > CURRENT_DATE THEN
+        RAISE EXCEPTION 'date of birth must be a past date';
+      END IF;
+      IF p_dob < '1900-01-01' THEN
+        RAISE EXCEPTION 'date of birth is too far in the past';
+      END IF;
+
+      -- Age is always derived from the date of birth, and the derived value is
+      -- the one that is stored: the caller's age is a display convenience and is
+      -- never trusted, so a visitor whose form says "still 30" in December gets
+      -- the correct 31. A nonsensical age argument is still refused, so a broken
+      -- client cannot submit garbage.
+      v_age := date_part('year', age(p_dob))::INTEGER;
+      IF v_age > 130 THEN
+        RAISE EXCEPTION 'age is out of range';
+      END IF;
+      IF p_age IS NOT NULL AND (p_age < 0 OR p_age > 130) THEN
+        RAISE EXCEPTION 'age must be between 0 and 130';
+      END IF;
+
+      IF p_sex IS NULL OR p_sex NOT IN ('Male', 'Female', 'Other') THEN
+        RAISE EXCEPTION 'sex must be Male, Female or Other';
+      END IF;
+
+      -- Preferred visit: today or later, at most two years out, 24-hour HH:MM.
+      IF p_preferred_date IS NULL OR p_preferred_date < CURRENT_DATE THEN
+        RAISE EXCEPTION 'preferred date must be today or later';
+      END IF;
+      IF p_preferred_date > CURRENT_DATE + 730 THEN
+        RAISE EXCEPTION 'preferred date cannot be more than two years away';
+      END IF;
+      IF p_preferred_time IS NULL OR p_preferred_time !~ '^([01][0-9]|2[0-3]):[0-5][0-9]$' THEN
+        RAISE EXCEPTION 'preferred time must be 24-hour HH:MM';
+      END IF;
+
+      -- A double-tap on the form must not create two requests for the same
+      -- phone on the same day while one is still pending.
+      IF EXISTS (
+        SELECT 1 FROM public.online_bookings ob
+         WHERE ob.phone = trim(p_phone)
+           AND ob.preferred_date = p_preferred_date
+           AND ob.status = 'Pending Arrival'
+      ) THEN
+        RAISE EXCEPTION 'that phone number already has a pending appointment on this date';
+      END IF;
+
+      -- The RETURNS TABLE output parameters (id, patient_code, phone, ...)
+      -- deliberately share names with the columns they return, so every column
+      -- referenced in this body is alias-qualified (ob.) and every value is a
+      -- v_/p_-prefixed variable. No bare column name ever appears, which is
+      -- what keeps PL/pgSQL from reporting a reference as ambiguous. (The
+      -- GUC-based alternative, plpgsql.variable_conflict = use_column, cannot
+      -- be used here: this host denies non-superusers permission to set it,
+      -- and a function attribute fails the apply for the same reason.)
+      LOOP
+        v_code := 'REG-' || lpad((floor(random() * 9000 + 1000))::INTEGER::TEXT, 4, '0');
+        v_attempt := v_attempt + 1;
+        BEGIN
+          -- id and patient_code are both unique, so a code collision with a
+          -- concurrent booking makes this INSERT raise unique_violation and the
+          -- exception block re-rolls instead of failing. The constraints are
+          -- the arbiter, not this loop.
+          INSERT INTO public.online_bookings (
+            id, patient_code, first_name, middle_name, last_name, dob, age, sex,
+            phone, email, address, reason_for_appointment, preferred_date,
+            preferred_time, status
+          ) VALUES (
+            'OB-' || to_char(clock_timestamp(), 'YYYYMMDDHH24MISS') || '-' || substring(md5(random()::TEXT) FROM 1 FOR 6),
+            v_code,
+            trim(p_first_name),
+            NULLIF(trim(p_middle_name), ''),
+            trim(p_last_name),
+            p_dob, v_age, p_sex,
+            trim(p_phone),
+            NULLIF(trim(p_email), ''),
+            COALESCE(trim(p_address), ''),
+            trim(p_reason),
+            p_preferred_date, p_preferred_time,
+            'Pending Arrival'
+          );
+          EXIT; -- the row is in; leave the re-roll loop
+        EXCEPTION
+          WHEN unique_violation THEN
+            IF v_attempt >= 5 THEN
+              RAISE EXCEPTION 'could not allocate a unique patient code - please try again';
+            END IF;
+            -- Otherwise fall through and re-roll the code.
+        END;
+      END LOOP;
+
+      -- Read the row back into the output parameters that become the response.
+      -- The alias-qualified SELECT list writes the columns to a row of output.
+      SELECT ob.id, ob.patient_code, ob.first_name, ob.middle_name, ob.last_name,
+             ob.dob, ob.age, ob.sex, ob.phone, ob.email, ob.address,
+             ob.reason_for_appointment, ob.preferred_date, ob.preferred_time,
+             ob.booked_at, ob.status
+        INTO id, patient_code, first_name, middle_name, last_name, dob, age, sex,
+             phone, email, address, reason_for_appointment, preferred_date,
+             preferred_time, booked_at, status
+        FROM public.online_bookings ob
+       WHERE ob.patient_code = v_code;
+
+      RETURN NEXT;
+      RETURN;
+    END $body$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = public
+  $fn$;
+
+  COMMENT ON FUNCTION public.app_submit_online_booking(TEXT, TEXT, TEXT, DATE, INTEGER, TEXT, TEXT, TEXT, TEXT, TEXT, DATE, TEXT) IS
+    'Public self-booking for the landing page: stores one appointment request as a Pending Arrival row with a fresh REG-#### code and returns the row it created. Accepts only the twelve fields a visitor can type, validates each in the database, derives the stored age from the date of birth (the client age is never trusted), and refuses a second booking for the same phone on the same pending date. anon may call this one function and nothing else in the schema: it can INSERT a booking row only through it and has no table or read access.';
+
   FOREACH t IN ARRAY staff_tables LOOP
     IF to_regclass('public.' || quote_ident(t)) IS NULL THEN CONTINUE; END IF;
     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
@@ -1329,6 +1528,7 @@ BEGIN
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_current_staff_id() FROM PUBLIC';
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_clear_own_must_change_password() FROM PUBLIC';
   EXECUTE 'REVOKE ALL ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) FROM PUBLIC';
+  EXECUTE 'REVOKE ALL ON FUNCTION public.app_submit_online_booking(TEXT, TEXT, TEXT, DATE, INTEGER, TEXT, TEXT, TEXT, TEXT, TEXT, DATE, TEXT) FROM PUBLIC';
   -- A revoke from PUBLIC is not enough on its own. PostgREST has to be able to
   -- reach RPCs as the anon role, so this database also carries a
   -- default-privileges entry giving that role EXECUTE on functions in this
@@ -1344,6 +1544,13 @@ BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
     EXECUTE 'REVOKE ALL ON FUNCTION public.app_clear_own_must_change_password() FROM anon';
     EXECUTE 'REVOKE ALL ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) FROM anon';
+    EXECUTE 'REVOKE ALL ON FUNCTION public.app_submit_online_booking(TEXT, TEXT, TEXT, DATE, INTEGER, TEXT, TEXT, TEXT, TEXT, TEXT, DATE, TEXT) FROM anon';
+    -- The ONE function a sessionless visitor is allowed to reach: it writes
+    -- exactly one controlled booking row and reads nothing else in the schema.
+    -- It is granted to anon by name (the comment above the block explains why
+    -- the explicit grant, not the revoked-from-PUBLIC state, is what gives a
+    -- named role the permission). Every other function stays cut off.
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_submit_online_booking(TEXT, TEXT, TEXT, DATE, INTEGER, TEXT, TEXT, TEXT, TEXT, TEXT, DATE, TEXT) TO anon';
   END IF;
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_is_admin() TO authenticated';
@@ -1351,6 +1558,7 @@ BEGIN
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_clear_own_must_change_password() TO authenticated';
   EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) TO authenticated';
+  EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_submit_online_booking(TEXT, TEXT, TEXT, DATE, INTEGER, TEXT, TEXT, TEXT, TEXT, TEXT, DATE, TEXT) TO authenticated';
 
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_user_role() TO service_role';
@@ -1359,6 +1567,7 @@ BEGIN
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_current_staff_id() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_clear_own_must_change_password() TO service_role';
     EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) TO service_role';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.app_submit_online_booking(TEXT, TEXT, TEXT, DATE, INTEGER, TEXT, TEXT, TEXT, TEXT, TEXT, DATE, TEXT) TO service_role';
   END IF;
 
   ALTER DEFAULT PRIVILEGES IN SCHEMA public

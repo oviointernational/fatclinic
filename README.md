@@ -107,6 +107,34 @@ server, no API to deploy, and no proxy — `src/services/supabase.ts` creates th
 client and `src/services/sync.ts` reconciles localStorage against Postgres.
 `wrangler deploy` publishes static files only.
 
+### Two faces of one app: the public site and the workstation
+
+The app has two audiences and two routes, split in `src/Root.tsx` by a hand-rolled
+router (`src/router.ts` — no react-router dependency):
+
+- **`/` is the public landing page** (`src/components/landing/LandingPage.tsx`):
+  who the clinic is, what it does, how booking works, and contact details. No
+  staff chrome, no patient data, nothing that requires a session.
+- **`/staff` is the workstation** — the sign-in gate, then the dashboard. The
+  `wrangler.jsonc` SPA fallback sends every other path there, so a deep link or a
+  bookmark onto an old route still lands in the app.
+
+A password-reset link lives in the URL **fragment** (`#access_token=…`) so it is
+never sent to a server or logged. It arrives at the root path, so `Root` renders
+the workstation whenever `hasResetLink()` is true **at any path** — otherwise a
+reset email would open the public page and the link would silently die. A
+signed-in staff member visiting `/` is redirected to `/staff` instead of being
+shown the visitor page.
+
+Visitors book without ever holding a session: the landing page's booking modal
+(`OnlineBookingModal` with a pluggable `submit` prop) calls the anon-callable RPC
+`app_submit_online_booking`, which validates the payload in the database, derives
+the age from the date of birth (a client-supplied age is never trusted), issues
+the `REG-####` patient code, and refuses a duplicate phone on the same pending
+date. The visitor's row lands in `online_bookings` with status `Pending Arrival`
+and surfaces in the front desk's Online Bookings lookup exactly like one created
+on a workstation — same table, same sync, same check-in flow.
+
 Sign-in is `supabase.auth.signInWithPassword` (`src/services/auth.ts`). A valid
 session is not on its own enough: the app also requires an `active` row in
 `public.users` and destroys the session when there is not one, and RLS resolves
@@ -847,6 +875,7 @@ Two things that make this easier to get wrong than they look:
 | `npm run typecheck:functions` | Type-checks `supabase/functions/staff-accounts/handler.ts`, which the root `tsconfig.json` does not reach — its `include` is `src` only, so both `tsc --noEmit` and `npm run build` report a clean tree while the one file holding the privileged key's only caller goes unchecked | no |
 | `npm run db:test` | All nine of the above | no |
 | `npm run db:apply` | Applies the schema in a transaction, then verifies RLS, grants, triggers, invoice math and seeds. Fails if a retired demo profile is still present, if a verification probe leaked a row, or if a live **policy or function** is not declared in `database/fatclinic.sql` (or vice versa) | yes |
+| `npm run db:reload-schema` | Reloads the PostgREST schema cache after a schema change, so the API answers the definitions `db:apply` just created rather than a stale copy | yes |
 | `npm run db:find-region` | Finds which IPv4 pooler region the project is in, by handshaking | yes |
 | `npm run db:fix-connection` | The same, and writes the answer to `.env` | yes |
 | `npm run db:check-rls` | Proves the anon key is blocked by RLS over the public API, and that email self-signup is off | no (HTTP) |
@@ -863,9 +892,10 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, proves the **handler** (not the gateway - `verify_jwt` is off) refuses `create` without a session and to a forged token, and proves the same caller is still *answered* for `forgot` | no (HTTP) |
 | `npm run db:check-deployed` | Tests the function **Supabase is actually serving**, not the file on disk: a password containing the staff name is refused, an older rule is still refused, a good password really authenticates, a clinician is refused, and it deletes what it created — then confirms the account is absent from a fresh listing rather than trusting the `200` | yes + a password |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
+| `npm run db:check-public-booking` | The landing page's booking path, end to end, as a caller with **no session**: the anon role has EXECUTE only by name and cannot read the table or touch another function; a happy-path booking returns a `REG-####` code and really lands in `online_bookings`; a client that lies about its age is stored with the age the database derives from the date of birth; nine malformed payloads are refused, a duplicate phone on the same pending date is refused, and every probe row is swept and confirmed gone | no (HTTP) |
 | `npm run db:crud` | 62 checks against the live database, as a real signed-in clinician, through the real write path. Sweeps all 350 columns of all 24 tables for a blank value sent where the column could have taken NULL, then creates, edits and deletes the chain a doctor writes — patient, visit, vitals, consultation, both diagnoses, lab request with its test, prescription with its item — and reads every assertion back with SQL rather than with the app's own reader. It has a dedicated section for all six Patient's Info sections, because a whole tab failing to save is the bug this app actually had: each section is written and read back individually, an unfilled box must land as empty rather than missing, and a removed diagnosis must be gone from the server. It also holds the vitals ranges and the boundary range guard to the **deployed** constraints, in both directions. Everything it creates, including the throwaway account, it removes — and confirms the account is gone rather than trusting the `200`. `CRUD_AUDIT_DIE=now` makes it die on purpose to prove that too | yes (service_role) |
 | `npm run db:purge-test-audit` | Deletes `SEC-` audit rows the checks left behind. `--dry-run` first | yes |
-| `npm run db:verify` | The live gate, in one pass: lint, the sync self-test, RLS, the orphan account, the live API surface, the clinical CRUD audit, the Auth admin probe, the reset link, and the forced password change. Pair it with `npm run db:test`, which is the off-database gate and covers the consultation suites `db:verify` does not | yes (service_role) |
+| `npm run db:verify` | The live gate, in one pass: lint, the sync self-test, RLS, the orphan account, the live API surface, the **public booking surface**, the clinical CRUD audit, the Auth admin probe, the reset link, and the forced password change. Pair it with `npm run db:test`, which is the off-database gate and covers the consultation suites `db:verify` does not | yes (service_role) |
 | `npm run staff:list` | Every staff profile, and whether each one can actually sign in | yes (service_role) |
 | `npm run staff:add` | Create a staff sign-in account, or reset one with `--link` | yes (service_role) |
 | `npm run staff:clean-demo` | Deletes the nine demo profiles a previous schema version seeded. `--dry-run` first | yes (service_role) |

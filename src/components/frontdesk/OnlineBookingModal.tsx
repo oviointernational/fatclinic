@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { db } from '../../services/db';
 import { OnlineBooking } from '../../types';
+import { BookingDraft, SubmitBookingResult } from '../../services/publicBooking';
 import { 
   X, 
   Calendar, 
@@ -20,12 +21,23 @@ interface OnlineBookingModalProps {
   isOpen: boolean;
   onClose: () => void;
   onBookingCreated?: (booking: OnlineBooking) => void;
+  /**
+   * When provided, the form submits through this async callback (the public
+   * RPC path on the landing page) instead of db.createOnlineBooking. The
+   * callback owns its error/success contract: only a `{ ok: false, message }`
+   * result is shown inline.
+   */
+  submit?: (draft: BookingDraft) => Promise<SubmitBookingResult>;
+  /** Optional visitor-facing copy; defaults to the front-desk wording. */
+  title?: { heading: string; subheading: string };
 }
 
 export const OnlineBookingModal: React.FC<OnlineBookingModalProps> = ({
   isOpen,
   onClose,
-  onBookingCreated
+  onBookingCreated,
+  submit,
+  title
 }) => {
   const [firstName, setFirstName] = useState('');
   const [middleName, setMiddleName] = useState('');
@@ -42,33 +54,56 @@ export const OnlineBookingModal: React.FC<OnlineBookingModalProps> = ({
 
   const [confirmedBooking, setConfirmedBooking] = useState<OnlineBooking | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   if (!isOpen) return null;
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!firstName.trim() || !lastName.trim() || !phone.trim() || !reason.trim()) {
-      alert('Please fill in all required fields (First Name, Last Name, Phone Number, and Reason for Appointment).');
+      setFormError('Please fill in all required fields (First Name, Last Name, Phone Number, and Reason for Appointment).');
       return;
     }
+    setFormError(null);
+    setIsSubmitting(true);
+    try {
+      const draft: BookingDraft = {
+        firstName: firstName.trim(),
+        middleName: middleName.trim() || undefined,
+        lastName: lastName.trim(),
+        dob,
+        age: Number(age) || 30,
+        sex,
+        phone: phone.trim(),
+        email: email.trim() || undefined,
+        address: address.trim() || 'Not specified',
+        reason: reason.trim(),
+        preferredDate,
+        preferredTime
+      };
 
-    const created = db.createOnlineBooking({
-      firstName: firstName.trim(),
-      middleName: middleName.trim() || undefined,
-      lastName: lastName.trim(),
-      dob,
-      age: Number(age) || 30,
-      sex,
-      phone: phone.trim(),
-      email: email.trim() || undefined,
-      address: address.trim() || 'Not specified',
-      reasonForAppointment: reason.trim(),
-      preferredDate,
-      preferredTime
-    });
-
-    setConfirmedBooking(created);
-    if (onBookingCreated) onBookingCreated(created);
+      if (submit) {
+        // Public path: the RPC validates and stores on the server. A refused
+        // submission (duplicate phone+date, bad input) is shown inline, never
+        // as a browser alert.
+        const result = await submit(draft);
+        if (!result.ok) {
+          setFormError(result.message);
+          return;
+        }
+        setConfirmedBooking(result.booking);
+      } else {
+        const created = db.createOnlineBooking({
+          ...draft,
+          reasonForAppointment: draft.reason
+        });
+        setConfirmedBooking(created);
+        if (onBookingCreated) onBookingCreated(created);
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const handleCopyCode = () => {
@@ -103,10 +138,10 @@ export const OnlineBookingModal: React.FC<OnlineBookingModalProps> = ({
             </div>
             <div>
               <h3 className="text-base font-extrabold text-slate-900 dark:text-white">
-                Book Patient Appointment & Self Pre-Registration
+                {title?.heading ?? 'Book Patient Appointment & Self Pre-Registration'}
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Register yourself online. Receive your Patient Code for rapid check-in at Front Desk.
+                {title?.subheading ?? 'Register yourself online. Receive your Patient Code for rapid check-in at Front Desk.'}
               </p>
             </div>
           </div>
@@ -337,6 +372,12 @@ export const OnlineBookingModal: React.FC<OnlineBookingModalProps> = ({
                 />
               </div>
 
+              {formError && (
+                <div className="text-xs font-semibold text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-xl px-3 py-2 animate-in fade-in duration-150">
+                  {formError}
+                </div>
+              )}
+
               <div className="flex items-center justify-end space-x-3 pt-3 border-t border-light-border dark:border-dark-border">
                 <button
                   type="button"
@@ -347,10 +388,20 @@ export const OnlineBookingModal: React.FC<OnlineBookingModalProps> = ({
                 </button>
                 <button
                   type="submit"
-                  className="flex items-center space-x-2 px-6 py-2.5 rounded-xl text-xs font-extrabold bg-emerald-600 hover:bg-emerald-700 text-white shadow-md transition-all"
+                  disabled={isSubmitting}
+                  className="flex items-center space-x-2 px-6 py-2.5 rounded-xl text-xs font-extrabold bg-emerald-600 hover:bg-emerald-700 text-white shadow-md transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                 >
-                  <span>Submit & Get Patient Code</span>
-                  <ArrowRight className="w-4 h-4" />
+                  {isSubmitting ? (
+                    <>
+                      <span>Booking…</span>
+                      <span className="w-3 h-3 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+                    </>
+                  ) : (
+                    <>
+                      <span>Submit & Get Patient Code</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </>
+                  )}
                 </button>
               </div>
             </form>
