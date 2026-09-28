@@ -68,6 +68,7 @@ const {
   recordPersisted,
   persistedBefore,
   forgetPersisted,
+  COLUMN_RANGES,
 } = await import('../src/services/sync.ts');
 
 // ---------------------------------------------------------------------------
@@ -1408,6 +1409,150 @@ await block('a collection that was never persisted has no past', async () => {
   check('but recording and reading back the same key works', persistedBefore(KEY)?.[0]?.id === 'x');
   check('and it is a copy, so the caller\'s object is not what comes back', persistedBefore(KEY) !== arr);
   forgetPersisted(KEY);
+});
+
+await block('a number the column\'s own CHECK would reject is refused here, by name', async () => {
+  // `quantity > 0` and `price >= 0` are declared on invoice lines, prescription
+  // items, payments and stock requests. An insert is one request, so a single
+  // zero voided the whole row while the screen reported success - the same
+  // mechanism as the NaN refusal above, one step further out. The form that
+  // collects these figures does not range-check them, so this is the only guard.
+  const patients = TABLE_BY_KEY.get('fatclinic_patients');
+  const invoices = TABLE_BY_KEY.get('fatclinic_invoices');
+  const patientOf = (age) => ({ ...patients.rowToModel(rowWithoutForeignKeys('patients')), id: 'P-90', age });
+  const invoiceOf = (quantity, unitPrice = 1000) => {
+    const invoice = invoices.rowToModel(rowWithoutForeignKeys('invoices'));
+    invoice.id = 'INV-90';
+    invoice.visitId = 'V-90';
+    invoice.patientId = 'P-90';
+    invoice.items = [
+      { id: 'IT-90', serviceCategory: 'Laboratory', description: 'PCV', quantity, unitPrice, totalPrice: unitPrice * quantity },
+    ];
+    return invoice;
+  };
+  /** Refuses at the first network call, so a refusal cannot be an aborted send. */
+  const noRequests = { from: () => { throw new Error('the request must never be built'); } };
+  const refuse = async (fn) => { try { await fn(); return null; } catch (err) { return err.message; } };
+
+  const tooOld = await refuse(() => pushDiff(patients, [], [patientOf(131)], noRequests));
+  check('a figure past the column\'s range is refused before the request is built', !!tooOld && /patients\.age/.test(tooOld), tooOld ?? 'no error was raised');
+  check('the refusal states the range the column accepts', !!tooOld && /\b0 to 130\b/.test(tooOld), tooOld ?? 'no error was raised');
+  const negative = await refuse(() => pushDiff(patients, [], [patientOf(-1)], noRequests));
+  check('and the same for the other end of it', !!negative && /patients\.age/.test(negative), negative ?? 'no error was raised');
+
+  // A child is written after its parent, so the parent has to be allowed through
+  // for the line to be reached. Refusing every table here would prove nothing
+  // about the child: the parent upsert would fail first, for the wrong reason.
+  const beforeChild = {
+    from: (table) => {
+      if (table === 'invoice_items') throw new Error('the request must never be built');
+      const ok = async () => ({ data: null, error: null });
+      return { upsert: ok, delete: ok, select: ok };
+    },
+  };
+  const noQuantity = await refuse(() => pushDiff(invoices, [], [invoiceOf(0)], beforeChild));
+  check('a zero-quantity line refuses the invoice it belongs to', !!noQuantity && /invoice_items\.quantity/.test(noQuantity), noQuantity ?? 'no error was raised');
+  check('and says what the column accepts', !!noQuantity && /greater than 0/.test(noQuantity), noQuantity ?? 'no error was raised');
+
+  // The bound is quoted the way the constraint states it, and a one-sided range
+  // has to say so. Printing both fields unconditionally produces "0 to undefined"
+  // for every `price >= 0` in the schema, which reads as a broken app rather than
+  // as a wrong figure - the one thing the message must not do.
+  const negativePrice = await refuse(() => pushDiff(invoices, [], [invoiceOf(1, -50)], beforeChild));
+  check(
+    'a one-sided range is quoted as one-sided, not as "0 to undefined"',
+    !!negativePrice && /invoice_items\.unit_price is -50, and that column accepts 0 or more/.test(negativePrice),
+    negativePrice ?? 'no error was raised',
+  );
+  check('and never names a bound the schema does not have', !/undefined/.test(negativePrice ?? ''), negativePrice ?? 'no error was raised');
+
+  // The other direction: a figure at the boundary is legitimate and must go
+  // through, or the guard is refusing a patient rather than a mistake.
+  const server = fakeServer();
+  await pushDiff(patients, [], [patientOf(0)], server.client);
+  await pushDiff(patients, [], [patientOf(130)], server.client);
+  check('a figure at each end of the range is written', server.find('patients', 'P-90')?.age === 130, server.find('patients', 'P-90')?.age);
+  await seedVisit(server, 'V-90', 'P-90');
+  await pushDiff(invoices, [], [invoiceOf(1)], server.client);
+  check('and a line at the lowest allowed quantity is written', server.count('invoice_items') === 1, server.count('invoice_items'));
+});
+
+await block('every guarded range is a range the schema states', async () => {
+  // The boundary guard and the schema are two transcriptions of the same CHECK
+  // constraints, which is exactly the setup where a quiet drift hides: a bound
+  // widened here stops the database refusing a row, and a bound narrowed here
+  // starts refusing a legitimate one, with the schema able to prove neither.
+  const numericChecks = new Map(); // 'table.column' -> { min?, max?, positiveOnly? }
+  let tablesRead = 0;
+  for (const match of sql.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)\s*\(([\s\S]*?)\n\);/g)) {
+    const [, table, body] = match;
+    tablesRead++;
+    for (const line of splitTopLevel(stripLineComments(body))) {
+      // Table-level constraints, and the `IN (...)` picklists the forms feed from
+      // a <select> - both are constrained by something other than a number typed.
+      if (/^CONSTRAINT\b/i.test(line)) continue;
+      const between = line.match(/^(\w+)\s+.*?\bCHECK\s*\(\s*\w+\s+BETWEEN\s+(\S+)\s+AND\s+(\S+)\s*\)\s*$/i);
+      if (between) {
+        numericChecks.set(`${table}.${between[1]}`, { min: Number(between[2]), max: Number(between[3]) });
+        continue;
+      }
+      const bound = line.match(/^(\w+)\s+.*?\bCHECK\s*\(\s*\w+\s*(>=|>)\s*(\S+?)\s*\)\s*$/i);
+      if (bound) {
+        numericChecks.set(
+          `${table}.${bound[1]}`,
+          bound[2] === '>' ? { positiveOnly: true } : { min: Number(bound[3]) },
+        );
+      }
+    }
+  }
+  // A canary against a silently-empty extractor, which would otherwise make every
+  // check below pass for the wrong reason. The count is deliberately not pinned to
+  // a number: a CHECK added to the schema is meant to fail the completeness check
+  // with a message that names the column, not a total that does not.
+  check(
+    'the whole schema was scanned for numeric CHECK constraints',
+    tablesRead === 34 && numericChecks.size > 40,
+    `${tablesRead} tables, ${numericChecks.size} constraints`,
+  );
+
+  for (const [key, rule] of Object.entries(COLUMN_RANGES)) {
+    const declared = numericChecks.get(key);
+    check(`the schema states a numeric CHECK for ${key}`, declared !== undefined, `no numeric CHECK found for ${key}`);
+    if (!declared) continue;
+    const same = rule.positiveOnly
+      ? declared.positiveOnly === true
+      : declared.min === rule.min && declared.max === rule.max;
+    check(`${key} is guarded by exactly the range the schema states`, same, `guard ${JSON.stringify(rule)}, schema ${JSON.stringify(declared)}`);
+  }
+
+  // Completeness is the half a per-entry check cannot give: a new CHECK added to
+  // the schema with no matching guard is a column the boundary passes straight on
+  // to a rejection nobody can read. The two exemptions are derived from the code,
+  // not restated - a third list of "these are the ones I skipped" is how this rots.
+  const dbOwned = new Set();
+  for (const map of TABLES) {
+    for (const column of map.dbOwned ?? []) dbOwned.add(`${map.table}.${column}`);
+    for (const child of map.children ?? []) {
+      for (const column of child.dbOwned ?? []) dbOwned.add(`${child.table}.${column}`);
+    }
+  }
+  const exempt = (key) => key.startsWith('vitals.') || dbOwned.has(key);
+  const unguarded = [...numericChecks.keys()].filter((key) => !(key in COLUMN_RANGES) && !exempt(key));
+  check('every numeric CHECK that can reach the client is guarded at the boundary', unguarded.length === 0, unguarded.join(', '));
+  check(
+    'and nothing is guarded that the schema does not constrain',
+    Object.keys(COLUMN_RANGES).every((key) => numericChecks.has(key)),
+    Object.keys(COLUMN_RANGES).filter((key) => !numericChecks.has(key)).join(', '),
+  );
+
+  // The exemption is deliberate and stated in the source: vitals is checked in the
+  // nursing form, where the refusal can name the field and ask for it again.
+  const { checkVitals } = await import('../src/services/vitalsLimits.ts');
+  check('vitals is left to the form, which is the only place that can re-ask', !Object.keys(COLUMN_RANGES).some((key) => key.startsWith('vitals.')));
+  check(
+    'and the form really does check it',
+    checkVitals({ temperature: 22, systolicBp: 120, diastolicBp: 80, pulse: 72, respiratoryRate: 16, spo2: 98, weight: 70, height: 1.7 }).length > 0,
+  );
 });
 
 // ---------------------------------------------------------------------------

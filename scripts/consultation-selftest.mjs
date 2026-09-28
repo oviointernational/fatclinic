@@ -76,6 +76,23 @@ const {
   NOTES_TITLE,
   PLAN_TITLE,
 } = await import('../src/services/consultationSeed.ts');
+const {
+  VITALS_LIMITS,
+  BMI_MAX,
+  BMI_CATEGORIES,
+  bmiCategoryFor,
+  checkBloodPressureOrder,
+  checkVitals,
+  checkVitalsField,
+  computeBmi,
+  normaliseHeight,
+  alertsFor,
+  HEIGHT_MIN,
+  HEIGHT_MAX,
+  WEIGHT_MAX,
+} = await import('../src/services/vitalsLimits.ts');
+
+const SCHEMA_SQL = fs.readFileSync(path.join(ROOT, 'database', 'fatclinic.sql'), 'utf8');
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -738,6 +755,176 @@ check(
   })(),
   foldPlan(seedManagementEntries({ plan: `${PLAN_TITLE}: Appendicectomy\nClinical Notes: Patient counselled`, clinicalNotes: 'Patient counselled' })),
 );
+
+// ---------------------------------------------------------------------------
+// 17. The vitals the form accepts, and the column the database has
+// ---------------------------------------------------------------------------
+//
+// The bug: the nursing form checked only whether a box was EMPTY. The vitals
+// table carries a CHECK constraint per measurement, so a nurse who typed T 22,
+// BP 22/111 and pulse 11 was told "Recorded!", an audit row claimed the vitals
+// were recorded, and Postgres refused the insert outright - bmi is NUMERIC(4,1)
+// and cannot hold the 22400 the arithmetic produced. The table held nothing.
+//
+// These checks are what stand between that and a chart that says one thing and
+// holds another. The ranges in vitalsLimits.ts are transcribed from the CHECK
+// constraints, and the first group below holds them to the schema file; the live
+// half of the proof is in db:crud, which reads the running database's
+// constraints rather than this file.
+
+section('17. the vitals form refuses what the column cannot hold');
+
+const goodVitals = {
+  temperature: 37.2,
+  systolicBp: 120,
+  diastolicBp: 80,
+  pulse: 72,
+  respiratoryRate: 16,
+  spo2: 98,
+  weight: 70,
+  height: 1.75,
+};
+
+check('a complete, ordinary reading is accepted', checkVitals(goodVitals).length === 0, checkVitals(goodVitals));
+check(
+  'the reading the live database refused is refused here too',
+  checkVitals({ ...goodVitals, temperature: 22, systolicBp: 22, diastolicBp: 111, pulse: 11, weight: 224, height: 0.1 }).length > 0,
+);
+check(
+  'a temperature below the column minimum is named as such',
+  checkVitalsField('temperature', 24.9).some((p) => p.field === 'temperature' && /25 to 45/.test(p.message)),
+  checkVitalsField('temperature', 24.9),
+);
+check(
+  'the exact minimum is accepted, because the column accepts it',
+  checkVitalsField('temperature', 25).length === 0,
+  checkVitalsField('temperature', 25),
+);
+check(
+  'the exact maximum is accepted, because the column accepts it',
+  checkVitalsField('temperature', 45).length === 0,
+  checkVitalsField('temperature', 45),
+);
+check(
+  'a value one place past the maximum is refused',
+  checkVitalsField('temperature', 45.1).length === 1,
+);
+check('a blank box is a missing reading, not a measurement of nothing', checkVitalsField('pulse', '').some((p) => /not been recorded/.test(p.message)));
+check('a non-numeric entry is refused by name', checkVitalsField('pulse', 'abc').some((p) => /must be a number/.test(p.message)));
+check('a zero weight is refused, because the column demands > 0', checkVitalsField('weight', 0).length === 1);
+check('a negative weight is refused', checkVitalsField('weight', -5).length === 1);
+check(
+  'a diastolic above the systolic is refused',
+  checkBloodPressureOrder(80, 120).length === 1,
+  checkBloodPressureOrder(80, 120),
+);
+check(
+  'the refusal says which reading is which',
+  /lower reading is diastolic/.test(checkBloodPressureOrder(80, 120)[0].message),
+);
+check('diastolic equal to systolic is allowed - the column allows it', checkBloodPressureOrder(90, 90).length === 0);
+check(
+  'a pain score off the 0-10 scale is refused',
+  checkVitals({ ...goodVitals, painScore: 11 }).some((p) => p.field === 'painScore'),
+);
+check('a pain score in scale is accepted', checkVitals({ ...goodVitals, painScore: 7 }).length === 0);
+check('a pain score left blank is fine, because the column is nullable', checkVitals({ ...goodVitals, painScore: '' }).length === 0);
+
+section('18. BMI: one calculation, shared by the banner and the save');
+
+// The BMI arithmetic existed in three places - the live banner, db.recordVitals
+// and the audit message - and each could round or categorise differently. If the
+// banner says one category and the record holds another, the nurse is reading a
+// different chart from the one being written.
+check('a normal reading calculates its BMI', computeBmi(70, 1.75).bmi === 22.9, computeBmi(70, 1.75));
+check('the category follows the BMI', computeBmi(70, 1.75).category === 'Normal');
+check('BMI is rounded to one decimal, as the column is', computeBmi(70, 1.75).bmi === Number((70 / (1.75 * 1.75)).toFixed(1)));
+check('the banner and the save cannot disagree on the category', (() => {
+  const shown = computeBmi(95, 1.75);
+  const saved = computeBmi(95, 1.75);
+  return shown.category === saved.category;
+})());
+check('an underweight reading is categorised', bmiCategoryFor(17) === 'Underweight');
+check('an obese class III reading is categorised', bmiCategoryFor(45) === 'Obese Class III');
+check('the boundary values land on the documented side', bmiCategoryFor(18.4) === 'Underweight' && bmiCategoryFor(18.5) === 'Normal');
+check('every category the code can return is one the column allows', BMI_CATEGORIES.every((c) => c === 'Underweight' || c === 'Normal' || c === 'Overweight' || /^Obese Class [I]{1,3}$/.test(c)));
+
+check(
+  'a weight and height that each pass, but whose BMI will not fit, is refused',
+  'problem' in computeBmi(WEIGHT_MAX, HEIGHT_MIN),
+  computeBmi(WEIGHT_MAX, HEIGHT_MIN),
+);
+check(
+  'the refusal names the BMI, and both readings behind it',
+  /BMI/.test(computeBmi(WEIGHT_MAX, HEIGHT_MIN).problem.message) && /height/i.test(computeBmi(WEIGHT_MAX, HEIGHT_MIN).problem.message),
+);
+check('a BMI that would overflow NUMERIC(4,1) is never returned', !('bmi' in computeBmi(WEIGHT_MAX, HEIGHT_MIN)) || computeBmi(WEIGHT_MAX, HEIGHT_MIN).bmi <= BMI_MAX);
+check('a height of zero cannot be divided by', 'problem' in computeBmi(70, 0));
+check('the form refuses that reading before the save', checkVitals({ ...goodVitals, weight: 400, height: 0.5 }).length > 0);
+check('centimetres are converted, because that is how it is measured', normaliseHeight(175) === 1.75);
+check('metres are left alone', normaliseHeight(1.75) === 1.75);
+check('the banner and the save convert height the same way', computeBmi(70, normaliseHeight(175)).bmi === computeBmi(70, normaliseHeight(1.75)).bmi);
+
+section('19. the limits in the code are the limits in the schema');
+
+// This is the group that makes the rest honest. A range widened here without the
+// schema would let a reading through that the database then refuses - the exact
+// bug, reintroduced. So each range is matched against the SQL the app ships.
+const vitalsTable = SCHEMA_SQL.slice(SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS vitals'), SCHEMA_SQL.indexOf('CREATE TABLE IF NOT EXISTS consultations'));
+check('the vitals table was found in the schema file', vitalsTable.length > 0);
+
+for (const limit of VITALS_LIMITS) {
+  const column = {
+    temperature: 'temperature_c',
+    systolicBp: 'systolic_bp',
+    diastolicBp: 'diastolic_bp',
+    pulse: 'pulse_bpm',
+    respiratoryRate: 'respiratory_rate',
+    spo2: 'spo2_pct',
+    weight: 'weight_kg',
+    height: 'height_m',
+  }[limit.field];
+  if (limit.positiveOnly) {
+    // The numeric precision sits between the column name and NOT NULL, and the
+    // schema is aligned with spaces, so the pattern allows whitespace rather than
+    // pinning the exact layout - a reformat of the SQL must not fail this.
+    check(
+      `vitalsLimits ${limit.field} matches the schema's rule for ${column}`,
+      new RegExp(`${column}\\s+NUMERIC\\(\\d+,\\d+\\)\\s+NOT NULL\\s+CHECK\\s*\\(\\s*${column}\\s*>\\s*0\\s*\\)`).test(vitalsTable),
+      `schema has no: CHECK (${column} > 0) on a NOT NULL column`,
+    );
+  } else {
+    const escaped = limit.min === 0 ? '0' : String(limit.min);
+    const upper = limit.max === 100 ? '100' : String(limit.max);
+    check(
+      `vitalsLimits ${limit.field} matches the schema's range for ${column}`,
+      new RegExp(`CHECK \\(${column} BETWEEN ${escaped} AND ${upper}\\)`).test(vitalsTable),
+      `schema has no: CHECK (${column} BETWEEN ${escaped} AND ${upper})`,
+    );
+  }
+}
+
+check('the schema carries the cross-field blood pressure rule', /CHECK \(diastolic_bp <= systolic_bp\)/.test(vitalsTable));
+check('and the form enforces it', checkBloodPressureOrder(70, 140).length === 1);
+check('the BMI column is as narrow as the arithmetic assumes', /bmi\s+NUMERIC\(4,1\)/.test(vitalsTable));
+check('and the BMI guard is that column, not a guess', BMI_MAX === 999.9);
+check('the BMI category CHECK allows exactly the categories the code returns', (() => {
+  const allowed = [...vitalsTable.matchAll(/'(Underweight|Normal|Overweight|Obese Class I{1,3})'/g)].map((m) => m[1]);
+  return allowed.length > 0 && BMI_CATEGORIES.every((c) => allowed.includes(c)) && allowed.every((c) => BMI_CATEGORIES.includes(c));
+})());
+check('the pain score scale in the code is the schema CHECK', /pain_score\s+INTEGER CHECK \(pain_score BETWEEN 0 AND 10\)/.test(vitalsTable));
+
+section('20. the alerts the form raises are clinical, and come from one place');
+
+check('a fever raises the fever alert', alertsFor({ ...goodVitals, temperature: 39 }).includes('High Grade Fever Spike'));
+check('a normal temperature raises nothing', alertsFor({ ...goodVitals, temperature: 37 }).length === 0);
+check('the fever threshold is the clinical one', (() => { try { return !alertsFor({ ...goodVitals, temperature: 37.9 }).includes('High Grade Fever Spike'); } catch { return false; } })());
+check('a critical saturation is raised, not hidden', alertsFor({ ...goodVitals, spo2: 85 }).includes('Critical Oxygen Saturation'));
+check('a healthy saturation raises nothing', alertsFor({ ...goodVitals, spo2: 98 }).length === 0);
+check('the alert list and the refusal list cannot both be empty for a bad reading', (() => {
+  const bad = { ...goodVitals, temperature: 22 };
+  return checkVitals(bad).length > 0;
+})());
 
 // ---------------------------------------------------------------------------
 

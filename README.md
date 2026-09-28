@@ -149,13 +149,98 @@ same thing — the mapper cannot send NULL there without inventing data, and for
 clinical value inventing data is worse than refusing the write, because a recorded
 temperature of 0 is a falsehood in a patient's chart while a refused save leaves
 the chart true. `npm run db:crud` fails on the first and lists the second, by
-table and column, so the count is known rather than guessed. Closing the second
-kind belongs in the form that asks for the number, not in the data layer, which
-has no safe answer to give.
+table and column, so the count is known rather than guessed.
+
+#### A value the column must have, and the form that asks for it
+
+The second kind has to be closed somewhere, and it cannot be closed in the data
+layer — that is the whole reason it is separated out above. The place that can
+ask for the number a second time is the form.
+
+`vitals` is where this actually bit. Its table carries a CHECK constraint per
+measurement, and the nursing form checked only whether a box was **empty**. A
+nurse who typed a temperature of 22 °C, a blood pressure of 22/111 and a pulse
+of 11 was told *Recorded!*, the app wrote an audit row saying the vitals were
+recorded, and Postgres refused the insert outright — `bmi` is `NUMERIC(4,1)` and
+cannot hold the 22400 the arithmetic produced from those numbers. The table held
+nothing, the chart said the reading was on file, and the audit trail — which is
+append-only, so it cannot be corrected — said it permanently. It was found by
+reading a database that had two `RECORD_VITALS` audit rows and no vitals.
+
+`src/services/vitalsLimits.ts` now owns those bounds. Three things are deliberate
+about it:
+
+- **the ranges are transcribed from the CHECK constraints, and two checks hold
+  them to that.** `db:consultation-test` parses `database/fatclinic.sql` and fails
+  if a range is not declared there; `db:crud` reads the **live** constraints out
+  of `information_schema` and fails in both directions — every value the form
+  accepts must actually store, and every value it refuses must actually be
+  refused. A range widened in TypeScript without the schema cannot pass both.
+  Tightening one is a clinical decision, so it is made deliberately or not at all.
+- **the derived values are checked too.** BMI is computed, not typed, so the nurse
+  cannot be blamed for it — but it still has to fit `NUMERIC(4,1)`, and that is a
+  consequence of the weight and the height. A weight and a height that each pass
+  on their own can still overflow it, which is precisely how the original reading
+  was voided by a number nobody typed. `computeBmi()` returns a refusal rather
+  than a value the column will not take.
+- **one calculation, three former copies.** BMI and its category were computed in
+  the live banner, in `recordVitals` and in the audit message, and each could
+  round or categorise differently — so the banner could show *Obese Class I* above
+  a value the record filed under something else. The same reasoning as `entryText`
+  in the consultation: one function, called by the display and by the save.
+
+The refusal is a message, not a clamp. It names the field, the value typed and the
+range the column accepts, so a nurse can correct the reading; and the form says
+*Not recorded* rather than *Recorded!*, because nothing was recorded. The reason
+is shown on the form as well as in the alert — an alert is dismissed, and the
+reading still has to be fixed.
 
 Because an upsert is a single request, any one of these refusals used to void
 *every* field on the record while the form said "Saved!". That is why the refusals
 are surfaced, and why the audit exists.
+
+#### The other forty columns with the same problem
+
+`vitals` is where this was found, and it is the one table where a nurse types a
+number into a box on a form that can be made to explain itself. The schema carries
+**53 numeric CHECK constraints**, and they are the same defect everywhere: one
+figure outside its range voided the whole row, and the complaint came back as
+`new row for relation "invoice_items" violates check constraint
+"invoice_items_quantity_check"` — the constraint, not the figure, and not the box.
+A cashier's invoice with a zero-quantity line, a stock request for zero, a payment
+of zero: all lost, all reported as saved.
+
+No form range-checks any of them, so the guard belongs at the boundary, in the same
+function that already refuses a `NaN` before the request is built. `COLUMN_RANGES`
+in `src/services/sync.ts` transcribes all **39** of those columns that the client
+can actually send. The other fourteen are excluded for reasons that are stated
+rather than assumed, and the test derives both exclusions from the code instead of
+restating them in a third list:
+
+- **vitals** (12) is checked in the nursing form, as above.
+- **the four money columns the database recalculates** (`invoices.subtotal`,
+  `total`, `paid_amount`, `balance`) are refused by `assertNoDbOwnedColumns`, which
+  runs *after* the range check. A range message about a column that must not be
+  sent at all would explain the wrong problem, so the guard stays out of the way.
+
+What this buys is not the refusal — the database was already refusing — it is a
+refusal that can be acted on, before the write, naming the column and the figure and
+the range. And it is *both* directions: the same table proves that a legitimate
+figure at the edge of the range still goes through, because a guard that refuses a
+valid payment is worse than no guard at all.
+
+Three checks hold the transcription to reality, because a transcription is only as
+good as its agreement with what it was copied from:
+
+| | what it proves |
+|---|---|
+| `db:sync:test` | every guarded range is the range `database/fatclinic.sql` states, and every numeric CHECK that can reach the client is guarded |
+| `db:sync:defects` | the guard is reachable (deleting the call fails 6 checks) and correct (widening `payments.amount` fails 2 more) |
+| `db:crud` | the schema file and the **deployed** database agree, and the real write path refuses a zero-quantity line by name without writing anything |
+
+That last one is the one that matters most, because it is the only one that can
+catch the file being wrong. The other two would happily pass forever against a
+schema the app no longer matches.
 
 #### The remembered past has to be a copy
 
@@ -267,12 +352,12 @@ lifted: a plan can contain a line beginning with anything at all, and treating a
 arbitrary "something: text" as a heading would break a clinician's prose into
 pieces that were not headings.
 
-`npm run db:consultation-test` runs 144 checks over this module, the doctor's gate,
-the examination column mapping and the surgery list, and
-`db:consultation:defects` breaks it seventeen ways to prove those checks are real;
-`db:crud` then proves the six sections against the live database as a signed-in
-clinician and reads every value back with SQL rather than with the app's own
-reader.
+`npm run db:consultation-test` runs 197 checks over this module, the doctor's gate,
+the examination column mapping, the surgery list and the vitals limits, and
+`db:consultation:defects` breaks it twenty-three ways to prove those checks are
+real; `db:crud` then proves the six sections against the live database as a
+signed-in clinician and reads every value back with SQL rather than with the app's
+own reader.
 
 ### Staff accounts
 
@@ -678,10 +763,10 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:lint` | Static checks on the SQL: every seed column, foreign key, index and view target exists, seed values satisfy their own CHECK constraints, ward codes match the TypeScript model, no credential column | no |
 | `npm run db:lint:test` | Injects known defects to prove `db:lint` actually catches them | no |
 | `npm run db:config:test` | Proves the `.env` password guards and the host resolver behave correctly, including the dotenv `#` truncation trap | no |
-| `npm run db:sync:test` | 296 checks against the schema: mappers emit only real columns, every required column is always sent, values survive a round trip, and inserts/updates/deletes/children/grandchildren/append-only tables/queue coalescing all behave as documented. Includes the rule that the remembered past is a **copy**, so an in-place edit cannot make a save vanish without a word | no |
-| `npm run db:sync:defects` | Breaks `sync.ts` twelve ways — the last one re-introducing the reference-holding bug — and requires the self-test to fail each time | no |
-| `npm run db:consultation-test` | 144 checks on the consultation's own logic, off-database: every visit status is either writable or explained, the doctor's read-only gate names the reason, a visit with no consultation seeds no invented diagnosis, one function decides an entry's text for both the screen and the save, an examination finding lands in the column its dialog title named (all eleven systems), a surgery entry survives the round trip through the one text column including notes containing the separator, and the plan and impression **settle** over five save-and-reload cycles instead of growing a prefix | no |
-| `npm run db:consultation:defects` | Breaks the consultation logic seventeen ways across the four modules — gate, examination mapping, surgery list and seeding/folding — and requires the self-test to fail each time | no |
+| `npm run db:sync:test` | 388 checks against the schema: mappers emit only real columns, every required column is always sent, values survive a round trip, and inserts/updates/deletes/children/grandchildren/append-only tables/queue coalescing all behave as documented. Includes the rule that the remembered past is a **copy**, so an in-place edit cannot make a save vanish without a word, and that every guarded numeric range is the range the schema declares, in both directions | no |
+| `npm run db:sync:defects` | Breaks `sync.ts` fourteen ways — the last two removing the boundary range guard and widening one of its bounds — and requires the self-test to fail each time | no |
+| `npm run db:consultation-test` | 197 checks on the clinical logic, off-database: every visit status is either writable or explained, the doctor's read-only gate names the reason, a visit with no consultation seeds no invented diagnosis, one function decides an entry's text for both the screen and the save, an examination finding lands in the column its dialog title named (all eleven systems), a surgery entry survives the round trip through the one text column including notes containing the separator, the plan and impression **settle** over five save-and-reload cycles instead of growing a prefix, and every vitals range matches the CHECK constraint the schema declares for it | no |
+| `npm run db:consultation:defects` | Breaks the clinical logic twenty-three ways across the five modules — gate, examination mapping, surgery list, seeding/folding and the vitals limits — and requires the self-test to fail each time | no |
 | `npm run typecheck:functions` | Type-checks `supabase/functions/staff-accounts/handler.ts`, which the root `tsconfig.json` does not reach — its `include` is `src` only, so both `tsc --noEmit` and `npm run build` report a clean tree while the one file holding the privileged key's only caller goes unchecked | no |
 | `npm run db:test` | All nine of the above | no |
 | `npm run db:apply` | Applies the schema in a transaction, then verifies RLS, grants, triggers, invoice math and seeds. Fails if a retired demo profile is still present, if a verification probe leaked a row, or if a live policy is not declared in `database/fatclinic.sql` (or vice versa) | yes |
@@ -701,7 +786,7 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, proves the **handler** (not the gateway - `verify_jwt` is off) refuses `create` without a session and to a forged token, and proves the same caller is still *answered* for `forgot` | no (HTTP) |
 | `npm run db:check-deployed` | Tests the function **Supabase is actually serving**, not the file on disk: a password containing the staff name is refused, an older rule is still refused, a good password really authenticates, a clinician is refused, and it deletes what it created | yes + a password |
 | `npm run db:check-api` | Proves every table and view in the SQL file is actually live and in the PostgREST schema cache | no (HTTP) |
-| `npm run db:crud` | 46 checks against the live database, as a real signed-in clinician, through the real write path. Sweeps all 350 columns of all 24 tables for a blank value sent where the column could have taken NULL, then creates, edits and deletes the chain a doctor writes — patient, visit, vitals, consultation, both diagnoses, lab request with its test, prescription with its item — and reads every assertion back with SQL rather than with the app's own reader. It has a dedicated section for all six Patient's Info sections, because a whole tab failing to save is the bug this app actually had: each section is written and read back individually, an unfilled box must land as empty rather than missing, and a removed diagnosis must be gone from the server. Everything it creates, including the throwaway account, it removes | yes (service_role) |
+| `npm run db:crud` | 62 checks against the live database, as a real signed-in clinician, through the real write path. Sweeps all 350 columns of all 24 tables for a blank value sent where the column could have taken NULL, then creates, edits and deletes the chain a doctor writes — patient, visit, vitals, consultation, both diagnoses, lab request with its test, prescription with its item — and reads every assertion back with SQL rather than with the app's own reader. It has a dedicated section for all six Patient's Info sections, because a whole tab failing to save is the bug this app actually had: each section is written and read back individually, an unfilled box must land as empty rather than missing, and a removed diagnosis must be gone from the server. It also holds the vitals ranges and the boundary range guard to the **deployed** constraints, in both directions. Everything it creates, including the throwaway account, it removes | yes (service_role) |
 | `npm run db:purge-test-audit` | Deletes `SEC-` audit rows the checks left behind. `--dry-run` first | yes |
 | `npm run db:verify` | The live gate, in one pass: lint, the sync self-test, RLS, the orphan account, the live API surface, the clinical CRUD audit, the Auth admin probe, the reset link, and the forced password change. Pair it with `npm run db:test`, which is the off-database gate and covers the consultation suites `db:verify` does not | yes (service_role) |
 | `npm run staff:list` | Every staff profile, and whether each one can actually sign in | yes (service_role) |

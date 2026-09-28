@@ -162,6 +162,28 @@ const DEFECTS = [
     to: '  persisted.set(key, value);',
     count: 1,
   },
+  {
+    name: 'the boundary stops checking a figure against the range the column declares',
+    // `quantity > 0` and `price >= 0` are declared on invoice lines, prescription
+    // items, payments and stock requests, and no form range-checks them. Without
+    // this call a zero quantity is sent, the database refuses the whole insert, and
+    // the message that comes back names `invoice_items_quantity_check` - the
+    // constraint, not the figure, and not the box it was typed in. The billing
+    // screen reported the invoice saved.
+    from: '  assertWithinColumnRanges(out, table);',
+    to: '  void table;',
+    count: 1,
+  },
+  {
+    name: 'a guarded range is widened past what the column accepts',
+    // The other half, and the one that does not look like anything: the guard is
+    // present, reads correctly, and is simply wrong. Nothing in the app refuses a
+    // zero payment any more, so the refusal is the database's, at write time, in
+    // the database's words. Held to the schema by the completeness check.
+    from: "  'payments.amount': { positiveOnly: true },",
+    to: "  'payments.amount': { min: 0 },",
+    count: 1,
+  },
 ];
 
 function run() {

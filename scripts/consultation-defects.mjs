@@ -22,6 +22,7 @@ const TARGETS = {
   surgery: path.join(ROOT, 'src', 'services', 'surgeryHistory.ts'),
   exam: path.join(ROOT, 'src', 'services', 'physicalExam.ts'),
   seed: path.join(ROOT, 'src', 'services', 'consultationSeed.ts'),
+  vitals: path.join(ROOT, 'src', 'services', 'vitalsLimits.ts'),
 };
 
 /**
@@ -288,6 +289,77 @@ const DEFECTS = [
   return [entry.complaint, entry.body]`,
     to: `export function entryText(entry: EntryItem): string {
   return [undefined, entry.body]`,
+    count: 1,
+  },
+  {
+    file: 'vitals',
+    name: 'the form goes back to refusing only an empty box',
+    // The original bug, restored. The vitals table carries a CHECK constraint per
+    // measurement; the form checked only `=== ''`. A nurse typing T 22, BP 22/111
+    // and pulse 11 was told "Recorded!", an audit row claimed the vitals were
+    // recorded, and the insert was refused outright - so the table held nothing
+    // while the chart said otherwise. This is the defect this file exists for,
+    // and it is a data-loss defect, not a cosmetic one.
+    from: `  if (limit.positiveOnly ? value <= 0 : value < limit.min! || value > limit.max!) {
+    return [{ field, message: outOfRange(limit, value) }];
+  }`,
+    to: `  if (value === '') {
+    return [{ field, message: outOfRange(limit, value) }];
+  }`,
+    count: 1,
+  },
+  {
+    file: 'vitals',
+    name: 'the blood pressure ordering rule is dropped',
+    // (diastolic_bp <= systolic_bp) is a real CHECK in the schema, and both
+    // column ranges permit 22/111 on their own. Without the cross-field rule the
+    // form accepts a reading the database refuses, and the refusal names a
+    // constraint the nurse has never heard of.
+    from: `  if (diastolic > systolic) {`,
+    to: `  if (false) {`,
+    count: 1,
+  },
+  {
+    file: 'vitals',
+    name: 'the BMI overflow guard is removed',
+    // bmi is NUMERIC(4,1). A weight and height that are each valid can still
+    // produce a BMI the column cannot hold, and that insert fails with a
+    // complaint about a number the nurse never typed. computeBmi returning a
+    // number unconditionally is how the original reached the database.
+    from: `  if (!Number.isFinite(bmi) || bmi > BMI_MAX || bmi < 0) {`,
+    to: `  if (false) {`,
+    count: 1,
+  },
+  {
+    file: 'vitals',
+    name: 'the BMI category boundaries are shifted',
+    // The banner and the save read the same function, so a shifted boundary shows
+    // one category above a value the record files under another.
+    from: `  { below: 25, category: 'Normal' },`,
+    to: `  { below: 20, category: 'Normal' },`,
+    count: 1,
+  },
+  {
+    file: 'vitals',
+    name: 'the fever alert threshold is moved to a round number',
+    // 38 °C is the clinical threshold for a high-grade fever. 40 is not, and a
+    // nurse relying on the alert would miss every fever between the two.
+    from: `export const HIGH_FEVER_C = 38;`,
+    to: `export const HIGH_FEVER_C = 40;`,
+    count: 1,
+  },
+  {
+    file: 'vitals',
+    name: 'the centimetre conversion is dropped',
+    // Height is measured in centimetres at the bedside and stored in metres. Lose
+    // the conversion and 175 is written as 175 m, which produces a BMI of 0.00 and
+    // a patient whose height is wrong by two orders of magnitude.
+    from: `export function normaliseHeight(value: number): number {
+  return value > 3 ? value / 100 : value;
+}`,
+    to: `export function normaliseHeight(value: number): number {
+  return value;
+}`,
     count: 1,
   },
 ];

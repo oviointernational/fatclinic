@@ -4,6 +4,7 @@ import { db } from '../../services/db';
 import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { isWithDoctor } from '../../services/consultationAccess';
+import { alertsFor, checkVitals, computeBmi, HEIGHT_MAX, HEIGHT_MIN, normaliseHeight, VITALS_LIMITS, WEIGHT_MAX, type VitalsProblem } from '../../services/vitalsLimits';
 import {
   CheckCircle2,
   Thermometer,
@@ -24,7 +25,8 @@ import {
   Search,
   ListChecks,
   Lock,
-  BedDouble
+  BedDouble,
+  AlertCircle
 } from 'lucide-react';
 import { AdmitDialog } from './AdmitDialog';
 
@@ -207,6 +209,25 @@ export const NursingStation: React.FC<NursingStationProps> = ({
   const [procedures, setProcedures] = useState<string[]>(existingVitals?.nursingProcedures || []);
 
   const [savedSuccess, setSavedSuccess] = useState(false);
+  // The reasons the last attempt was refused, kept so the reading can be
+  // corrected without the nurse re-deriving what the database objected to.
+  const [vitalsProblems, setVitalsProblems] = useState<VitalsProblem[]>([]);
+
+  /**
+   * The database's own bounds, as the number input's `min`/`max`.
+   *
+   * The browser's number validation is a courtesy, not the guarantee - it is
+   * bypassed by typing a value with the keyboard arrows, by a paste, and by any
+   * path that does not go through this form. `checkVitals` is the guarantee, and
+   * these attributes are here so the box turns red before Save is pressed rather
+   * than after. Both come from the same table, so they cannot disagree.
+   */
+  const limitProps = (field: string) => {
+    const limit = VITALS_LIMITS.find((l) => l.field === field);
+    if (!limit) return {};
+    if (limit.positiveOnly) return { min: field === 'height' ? HEIGHT_MIN : 0.1, max: field === 'height' ? HEIGHT_MAX : WEIGHT_MAX };
+    return { min: limit.min, max: limit.max };
+  };
 
   // Sync when selected visit changes
   useEffect(() => {
@@ -234,20 +255,31 @@ export const NursingStation: React.FC<NursingStationProps> = ({
     }
   }, [activeVisitId]);
 
-  // Real-time BMI calculation (only when weight & height are entered)
-  const effectiveHeight = height === '' ? 0 : height > 3 ? height / 100 : height;
-  const calculatedBmi = weight !== '' && effectiveHeight > 0 ? Number((weight / (effectiveHeight * effectiveHeight)).toFixed(1)) : null;
+  // Real-time BMI, from the same function the save uses. This used to be a
+  // fourth copy of the BMI arithmetic, alongside the one in db.recordVitals and
+  // the one the audit message printed - three places that could round, clamp or
+  // categorise differently, which is how a nurse could be shown "Obese Class I"
+  // above a value the record then refused. One function, called by the banner and
+  // by the save.
+  const previewBmi =
+    weight === '' || height === ''
+      ? null
+      : computeBmi(Number(weight), normaliseHeight(Number(height)));
+  const calculatedBmi = previewBmi && 'bmi' in previewBmi ? previewBmi.bmi : null;
 
-  const getBmiBadge = (bmi: number) => {
-    if (bmi < 18.5) return { label: 'Underweight', color: 'bg-blue-100 text-blue-800 dark:bg-blue-950/60 dark:text-blue-300' };
-    if (bmi < 25) return { label: 'Normal Weight', color: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300' };
-    if (bmi < 30) return { label: 'Overweight', color: 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300' };
-    if (bmi < 35) return { label: 'Obese Class I', color: 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300' };
-    if (bmi < 40) return { label: 'Obese Class II', color: 'bg-purple-100 text-purple-800 dark:bg-purple-950/60 dark:text-purple-300' };
-    return { label: 'Obese Class III (Morbid)', color: 'bg-red-200 text-red-900 dark:bg-red-950/80 dark:text-red-200' };
+  const BMI_BADGE: Record<string, string> = {
+    Underweight: 'bg-blue-100 text-blue-800 dark:bg-blue-950/60 dark:text-blue-300',
+    Normal: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300',
+    Overweight: 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300',
+    'Obese Class I': 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300',
+    'Obese Class II': 'bg-purple-100 text-purple-800 dark:bg-purple-950/60 dark:text-purple-300',
+    'Obese Class III': 'bg-red-200 text-red-900 dark:bg-red-950/80 dark:text-red-200',
   };
 
-  const bmiInfo = calculatedBmi !== null ? getBmiBadge(calculatedBmi) : null;
+  const bmiInfo =
+    previewBmi && 'category' in previewBmi
+      ? { label: previewBmi.category, color: BMI_BADGE[previewBmi.category] }
+      : null;
 
   const availableProcedures = [
     'Vital signs monitoring & triage',
@@ -271,19 +303,31 @@ export const NursingStation: React.FC<NursingStationProps> = ({
     e.preventDefault();
     if (!activeVisit || !activePatient) return;
 
-    const missing: string[] = [];
-    if (temperature === '') missing.push('Temperature');
-    if (systolicBp === '') missing.push('Systolic BP');
-    if (diastolicBp === '') missing.push('Diastolic BP');
-    if (pulse === '') missing.push('Pulse');
-    if (respiratoryRate === '') missing.push('Respiratory Rate');
-    if (spo2 === '') missing.push('SpO2');
-    if (weight === '') missing.push('Weight');
-    if (height === '') missing.push('Height');
-    if (missing.length > 0) { alert(`Record vitals: please fill in ${missing.join(', ')}.`); return; }
+    // Refused here, with the reason, rather than accepted here and rejected by
+    // Postgres. The vitals table carries a CHECK constraint per measurement, so a
+    // plausible-looking typo is a value the record cannot hold - and because an
+    // insert is one request, the whole reading went missing while the audit trail
+    // said it had been recorded. The form is the only place that can ask the
+    // nurse to correct it, so this is where it happens.
+    const problems = checkVitals({
+      temperature, systolicBp, diastolicBp, pulse, respiratoryRate, spo2, weight, height, painScore,
+    });
+    if (problems.length > 0) {
+      setVitalsProblems(problems);
+      alert(
+        `Record vitals: nothing has been saved.\n\n${problems
+          .map((p) => `• ${p.message}`)
+          .join('\n')}`,
+      );
+      return;
+    }
+    setVitalsProblems([]);
 
     const tempNum = Number(temperature);
     const hgtNum = Number(height);
+    const draft = {
+      temperature, systolicBp, diastolicBp, pulse, respiratoryRate, spo2, weight, height, painScore,
+    };
     const recorded = db.recordVitals({
       visitId: activeVisit.id,
       patientId: activePatient.id,
@@ -296,12 +340,12 @@ export const NursingStation: React.FC<NursingStationProps> = ({
       respiratoryRate: Number(respiratoryRate),
       spo2: Number(spo2),
       weight: Number(weight),
-      height: hgtNum > 3 ? hgtNum / 100 : hgtNum,
+      height: normaliseHeight(hgtNum),
       painScore,
       nursingNotes,
       nursingCarePlan,
       nursingProcedures: procedures,
-      alerts: tempNum >= 38 ? ['High Grade Fever Spike'] : []
+      alerts: alertsFor(draft)
     }, currentUser);
 
     setSavedSuccess(true);
@@ -318,9 +362,19 @@ export const NursingStation: React.FC<NursingStationProps> = ({
         </span>
         <div className="flex items-center space-x-2">
           {savedSuccess && (
-            <span className="flex items-center space-x-1 text-[11px] font-bold text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40 px-2.5 py-1 rounded-lg animate-in fade-in">
+            <span className="flex items-center space-x-1 text-[11px] font-bold text-emerald-600 bg-emerald-50 dark:text-emerald-300 dark:bg-emerald-950/40 px-2.5 py-1 rounded-lg animate-in fade-in">
               <CheckCircle2 className="w-3.5 h-3.5" />
               <span>Recorded!</span>
+            </span>
+          )}
+          {/* "Recorded!" appears only when the reading passed every range the
+              database enforces, so it cannot sit above a refused attempt. The
+              reasons are shown here as well as in the alert, because an alert is
+              dismissed and a reading still has to be corrected. */}
+          {vitalsProblems.length > 0 && (
+            <span className="flex items-center space-x-1 text-[11px] font-bold text-rose-600 bg-rose-50 dark:text-rose-300 dark:bg-rose-950/40 px-2.5 py-1 rounded-lg">
+              <AlertCircle className="w-3.5 h-3.5" />
+              <span>Not recorded: {vitalsProblems.length} to fix</span>
             </span>
           )}
           <button
@@ -534,12 +588,30 @@ export const NursingStation: React.FC<NursingStationProps> = ({
                   <span>Vital Signs Measurement</span>
                 </div>
 
+                {/* The refusals, listed under the boxes rather than only in an
+                    alert. The bounds are the database's own, so the browser
+                    refuses at the edge of what the column can hold and the
+                    message says so. */}
+                {vitalsProblems.length > 0 && (
+                  <div className="rounded-xl border border-rose-200 dark:border-rose-900/60 bg-rose-50 dark:bg-rose-950/30 p-3 space-y-1">
+                    <p className="text-[11px] font-extrabold text-rose-700 dark:text-rose-300">
+                      This reading has not been recorded. Nothing has been saved.
+                    </p>
+                    {vitalsProblems.map((p, i) => (
+                      <p key={`${p.field}-${i}`} className="text-[11px] text-rose-700 dark:text-rose-300">
+                        • {p.message}
+                      </p>
+                    ))}
+                  </div>
+                )}
+
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
                   <div>
                     <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Temperature (°C):</label>
                     <input
                       type="number"
                       step="0.1"
+                      {...limitProps('temperature')}
                       required
                       value={temperature}
                       onChange={e => setTemperature(e.target.value === '' ? '' : Number(e.target.value))}
@@ -551,6 +623,7 @@ export const NursingStation: React.FC<NursingStationProps> = ({
                     <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Systolic BP (mmHg):</label>
                     <input
                       type="number"
+                      {...limitProps('systolicBp')}
                       required
                       value={systolicBp}
                       onChange={e => setSystolicBp(e.target.value === '' ? '' : Number(e.target.value))}
@@ -562,6 +635,7 @@ export const NursingStation: React.FC<NursingStationProps> = ({
                     <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Diastolic BP (mmHg):</label>
                     <input
                       type="number"
+                      {...limitProps('diastolicBp')}
                       required
                       value={diastolicBp}
                       onChange={e => setDiastolicBp(e.target.value === '' ? '' : Number(e.target.value))}
@@ -573,6 +647,7 @@ export const NursingStation: React.FC<NursingStationProps> = ({
                     <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Pulse (bpm):</label>
                     <input
                       type="number"
+                      {...limitProps('pulse')}
                       required
                       value={pulse}
                       onChange={e => setPulse(e.target.value === '' ? '' : Number(e.target.value))}
@@ -586,6 +661,7 @@ export const NursingStation: React.FC<NursingStationProps> = ({
                     <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Respiratory Rate (cpm):</label>
                     <input
                       type="number"
+                      {...limitProps('respiratoryRate')}
                       required
                       value={respiratoryRate}
                       onChange={e => setRespiratoryRate(e.target.value === '' ? '' : Number(e.target.value))}
@@ -597,6 +673,7 @@ export const NursingStation: React.FC<NursingStationProps> = ({
                     <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">SpO2 Oxygen (%):</label>
                     <input
                       type="number"
+                      {...limitProps('spo2')}
                       required
                       value={spo2}
                       onChange={e => setSpo2(e.target.value === '' ? '' : Number(e.target.value))}
@@ -609,6 +686,7 @@ export const NursingStation: React.FC<NursingStationProps> = ({
                     <input
                       type="number"
                       step="0.5"
+                      {...limitProps('weight')}
                       required
                       value={weight}
                       onChange={e => setWeight(e.target.value === '' ? '' : Number(e.target.value))}
@@ -617,10 +695,15 @@ export const NursingStation: React.FC<NursingStationProps> = ({
                   </div>
 
                   <div>
-                    <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Height (meters):</label>
+                    {/* Centimetres are accepted too, because that is how the
+                        measurement is taken. `normaliseHeight` converts, and the
+                        3 m cut-off is the same one the save has always used. */}
+                    <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Height (metres, or cm):</label>
                     <input
                       type="number"
                       step="0.01"
+                      min={0.5}
+                      max={250}
                       required
                       value={height}
                       onChange={e => setHeight(e.target.value === '' ? '' : Number(e.target.value))}

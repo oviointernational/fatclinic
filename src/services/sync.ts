@@ -1544,6 +1544,13 @@ function applyOmit(row: Record<string, unknown>, omit?: string[]): Record<string
  * the column is nullable. Two conventions, both applied deliberately, rather
  * than one blanket rule that would trade a lost consultation for a different
  * lost consultation.
+ *
+ * 3. A number outside the range the column's CHECK constraint states is refused,
+ *    also by name. The same one-request argument applies: `quantity > 0` and
+ *    `price >= 0` are declared on invoice lines, prescription items, payments and
+ *    stock requests, and one zero or negative figure voided the whole row while
+ *    the screen said it was saved. `vitals` is checked in the form instead, with
+ *    `db.recordVitals` throwing behind it - see `COLUMN_RANGES` for why.
  */
 function forPostgres(row: Record<string, unknown>, table: string): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -1558,7 +1565,120 @@ function forPostgres(row: Record<string, unknown>, table: string): Record<string
     }
     out[k] = v;
   }
+  assertWithinColumnRanges(out, table);
   return out;
+}
+
+/**
+ * The ranges the schema's own CHECK constraints state, by table and column.
+ *
+ * Transcribed from database/fatclinic.sql and held to it: `db:consultation-test`
+ * fails if an entry is not declared there, and `db:crud` asks the live database
+ * whether the row was really stored. A bound added here without the schema cannot
+ * pass both.
+ *
+ * `vitals` is deliberately absent. Those twelve measurements are checked in the
+ * nursing form instead, by `vitalsLimits`, because a nurse who typed a
+ * temperature of 22 °C has to be told what the column accepts - a refusal naming a
+ * table and a column is true but useless at the bedside, and the form is the only
+ * place that can ask for the number a second time. `db.recordVitals` still throws
+ * if the arithmetic produces something unstorable, so the backstop for a caller
+ * that bypasses the form is intact.
+ *
+ * Nor are the columns the database recalculates. Those are refused by
+ * `assertNoDbOwnedColumns`, and it runs after this: a range message about a column
+ * that must not be sent at all would explain the wrong problem. `db:crud` and the
+ * self-test both derive that exclusion from the `dbOwned` lists rather than from a
+ * second copy of them, so it cannot drift.
+ *
+ * Every remaining numeric CHECK in the schema is listed, grouped by table. Nothing
+ * here is a clinical judgement - each entry is a transcription, held to the schema
+ * file by `db:sync:test` and to the live constraints by `db:crud`.
+ */
+export const COLUMN_RANGES: Readonly<Record<string, { min?: number; max?: number; positiveOnly?: boolean }>> = {
+  'permission_nodes.depth': { min: 1, max: 4 },
+  'system_settings.inactivity_timeout_minutes': { positiveOnly: true },
+  'wards.capacity': { min: 0 },
+  'patients.age': { min: 0, max: 130 },
+  'online_bookings.age': { min: 0, max: 130 },
+
+  'lab_investigations.price': { min: 0 },
+  'lab_requests.total_price': { min: 0 },
+  'lab_test_orders.price': { min: 0 },
+
+  'medications.unit_price': { min: 0 },
+  'medications.current_stock': { min: 0 },
+  'medications.min_stock_alert': { min: 0 },
+
+  'prescriptions.total_price': { min: 0 },
+  'prescription_items.quantity_prescribed': { positiveOnly: true },
+  'prescription_items.quantity_dispensed': { min: 0 },
+  'prescription_items.unit_price': { min: 0 },
+  'prescription_items.total_price': { min: 0 },
+
+  'service_prices.price': { min: 0 },
+  'invoices.discount': { min: 0 },
+  'invoice_items.quantity': { positiveOnly: true },
+  'invoice_items.unit_price': { min: 0 },
+  'invoice_items.total_price': { min: 0 },
+  'payments.amount': { positiveOnly: true },
+
+  'radiology_orders.price': { min: 0 },
+  'physiotherapy_orders.sessions': { positiveOnly: true },
+  'physiotherapy_orders.sessions_completed': { min: 0 },
+  'physiotherapy_orders.price': { min: 0 },
+
+  'clinical_consumables.current_stock': { min: 0 },
+  'clinical_consumables.min_alert_level': { min: 0 },
+  'clinical_consumables.unit_price': { min: 0 },
+  'clinical_consumables.cost_price': { min: 0 },
+  'consumable_requests.quantity_requested': { positiveOnly: true },
+  'consumable_usage.quantity_used': { positiveOnly: true },
+  'consumable_usage.unit_price': { min: 0 },
+  'consumable_usage.total_charge': { min: 0 },
+  'medication_requests.quantity_requested': { positiveOnly: true },
+
+  'lab_stock_items.current_stock': { min: 0 },
+  'lab_stock_items.unit_cost': { min: 0 },
+  'lab_stock_items.min_alert_level': { min: 0 },
+  'lab_stock_requests.quantity_requested': { positiveOnly: true },
+};
+
+/**
+ * Refuses a value the column's own CHECK constraint would reject.
+ *
+ * An insert is one request, so a single out-of-range number voided an entire
+ * invoice line, prescription or stock request while the screen reported success -
+ * the same mechanism as the `NaN` refusal above, and the reason this has to
+ * happen before the request is built. Postgres's own message is
+ * `new row for relation "invoice_items" violates check constraint
+ * "invoice_items_quantity_check"`, which names the constraint and neither the value
+ * that caused it nor anything a person typed.
+ */
+function assertWithinColumnRanges(row: Record<string, unknown>, table: string): void {
+  for (const [key, value] of Object.entries(row)) {
+    if (typeof value !== 'number') continue;
+    const range = COLUMN_RANGES[`${table}.${key}`];
+    if (!range) continue;
+    const out =
+      range.positiveOnly
+        ? value <= 0
+        : (range.min !== undefined && value < range.min) || (range.max !== undefined && value > range.max);
+    if (!out) continue;
+    // Stated the way the constraint is, so the message can be read against the
+    // schema. `price >= 0` has no upper bound and must not claim to have one.
+    const bound = range.positiveOnly
+      ? 'greater than 0'
+      : range.max === undefined
+        ? `${range.min} or more`
+        : range.min === undefined
+          ? `${range.max} or less`
+          : `${range.min} to ${range.max}`;
+    throw new Error(
+      `${table}.${key} is ${value}, and that column accepts ${bound}. The row was not saved. ` +
+        'Check the figure it was reached from, because the whole row was refused rather than this one value.',
+    );
+  }
 }
 
 /** Guard against a mapper writing a column the database owns. */

@@ -60,6 +60,7 @@ import {
   queueDiff,
   recordPersisted,
 } from './sync';
+import { computeBmi, normaliseHeight } from './vitalsLimits';
 
 const STORAGE_KEYS = {
   SETTINGS: 'fatclinic_settings',
@@ -741,17 +742,23 @@ class FatClinicDatabase {
   }
 
   public recordVitals(vitalsData: Omit<Vitals, 'id' | 'recordedAt' | 'bmi' | 'bmiCategory'>, nurse: User): Vitals {
-    // Auto calculate BMI = weight (kg) / (height (m) ^ 2)
-    const h = vitalsData.height > 3 ? vitalsData.height / 100 : vitalsData.height; // handle cm vs m
-    const bmiVal = Number((vitalsData.weight / (h * h)).toFixed(1));
-    
-    let bmiCategory: Vitals['bmiCategory'] = 'Normal';
-    if (bmiVal < 18.5) bmiCategory = 'Underweight';
-    else if (bmiVal < 25) bmiCategory = 'Normal';
-    else if (bmiVal < 30) bmiCategory = 'Overweight';
-    else if (bmiVal < 35) bmiCategory = 'Obese Class I';
-    else if (bmiVal < 40) bmiCategory = 'Obese Class II';
-    else bmiCategory = 'Obese Class III';
+    // BMI and its category come from vitalsLimits, which is also what the form
+    // validates against. They used to be computed here, in a second place, from
+    // ranges the form never knew about: a weight and height that are each fine
+    // on their own can still produce a BMI wider than NUMERIC(4,1), and the
+    // resulting insert is refused with a complaint about a number the nurse
+    // never typed.
+    const h = normaliseHeight(vitalsData.height); // handle cm vs m
+    const computed = computeBmi(vitalsData.weight, h);
+    // The form refuses these before calling, so this is the backstop for any
+    // other caller rather than a silent clamp: a reading is either savable or it
+    // is not, and a value that is not savable must not be recorded as though it
+    // were.
+    if ('problem' in computed) {
+      throw new Error(`Vitals not recorded: ${computed.problem.message}`);
+    }
+    const bmiVal = computed.bmi;
+    const bmiCategory: Vitals['bmiCategory'] = computed.category;
 
     const newVitals: Vitals = {
       ...vitalsData,

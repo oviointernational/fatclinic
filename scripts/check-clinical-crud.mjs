@@ -402,34 +402,46 @@ async function bootstrap() {
     };
   }
 
+  /**
+   * An ordinary vitals reading, as the model carries it.
+   *
+   * Factored out because the constraint section below has to build a reading with
+   * one measurement changed, eight times over, and a hand-copied baseline is
+   * exactly how a probe ends up testing something other than what it names.
+   */
+  function baseVitalsModel() {
+    return {
+      id: `VIT${PREFIX}`,
+      visitId,
+      patientId,
+      recordedAt: now(),
+      nurseId: PROFILE,
+      nurseName: 'CRUD Audit',
+      temperature: 37,
+      systolicBp: 120,
+      diastolicBp: 80,
+      pulse: 72,
+      respiratoryRate: 16,
+      spo2: 98,
+      weight: 70,
+      height: 1.7,
+      bmi: 24.2,
+      bmiCategory: 'Normal',
+      painScore: 4,
+      nursingNotes: '',
+      nursingCarePlan: '',
+      nursingProcedures: [],
+      alerts: [],
+    };
+  }
+
   /** Leaf tables: created, edited and deleted inside the run, in that order. */
   const LEAF_CASES = [
     {
       table: 'vitals',
-      model: () => ({
-        id: `VIT${PREFIX}`,
-        visitId,
-        patientId,
-        recordedAt: now(),
-        nurseId: PROFILE,
-        nurseName: 'CRUD Audit',
-        temperature: 38.4,
-        systolicBp: 120,
-        diastolicBp: 80,
-        pulse: 92,
-        respiratoryRate: 20,
-        spo2: 98,
-        weight: 70,
-        height: 1.7,
-        bmi: 24.2,
-        bmiCategory: 'Normal',
-        painScore: 4,
-        // Blanked: the nursing notes boxes the clinician left empty.
-        nursingNotes: '',
-        nursingCarePlan: '',
-        nursingProcedures: [],
-        alerts: ['Fever'],
-      }),
+      // The same baseline the constraint section builds on, so the two probes
+      // cannot be testing different things.
+      model: () => ({ ...baseVitalsModel(), temperature: 38.4, pulse: 92, respiratoryRate: 20, alerts: ['Fever'] }),
       patch: { nursingNotes: 'Fluids advised', painScore: 2 },
       created: { temperature_c: 38.4, nursing_notes: '', nursing_procedures: [], alerts: ['Fever'] },
       patched: { nursing_notes: 'Fluids advised', pain_score: 2, temperature_c: 38.4 },
@@ -754,6 +766,229 @@ async function bootstrap() {
       check('its remaining diagnosis is deleted with the consultation', gone.rowCount === 0);
 
       // ---------------------------------------------------------------------
+      // ---------------------------------------------------------------------
+      // The form's ranges against the running database's own constraints.
+      //
+      // The bug: the nursing form checked only whether a box was empty, so a
+      // nurse typing T 22, BP 22/111 and pulse 11 was told "Recorded!", an audit
+      // row claimed the vitals were recorded, and the insert was refused - the
+      // table held nothing. The fix moved the CHECK constraints into the form.
+      //
+      // That fix is only worth anything if the two really agree, and the
+      // off-database check can only compare against the SQL *file*. So this asks
+      // the live database: for every constrained column, is the value the form
+      // would accept actually stored, and is the value just outside its range
+      // actually refused? A range widened in TypeScript without the schema
+      // cannot pass both halves.
+      section('the form accepts exactly what the vitals column accepts');
+
+      const limits = await import('../src/services/vitalsLimits.ts');
+      const VITALS_ID = `VIT${PREFIX}`;
+
+      /**
+       * Writes one reading through the real path and reads it back.
+       *
+       * `pushDiff(map, before, after)`: an empty `before` makes the row an insert.
+       * Getting those two the wrong way round is a silent no-op that looks like a
+       * database refusal, so the row itself is the only acceptable evidence.
+       */
+      const writeVitals = async (model) => {
+        const err = await write('vitals', mapOf('vitals'), [], [model]);
+        const row = (await sql.query(`select * from vitals where id = $1`, [VITALS_ID])).rows[0];
+        return { err, row };
+      };
+      const removeVitals = () => write('vitals', mapOf('vitals'), [{ id: VITALS_ID }], []);
+
+      /** A reading with one field changed and the derived BMI left consistent. */
+      const withField = (field, value) => {
+        const m = { ...baseVitalsModel(), [field]: value };
+        // Only recomputed when it is computable: a weight or height of 0 has no
+        // BMI, and the point of that probe is to isolate the column's own CHECK
+        // rather than trip two constraints at once.
+        const bmi = limits.computeBmi(m.weight, limits.normaliseHeight(m.height));
+        if ('bmi' in bmi) {
+          m.bmi = bmi.bmi;
+          m.bmiCategory = bmi.category;
+        }
+        m.height = limits.normaliseHeight(m.height);
+        return m;
+      };
+
+      const LIMIT_COLUMNS = [
+        { field: 'temperature', column: 'temperature_c', at: 37, outside: 24 },
+        { field: 'systolicBp', column: 'systolic_bp', at: 120, outside: 35 },
+        { field: 'diastolicBp', column: 'diastolic_bp', at: 80, outside: 15 },
+        { field: 'pulse', column: 'pulse_bpm', at: 72, outside: 15 },
+        { field: 'respiratoryRate', column: 'respiratory_rate', at: 16, outside: 2 },
+        { field: 'spo2', column: 'spo2_pct', at: 98, outside: 140 },
+        { field: 'weight', column: 'weight_kg', at: 70, outside: 0 },
+        { field: 'height', column: 'height_m', at: 1.7, outside: 0 },
+      ];
+
+      // Direction one: what the form accepts must store. A reading the database
+      // rejects is a reading a nurse typed correctly and the app called a fault.
+      const notAccepted = [];
+      for (const c of LIMIT_COLUMNS) {
+        const { err, row } = await writeVitals(withField(c.field, c.at));
+        if (err || !row || Number(row[c.column]) !== c.at) {
+          notAccepted.push(
+            `${c.column}: the form accepts ${c.at}, but the database ${
+              err ? `refused it (${err.message})` : `stored ${JSON.stringify(row?.[c.column])}`
+            }`,
+          );
+        }
+        await removeVitals();
+      }
+      check('every value the form accepts, the live column accepts', notAccepted.length === 0, notAccepted);
+
+      // Direction two: what the form refuses must also be refused by the database,
+      // or the form is refusing a legitimate reading. Narrowing a range is a
+      // clinical decision, and this is where an accidental one shows up.
+      const overTight = [];
+      for (const c of LIMIT_COLUMNS) {
+        const { err } = await writeVitals(withField(c.field, c.outside));
+        if (!err) overTight.push(`${c.column}: the form refuses ${c.outside}, but the database stored it`);
+        await removeVitals();
+      }
+      check('every value the form refuses, the live column also refuses', overTight.length === 0, overTight);
+
+      // The cross-field rule, which no single-column range can express: 70/140
+      // satisfies both integer ranges and is still not a blood pressure.
+      const bp = baseVitalsModel();
+      bp.systolicBp = 70;
+      bp.diastolicBp = 140;
+      const { err: bpErr } = await writeVitals(bp);
+      check(
+        'the database refuses a diastolic above the systolic, as the schema declares',
+        Boolean(bpErr),
+        'the reading was stored, so bp_ordering is not enforced on this database',
+      );
+      check('and the form refuses it first, with an explanation', limits.checkBloodPressureOrder(70, 140).length === 1);
+      await removeVitals();
+
+      // The reading that actually happened: 22 °C, 22/111, pulse 11, BMI 22400.
+      // One number the nurse never typed voided the whole record, and the audit
+      // trail - which is append-only, so it cannot be corrected - said otherwise.
+      const impossible = { ...baseVitalsModel(), temperature: 22, systolicBp: 22, diastolicBp: 111, pulse: 11 };
+      impossible.bmi = 22400;
+      impossible.bmiCategory = 'Obese Class III';
+      const { err: impossibleErr } = await writeVitals(impossible);
+      check(
+        'the reading the form used to accept is refused by the live database',
+        Boolean(impossibleErr),
+        'it was stored, so the constraint this fix relies on is not present',
+      );
+      check(
+        'and the form now refuses it before any request is made',
+        limits.checkVitals({
+          temperature: 22, systolicBp: 22, diastolicBp: 111, pulse: 11,
+          respiratoryRate: 16, spo2: 98, weight: 224, height: 0.1,
+        }).length > 0,
+      );
+      await removeVitals();
+
+      // The BMI column is narrower than the arithmetic assumes, so a weight and a
+      // height that are each valid can still overflow it. This is the specific
+      // mechanism that voided the record, so it is asserted rather than assumed.
+      const overflowingBmi = limits.computeBmi(400, 0.5);
+      check(
+        'a weight and height that each pass cannot produce a storable BMI',
+        'problem' in overflowingBmi,
+        `computeBmi(400, 0.5) returned ${JSON.stringify(overflowingBmi)}`,
+      );
+      check(
+        'so the form refuses the combination rather than sending it',
+        limits.checkVitals({ ...baseVitalsModel(), weight: 400, height: 0.5 }).length > 0,
+      );
+      const { err: overflowErr } = await writeVitals({ ...baseVitalsModel(), weight: 400, height: 0.5, bmi: 1600, bmiCategory: 'Obese Class III' });
+      check(
+        'and the database would have refused it too, for the same reason',
+        Boolean(overflowErr),
+        'it was stored, so bmi is wider than the form assumes',
+      );
+      await removeVitals();
+
+      // The boundary guard for every other numeric CHECK in the schema - the
+      // quantities, prices, stocks and session counts that no form range-checks.
+      // Two things are worth proving here, and neither is the off-database one:
+      // that the transcription still matches the *deployed* schema rather than
+      // only the file, and that the refusal happens in the app's real write path.
+      section('the guarded ranges are the ranges the deployed database declares');
+
+      // `information_schema.check_constraints` carries no table name and stores
+      // the clause as Postgres re-printed it, not as the file wrote it. So
+      // `BETWEEN 0 AND 130` arrives as two comparisons against 0 and 130, and
+      // every NUMERIC bound arrives cast - `unit_price >= (0)::numeric`. Reading
+      // that back into a range is the only way to compare it with the file, and
+      // it is also the only way to notice a constraint that exists in the
+      // database but not in the schema the app ships.
+      const live = (await sql.query(`
+        select ccu.table_name, ccu.column_name, cc.check_clause
+        from information_schema.check_constraints cc
+        join information_schema.constraint_column_usage ccu
+          on ccu.constraint_schema = cc.constraint_schema
+         and ccu.constraint_name = cc.constraint_name
+        where cc.constraint_schema = 'public'
+      `)).rows;
+      const liveRanges = new Map();
+      for (const r of live) {
+        // Only comparisons of this column against a number. One against another
+        // column - `bp_ordering`, `quantity_dispensed <= quantity_prescribed` -
+        // is a cross-field rule, not a range, and is not one of these.
+        const on = new RegExp(`"?${r.column_name}"?\\s*(>=|<=|>|<)\\s*\\(?\\s*(-?[\\d.]+)`, 'g');
+        const ops = [...String(r.check_clause).matchAll(on)].map((m) => ({ op: m[1], n: Number(m[2]) }));
+        if (ops.length === 0) continue;
+        const at = (op) => ops.find((o) => o.op === op)?.n;
+        const range = {};
+        if (at('>=') !== undefined) range.min = at('>=');
+        if (at('>') !== undefined && at('>=') === undefined) range.positiveOnly = at('>') === 0;
+        if (at('<=') !== undefined) range.max = at('<=');
+        if (at('<') !== undefined && at('<=') === undefined) range.max = at('<');
+        if (Object.keys(range).length === 0) continue;
+        liveRanges.set(`${r.table_name}.${r.column_name}`, range);
+      }
+      check('the deployed schema\'s numeric CHECKs were all read', liveRanges.size > 40, `read ${liveRanges.size} of ${live.length} constraint rows`);
+
+      // The file is what the app transcribes from and the database is what
+      // actually refuses, so the guard is only as good as their agreement.
+      const schemaFile = (await import('node:fs')).readFileSync(new URL('../database/fatclinic.sql', import.meta.url), 'utf8');
+      const fileRanges = new Map();
+      for (const m of schemaFile.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)\s*\(([\s\S]*?)\n\);/g)) {
+        for (const line of m[2].split('\n').map((l) => l.replace(/--.*$/, '').trim()).filter(Boolean)) {
+          if (/^CONSTRAINT\b/i.test(line)) continue;
+          const between = line.match(/^(\w+)\s+.*?\bCHECK\s*\(\s*\w+\s+BETWEEN\s+(\S+)\s+AND\s+(\S+)\s*\)/i);
+          if (between) { fileRanges.set(`${m[1]}.${between[1]}`, { min: Number(between[2]), max: Number(between[3]) }); continue; }
+          const bound = line.match(/^(\w+)\s+.*?\bCHECK\s*\(\s*\w+\s*(>=|>)\s*(\S+?)\s*\)/i);
+          if (bound) fileRanges.set(`${m[1]}.${bound[1]}`, bound[2] === '>' ? { positiveOnly: true } : { min: Number(bound[3]) });
+        }
+      }
+      const drifted = [...fileRanges.keys()].filter((key) => JSON.stringify(fileRanges.get(key)) !== JSON.stringify(liveRanges.get(key)));
+      check('every range the schema file states, the deployed database agrees with', drifted.length === 0, drifted.map((k) => `${k}: file ${JSON.stringify(fileRanges.get(k))}, live ${JSON.stringify(liveRanges.get(k))}`).join('; '));
+
+      // And the guard, in the real write path. A line item of zero is refused
+      // locally - so the complaint names the column and the figure, and the
+      // invoice is not half-written on the way to being refused.
+      const invoiceOf = (quantity) => ({
+        id: `INV${PREFIX}`, visitId, patientId,
+        date: '2026-03-04', discount: 0, requirePrepayment: false,
+        items: [{ id: `ITI${PREFIX}`, serviceCategory: 'Laboratory', description: 'PCV', quantity, unitPrice: 1000, totalPrice: 1000 * quantity }],
+      });
+      const zeroLine = await write('invoices', mapOf('invoices'), [], [invoiceOf(0)]);
+      const nothingStored = await sql.query(`select count(*)::int as n from invoice_items where id = $1`, [`ITI${PREFIX}`]);
+      check(
+        'a zero-quantity line is refused by the app, by name, before any request',
+        /invoice_items\.quantity is 0/.test(zeroLine?.message ?? '') && /greater than 0/.test(zeroLine?.message ?? ''),
+        zeroLine?.message ?? 'no error was raised',
+      );
+      check('and nothing was written on the way to being refused', nothingStored.rows[0].n === 0, `${nothingStored.rows[0].n} row(s) written`);
+      check('the guard names the column, not the constraint', !/check constraint/.test(zeroLine?.message ?? ''), zeroLine?.message);
+
+      const goodLine = await write('invoices', mapOf('invoices'), [], [invoiceOf(2)]);
+      const storedLine = await sql.query(`select quantity, unit_price, total_price from invoice_items where id = $1`, [`ITI${PREFIX}`]);
+      check('a legitimate line is still written', !goodLine && storedLine.rowCount === 1, goodLine?.message ?? 'not stored');
+      check('with the quantity it was given', Number(storedLine.rows[0]?.quantity) === 2, storedLine.rows[0]?.quantity);
+      await sql.query(`delete from invoices where id = $1`, [`INV${PREFIX}`]);
+
       section('the visit, then the patient, once nothing hangs off them');
       error = await write('visits', mapOf('visits'), [visit], []);
       const visitLeft = await sql.query(`select 1 from visits where id = $1`, [visitId]);
