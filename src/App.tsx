@@ -144,10 +144,10 @@ export const App: React.FC = () => {
       <div className="w-screen h-screen overflow-hidden flex items-center justify-center bg-light-bg dark:bg-dark-bg p-6">
         <div className="w-full max-w-sm p-8 rounded-3xl bg-white dark:bg-dark-card border border-light-border dark:border-dark-border shadow-2xl text-center space-y-4">
           <div className="w-14 h-14 mx-auto rounded-full bg-gradient-to-tr from-emerald-600 via-teal-500 to-emerald-400 flex items-center justify-center text-white text-2xl font-black shadow-md">
-            F
+            S
           </div>
           <div>
-            <h2 className="text-lg font-extrabold text-slate-900 dark:text-white">FatClinic Workstation</h2>
+            <h2 className="text-lg font-extrabold text-slate-900 dark:text-white">Solace Medicares Workstation</h2>
             <p className="text-xs text-slate-500 mt-1">You signed out. Patient data is hidden until you sign in again.</p>
           </div>
           <button

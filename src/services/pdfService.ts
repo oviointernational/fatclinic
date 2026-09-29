@@ -172,7 +172,7 @@ export const pdfService = {
           <div class="footer-sign">
             <div>
               Generated on: <strong>${new Date().toLocaleString()}</strong><br>
-              FatClinic Connected Health Information System (EHR v2.6)
+              Solace Medicares Connected Health Information System (EHR v2.6)
             </div>
             <div style="text-align: right;">
               Certified Electronic Medical Record<br>

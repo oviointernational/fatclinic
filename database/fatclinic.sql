@@ -761,7 +761,7 @@ CREATE TABLE IF NOT EXISTS lab_stock_requests (
 -- Single-row tables: id is pinned to 1 by a CHECK.
 CREATE TABLE IF NOT EXISTS system_settings (
   id                         INTEGER PRIMARY KEY CHECK (id = 1),
-  hospital_name              TEXT NOT NULL DEFAULT 'FatClinic & Medical Specialties',
+  hospital_name              TEXT NOT NULL DEFAULT 'Solace Medicares & Medical Specialties',
   tagline                    TEXT NOT NULL DEFAULT '',
   address                    TEXT NOT NULL DEFAULT '',
   phone                      TEXT NOT NULL DEFAULT '',
@@ -1709,10 +1709,10 @@ INSERT INTO system_settings
   (id, hospital_name, tagline, address, phone, email, currency, currency_code,
    invoice_prefix, patient_prefix, inactivity_timeout_minutes)
 VALUES
-  (1, 'FatClinic & Medical Specialties',
+  (1, 'Solace Medicares & Medical Specialties',
    'Precision Care. Connected Health. Zero Compromise.',
    '14 Healthcare Boulevard, Medical District, Victoria Island',
-   '+234 (0) 1 800-FATCLINIC', 'care@fatclinic.health',
+   '+234 (0) 1 800-FATCLINIC', 'care@solacemedicares.com',
    '₦', 'NGN', 'FC-INV', 'FC', 5)
 ON CONFLICT (id) DO NOTHING;
 
@@ -1721,10 +1721,10 @@ INSERT INTO receipt_settings
    receipt_prefix, show_receipt_count, show_payment_method, show_received_by,
    show_bank_details, show_invoice_position, show_thank_you)
 VALUES
-  (1, 'FatClinic & Medical Specialties',
+  (1, 'Solace Medicares & Medical Specialties',
    'Precision Care. Connected Health. Zero Compromise.',
    '14 Healthcare Boulevard, Medical District, Victoria Island',
-   '+234 (0) 1 800-FATCLINIC', 'care@fatclinic.health',
+   '+234 (0) 1 800-FATCLINIC', 'care@solacemedicares.com',
    'Thank you for your patronage. This receipt is computer-generated and valid without signature.',
    'Fees are payable before service except emergencies. Balances must be cleared before discharge.',
    'RCP', TRUE, TRUE, TRUE, TRUE, TRUE, TRUE)

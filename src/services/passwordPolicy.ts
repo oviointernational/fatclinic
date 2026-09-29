@@ -39,7 +39,8 @@ export const MAX_PASSWORD_LENGTH = 200;
 const TOO_WEAK = new Set([
   'password', 'password1', 'password123', '12345678', '123456789', '1234567890',
   'qwertyuiop', 'letmein123', 'welcome123', 'admin1234', 'iloveyou123',
-  'fatclinic', 'fatclinic123', 'clinic1234', 'hospital123',
+  'fatclinic', 'fatclinic123', 'solacemedicares', 'solacemedicares123',
+  'clinic1234', 'hospital123',
 ]);
 
 /**

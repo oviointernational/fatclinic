@@ -182,7 +182,12 @@ function saveStorage<T>(key: string, value: T): void {
 // version is what actually removes them from machines that already have them -
 // leaving them in localStorage would mean an account whose credential nobody,
 // including the database, still recognises.
-const STORAGE_VERSION = 3;
+//
+// v4: the clinic rebranded to "Solace Medicares & Medical Specialties"
+// (contact email care@solacemedicares.com). Bumping clears cached settings and
+// seeded records on machines that pre-date the rebrand, so the new identity is
+// what boots instead of a stale "FatClinic" cached in localStorage.
+const STORAGE_VERSION = 4;
 const VERSION_KEY = 'fatclinic_schema_version';
 
 function ensureProductionStorage(): void {

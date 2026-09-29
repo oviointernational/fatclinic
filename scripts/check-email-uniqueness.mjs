@@ -53,7 +53,7 @@ const client = new pg.Client({
 });
 
 const stamp = Date.now();
-const PROBE = `constraint-probe-${stamp}@fatclinic.health`;
+const PROBE = `constraint-probe-${stamp}@solacemedicares.com`;
 
 await client.connect();
 

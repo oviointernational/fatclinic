@@ -15,11 +15,11 @@ import {
 } from '../types';
 
 export const initialSettings: SystemSettings = {
-  hospitalName: 'FatClinic & Medical Specialties',
+  hospitalName: 'Solace Medicares & Medical Specialties',
   tagline: 'Precision Care. Connected Health. Zero Compromise.',
   address: '14 Healthcare Boulevard, Medical District, Victoria Island',
   phone: '+234 (0) 1 800-FATCLINIC',
-  email: 'care@fatclinic.health',
+  email: 'care@solacemedicares.com',
   currency: '₦',
   currencyCode: 'NGN',
   invoicePrefix: 'FC-INV',
@@ -28,11 +28,11 @@ export const initialSettings: SystemSettings = {
 };
 
 export const initialReceiptSettings: import('../types').ReceiptSettings = {
-  hospitalName: 'FatClinic & Medical Specialties',
+  hospitalName: 'Solace Medicares & Medical Specialties',
   tagline: 'Precision Care. Connected Health. Zero Compromise.',
   address: '14 Healthcare Boulevard, Medical District, Victoria Island',
   phone: '+234 (0) 1 800-FATCLINIC',
-  email: 'care@fatclinic.health',
+  email: 'care@solacemedicares.com',
   footerMessage: 'Thank you for your patronage. This receipt is computer-generated and valid without signature.',
   termsLine: 'Fees are payable before service except emergencies. Balances must be cleared before discharge.',
   receiptPrefix: 'RCP',
@@ -53,7 +53,7 @@ export const initialReceiptSettings: import('../types').ReceiptSettings = {
 // The first administrator is created from the command line instead:
 //
 //     node scripts/provision-staff.mjs --name "Dr. Sarah Alabi" \
-//       --email you@fatclinic.health --role ADMINISTRATOR
+//       --email you@solacemedicares.com --role ADMINISTRATOR
 //
 // See database/fatclinic.sql for the same note on the SQL side.
 export const initialUsers: User[] = [];

@@ -201,7 +201,7 @@ export const PasswordResetModal: React.FC<PasswordResetModalProps> = ({
                       setEmail(e.target.value);
                       setRequestError(null);
                     }}
-                    placeholder="you@fatclinic.health"
+                    placeholder="you@solacemedicares.com"
                     className="w-full px-3 py-2 text-xs rounded-xl bg-slate-50 dark:bg-dark-surface border border-light-border dark:border-dark-border text-slate-800 dark:text-slate-100 focus:ring-2 focus:ring-emerald-500 focus:outline-none"
                   />
                 </div>

@@ -1539,7 +1539,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
                 <input
                   type="email"
                   required
-                  placeholder="ngozi@fatclinic.org"
+                  placeholder="ngozi@solacemedicares.com"
                   value={userForm.email}
                   onChange={e => setUserForm({ ...userForm, email: e.target.value })}
                   className="w-full px-3 py-2 rounded-xl border bg-slate-50 dark:bg-dark-surface"

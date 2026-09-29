@@ -581,7 +581,7 @@ await block('credentials never leave the browser', async () => {
   // The sign-in lookup is an exact, case-insensitive match against this column,
   // and uq_users_email_lower is unique on lower(email). A row written with
   // mixed case would be one the clinician can authenticate as but never find.
-  const cases = ['Dr@FatClinic.Health', '  Ngozi@FatClinic.Health  ', 'ALABI@FATALCLINIC.HEALTH'];
+  const cases = ['Dr@SolaceMedicares.Com', '  Ngozi@SolaceMedicares.Com  ', 'ALABI@SOLACEMEDICARES.COM'];
   const written = cases.map((e) => users.modelToRow({ ...users.rowToModel(syntheticRow('users')), email: e }).email);
   check(
     'every written staff email is trimmed and lowercased',
@@ -590,7 +590,7 @@ await block('credentials never leave the browser', async () => {
   );
   check(
     'the lowercased form is what the self-test expects to look up',
-    written[0] === 'dr@fatclinic.health' && written[1] === 'ngozi@fatclinic.health',
+    written[0] === 'dr@solacemedicares.com' && written[1] === 'ngozi@solacemedicares.com',
     written.join(' | '),
   );
   check(

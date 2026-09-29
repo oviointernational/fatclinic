@@ -1,4 +1,4 @@
-# FatClinic EHR
+# Solace Medicares EHR
 
 Hospital information system: dashboard, front desk, clinical care & triage,
 laboratory, pharmacy, radiology, physiotherapy, billing, AI assistant, admin.
@@ -65,9 +65,9 @@ re-running it is safe.
    ```bash
    npm run staff:list                       # who exists, and who can sign in
    npm run staff:add -- --dry-run \
-     --name "Dr. Sarah Alabi" --email you@fatclinic.health --role ADMINISTRATOR
+     --name "Dr. Sarah Alabi" --email you@solacemedicares.com --role ADMINISTRATOR
    npm run staff:add -- \
-     --name "Dr. Sarah Alabi" --email you@fatclinic.health --role ADMINISTRATOR
+     --name "Dr. Sarah Alabi" --email you@solacemedicares.com --role ADMINISTRATOR
    ```
 
    Omit `--password` and one is generated and printed once. Never paste that key
@@ -86,7 +86,7 @@ re-running it is safe.
 7. Prove the whole path works, with a real sign-in:
    ```bash
    STAFF_PASSWORD='the-generated-password' \
-     npm run db:check-signin -- you@fatclinic.health
+     npm run db:check-signin -- you@solacemedicares.com
    ```
    This signs in for real, reads through the live API, and asserts that the SQL
    helpers resolve, that an admin may write to configuration, that a
@@ -290,7 +290,7 @@ So every live script now confirms by listing: `db:crud` and
 `db:check-deployed` now do, and `db:check-forgot-password` is the backstop that
 notices a probe account left by *any* of them — matched on the prefix of the
 local part, never the domain, because the probes deliberately live on the
-clinic's own `@fatclinic.health`.
+clinic's own `@solacemedicares.com`.
 
 The one subtlety: a just-created account does not show up in the admin listing
 straight away, so "look for it by email and see it is absent" is satisfied by an
@@ -887,7 +887,7 @@ Two things that make this easier to get wrong than they look:
 | `npm run db:check-email` | Inserts a real staff row and proves the live database refuses a second one for the same address, including when only the case differs. The form's message is help; this is the guarantee | yes (service_role) |
 | `npm run db:probe-auth-admin` | Pins the Auth admin API shapes the function depends on (`PUT` is the only update verb, `?filter=` is ignored so an email lookup must page), then deletes the account it made | yes (service_role) |
 | `npm run db:check-profile-lookup` | Signs in for real as a throwaway clinician and runs the exact `select *` on `users` that sign-in depends on. A column-level grant change once made that query fail, and `fetchProfile` reported it as "Could not reach the sign-in service" — so this pins the query login cannot do without | yes (service_role) |
-| `npm run db:check-forgot-password` | The administrator-only reset link, end to end: the function answers a caller with **no session**, a clinician / a disabled admin / an admin with no sign-in account are all refused, an unknown address gets the byte-identical reply a clinician gets, the reply carries no profile id or auth UUID, a real administrator does get a link, the generated link comes back to the deployed app in the URL fragment the app parses, and every request is audited with no actor. It is also the check that notices a **probe account left behind** by any of the live scripts, matched on the prefix of the local part rather than the domain — the probes live on the clinic's own `@fatclinic.health` so they exercise the real uniqueness and rate-limit paths, so a domain match would also match every member of staff. Proves a link is *generated* — only the recipient can confirm it *arrives* | yes (service_role) |
+| `npm run db:check-forgot-password` | The administrator-only reset link, end to end: the function answers a caller with **no session**, a clinician / a disabled admin / an admin with no sign-in account are all refused, an unknown address gets the byte-identical reply a clinician gets, the reply carries no profile id or auth UUID, a real administrator does get a link, the generated link comes back to the deployed app in the URL fragment the app parses, and every request is audited with no actor. It is also the check that notices a **probe account left behind** by any of the live scripts, matched on the prefix of the local part rather than the domain — the probes live on the clinic's own `@solacemedicares.com` so they exercise the real uniqueness and rate-limit paths, so a domain match would also match every member of staff. Proves a link is *generated* — only the recipient can confirm it *arrives* | yes (service_role) |
 | `npm run db:check-forced-password-change` | The first sign-in after an administrator has issued a password, end to end: the function exists, takes no argument, runs as the definer with a pinned search_path, and only `authenticated` can execute it; a clinician can clear **their own** flag and the database records it; nobody else's row is touched; it cannot grant a role, deactivate an account, or reach a colleague; `anon` cannot call it; a clinician still **cannot** write `users` by any other route (asserted on purpose - it is why the function exists); and Supabase's "you already have that password" refusal is refused, recognised, and not sent to an administrator. This is the check for the lockout where the change *succeeded*, the screen stayed, and the retry was reported as a fault. Its throwaway account is confirmed gone by listing, because this is the script that hands a real role to a fake clinician and drives sign-in end to end | yes (service_role) |
 | `npm run db:check-function-live` | Tells a deployed `staff-accounts` apart from an undeployed one, proves the **handler** (not the gateway - `verify_jwt` is off) refuses `create` without a session and to a forged token, and proves the same caller is still *answered* for `forgot` | no (HTTP) |
 | `npm run db:check-deployed` | Tests the function **Supabase is actually serving**, not the file on disk: a password containing the staff name is refused, an older rule is still refused, a good password really authenticates, a clinician is refused, and it deletes what it created — then confirms the account is absent from a fresh listing rather than trusting the `200` | yes + a password |

@@ -63,7 +63,7 @@ const SVC = env.SUPABASE_SERVICE_ROLE_KEY;
 const ADMIN = { apikey: SVC, Authorization: `Bearer ${SVC}`, 'Content-Type': 'application/json' };
 
 const stamp = Date.now().toString().slice(-8);
-const EMAIL = `forcedcheck-${stamp}@fatclinic.health`;
+const EMAIL = `forcedcheck-${stamp}@solacemedicares.com`;
 const ISSUED = `Issued-${stamp}!Harbour3`;
 const CHOSEN = `Chosen-${stamp}!Lantern8`;
 const PROFILE = `USR-FC${stamp}`;

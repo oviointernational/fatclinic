@@ -44,10 +44,10 @@ const SVC = env.SUPABASE_SERVICE_ROLE_KEY;
 // the honest surface: no real clinician is ever provisioned with these
 // addresses, and the probe suites generate fresh ones every run.
 const USER_SURFACE = `(
-  email like 'crudaudit-%@fatclinic.health'
-  or email = 'forcedchange-probe@fatclinic.health'
-  or email like 'browserprobe-%@fatclinic.health'
-  or (id like 'USR-A%' and email like 'crudaudit-%@fatclinic.health')
+  email like 'crudaudit-%@solacemedicares.com'
+  or email = 'forcedchange-probe@solacemedicares.com'
+  or email like 'browserprobe-%@solacemedicares.com'
+  or (id like 'USR-A%' and email like 'crudaudit-%@solacemedicares.com')
   or id in ('USR-FC557978', 'FB-U9108760')
 )`;
 const PATIENT_ID = 'FB-P9108760';

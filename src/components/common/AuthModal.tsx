@@ -69,7 +69,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onOpenPas
           <div className="flex items-center space-x-2">
             <ShieldCheck className="w-5 h-5 text-emerald-500" />
             <h3 className="text-base font-extrabold text-slate-800 dark:text-white">
-              FatClinic Workstation Access
+              Solace Medicares Workstation Access
             </h3>
           </div>
           <button
@@ -93,7 +93,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onOpenPas
                 autoComplete="username"
                 value={email}
                 onChange={e => { setEmail(e.target.value); setError(null); }}
-                placeholder="you@fatclinic.health"
+                placeholder="you@solacemedicares.com"
                 className="w-full px-3 py-2 text-xs rounded-xl bg-slate-50 dark:bg-dark-surface border border-light-border dark:border-dark-border text-slate-800 dark:text-slate-100 focus:ring-2 focus:ring-emerald-500 focus:outline-none"
               />
             </div>

@@ -23,7 +23,7 @@
  *   # First administrator. Creates the auth account and the profile together.
  *   npm run staff:add -- \
  *     --name "Dr. Sarah Alabi" \
- *     --email alabi@fatclinic.health \
+ *     --email alabi@solacemedicares.com \
  *     --role ADMINISTRATOR \
  *     --password 'choose-something-long'
  *

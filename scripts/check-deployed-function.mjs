@@ -53,7 +53,7 @@ const ADMIN = 'ernestoviosun@gmail.com';
 const ADMIN_PW = process.env.STAFF_PASSWORD;
 
 const stamp = Date.now();
-const PROBE_EMAIL = `zainab-probe-${stamp}@fatclinic.health`;
+const PROBE_EMAIL = `zainab-probe-${stamp}@solacemedicares.com`;
 const PROBE_NAME = 'Zainab Probeworthy';
 const PROBE_ID = `USR-PROBE${stamp}`;
 
@@ -179,7 +179,7 @@ if (!ADMIN_PW) {
     // 4. Authorisation still holds on the deployed copy.
     if (withGood.token) {
       const asClinician = await callFn(withGood.token, {
-        action: 'create', email: 'someone-else-probe@fatclinic.health', password: 'Another-Good-11!X',
+        action: 'create', email: 'someone-else-probe@solacemedicares.com', password: 'Another-Good-11!X',
       });
       check('a clinician is refused by the deployed function',
         asClinician.status === 403 || asClinician.json?.code === 'not_admin',

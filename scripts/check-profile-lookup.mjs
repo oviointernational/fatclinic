@@ -62,7 +62,7 @@ const stamp = Date.now();
 const PROBE = {
   id: `USR-P${stamp}`,
   name: 'Sign-in Path Probe',
-  email: `signin-probe-${stamp}@fatclinic.health`,
+  email: `signin-probe-${stamp}@solacemedicares.com`,
   password: `Probe-${stamp}!Vault7`,
 };
 

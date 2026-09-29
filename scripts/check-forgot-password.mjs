@@ -116,13 +116,13 @@ const stamp = Date.now();
 const clinician = {
   id: `USR-F${stamp}`,
   name: 'Reset Clinician Probe',
-  email: `reset-clinician-${stamp}@fatclinic.health`,
+  email: `reset-clinician-${stamp}@solacemedicares.com`,
   role: 'PHYSICIAN',
 };
 const disabledAdmin = {
   id: `USR-G${stamp}`,
   name: 'Reset Disabled Probe',
-  email: `reset-disabled-${stamp}@fatclinic.health`,
+  email: `reset-disabled-${stamp}@solacemedicares.com`,
   role: 'ADMINISTRATOR',
   active: false,
 };
@@ -130,7 +130,7 @@ const disabledAdmin = {
 const orphanAdmin = {
   id: `USR-H${stamp}`,
   name: 'Reset Orphan Probe',
-  email: `reset-orphan-${stamp}@fatclinic.health`,
+  email: `reset-orphan-${stamp}@solacemedicares.com`,
   role: 'ADMINISTRATOR',
 };
 
@@ -200,7 +200,7 @@ try {
 
   // --- 3. An unknown address is indistinguishable from a clinician ---------
   console.log('\nAn address that is not in the staff register');
-  const stranger = await callForgot(`stranger-${stamp}@fatclinic.health`);
+  const stranger = await callForgot(`stranger-${stamp}@solacemedicares.com`);
   check('an unknown address is refused', stranger.body?.sent === false, `sent=${stranger.body?.sent}`);
   check(
     'and gets the EXACT reply a clinician gets, so nobody can be enumerated',
@@ -280,7 +280,7 @@ try {
       const at = new URL(landed);
       check(
         'the link comes back to the deployed app, not to localhost',
-        at.hostname.includes('fatclinic') && at.hostname !== 'localhost',
+        at.hostname.includes('solacemedicares') && at.hostname !== 'localhost',
         at.origin,
       );
 
@@ -374,7 +374,7 @@ try {
 
   const accounts = await (await fetch(`${BASE}/auth/v1/admin/users?page=1&per_page=200`, { headers: ADMIN })).json();
   // Matched on the *prefix* of the local part, never the domain. The probe
-  // accounts live on the clinic's own `@fatclinic.health` so they exercise the
+  // accounts live on the clinic's own `@solacemedicares.com` so they exercise the
   // real uniqueness and rate-limit paths, and a domain match would therefore
   // also match every genuine member of staff - which is the mistake
   // scripts/demo-staff.mjs warns about in a comment.

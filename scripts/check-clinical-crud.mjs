@@ -102,7 +102,7 @@ async function bootstrap() {
   const ADMIN = { apikey: SVC, Authorization: `Bearer ${SVC}`, 'Content-Type': 'application/json' };
 
   const stamp = Date.now().toString().slice(-8);
-  const EMAIL = `crudaudit-${stamp}@fatclinic.health`;
+  const EMAIL = `crudaudit-${stamp}@solacemedicares.com`;
   const PASSWORD = `Audit-${stamp}!Rampart7`;
   const PROFILE = `USR-A${stamp}`;
   const PREFIX = `-A${stamp}`;
@@ -618,11 +618,11 @@ async function bootstrap() {
     const { rows: leftover } = await sql.query(
       `select id, email from users
         where id like 'USR-A%'
-           or email like 'crudaudit-%@fatclinic.health'
+           or email like 'crudaudit-%@solacemedicares.com'
            or id = 'USR-FC557978'
-           or email = 'forcedchange-probe@fatclinic.health'
+           or email = 'forcedchange-probe@solacemedicares.com'
            or id = 'FB-U9108760'
-           or email like 'browserprobe-%@fatclinic.health'`,
+           or email like 'browserprobe-%@solacemedicares.com'`,
     );
     if (leftover.length) {
       const ids = leftover.map((r) => r.id);

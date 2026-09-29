@@ -8,18 +8,18 @@
  * "demo" drift from the other's, which is exactly the kind of quiet
  * disagreement that ends with invented names in a real audit trail.
  *
- * This is a list, not a pattern, on purpose. A `like '%@fatclinic.health'` would
+ * This is a list, not a pattern, on purpose. A `like '%@solacemedicares.com'` would
  * also match a real clinician who was given a company address, and a cleanup
  * that can delete a real person's account is worse than no cleanup.
  */
 export const DEMO_STAFF_EMAILS = Object.freeze([
-  'adeleke@fatclinic.health',
-  'alabi@fatclinic.health',
-  'ngozi@fatclinic.health',
-  'ibrahim@fatclinic.health',
-  'kemi@fatclinic.health',
-  'tayo@fatclinic.health',
-  'emeka@fatclinic.health',
-  'chinedu.rad@fatclinic.health',
-  'amina.pt@fatclinic.health',
+  'adeleke@solacemedicares.com',
+  'alabi@solacemedicares.com',
+  'ngozi@solacemedicares.com',
+  'ibrahim@solacemedicares.com',
+  'kemi@solacemedicares.com',
+  'tayo@solacemedicares.com',
+  'emeka@solacemedicares.com',
+  'chinedu.rad@solacemedicares.com',
+  'amina.pt@solacemedicares.com',
 ]);

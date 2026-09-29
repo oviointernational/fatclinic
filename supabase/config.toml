@@ -17,7 +17,7 @@ project_id = "pltcaelohphezknpxpdj"
 [auth]
 # Where a reset link lands when the browser strips the token, and the fallback
 # when a link arrives with no destination. This is the deployed app on Cloudflare.
-site_url = "https://fatclinic.oviointernational.workers.dev"
+site_url = "https://solacemedicares.com"
 
 # The allow-list a password-reset link is permitted to redirect to. It has to be
 # declared here, not just in the dashboard, for the same reason the schema is:
@@ -32,7 +32,7 @@ site_url = "https://fatclinic.oviointernational.workers.dev"
 # will use whatever domain it was reached on, so the list below must contain the
 # origin people actually visit.
 additional_redirect_urls = [
-  "https://fatclinic.oviointernational.workers.dev",
+  "https://solacemedicares.com",
   "http://localhost:5173",
 ]
 

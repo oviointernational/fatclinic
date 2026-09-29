@@ -43,7 +43,7 @@ const SVC = env.SUPABASE_SERVICE_ROLE_KEY;
 const ADMIN = { apikey: SVC, Authorization: `Bearer ${SVC}`, 'Content-Type': 'application/json' };
 
 const stamp = Date.now().toString().slice(-8);
-const EMAIL = `crudaudit-${stamp}@fatclinic.health`; // reuses the probe surface the sweep and purge know
+const EMAIL = `crudaudit-${stamp}@solacemedicares.com`; // reuses the probe surface the sweep and purge know
 const PASSWORD = `Audit-${stamp}!Rampart7`;
 const PROFILE = `USR-A${stamp}`;
 
@@ -116,9 +116,9 @@ async function bootstrap() {
   const { rows: leftover } = await sql.query(
     `select id from users
       where id like 'USR-A%'
-         or email like 'crudaudit-%@fatclinic.health'
-         or id = 'USR-FC557978' or email = 'forcedchange-probe@fatclinic.health'
-         or id = 'FB-U9108760' or email like 'browserprobe-%@fatclinic.health'`,
+         or email like 'crudaudit-%@solacemedicares.com'
+         or id = 'USR-FC557978' or email = 'forcedchange-probe@solacemedicares.com'
+         or id = 'FB-U9108760' or email like 'browserprobe-%@solacemedicares.com'`,
   );
   if (leftover.length) {
     const ids = leftover.map((r) => r.id);
