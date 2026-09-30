@@ -85,6 +85,19 @@ const forgot = await probe(
   { action: 'forgot', email: 'not-an-address' },
 );
 
+// `change_email` joined `create` and `reset` after an administrator changed a
+// staff address on a profile that already had an account: the RLS write moved
+// one half of the sign-in identity and left the other behind, so resetting that
+// person afterwards looked like they had never had an account at all. The fix
+// lives in the function, so "the function understands change_email" is what has
+// to be true on the deployed copy - and it is also the one assertion that fails
+// loudly if a redeploy is missed, which is exactly when this matters.
+const changeEmail = await probe(
+  'no Authorization header, asking to move a sign-in address',
+  CRED,
+  { action: 'change_email', userId: '00000000-0000-0000-0000-000000000000', email: 'not-an-address' },
+);
+
 // An undeployed function has its own signature. Distinguish it from a 401 so
 // "not deployed yet" is never reported as "deployed and refusing".
 const deployed = !/Edge Function .* not found/i.test(JSON.stringify(noAuth.json));
@@ -111,6 +124,20 @@ check('a forged token is refused identically', forged.status === noAuth.status,
 check('the same caller is answered for "forgot" rather than refused',
   forgot.status === 400 && forgot.json?.code === 'invalid_email',
   `status ${forgot.status} code=${forgot.json?.code} - if this is 401, verify_jwt was re-enabled and the reset link is dead for the people it exists for`);
+
+// Two claims, asserted together. First, a refusal for `change_email` that is not
+// "unknown action" means the deployed copy has the handler that understands it.
+// Second, and just as important, that refusal is byte-for-byte the same shape as
+// `create`'s - so adding an operation did not widen this endpoint into something
+// whose action names a signed-out caller can enumerate.
+check('the deployed copy understands "change_email"', !/Unknown action/i.test(JSON.stringify(changeEmail.json)),
+  changeEmail.json?.code === 'upstream_failure' && /Unknown action/i.test(JSON.stringify(changeEmail.json))
+    ? 'answered "Unknown action" - the function needs redeploying (supabase functions deploy staff-accounts)'
+    : `answered code=${changeEmail.json?.code}`);
+
+check('and it refuses exactly as "create" does, with nothing to enumerate',
+  changeEmail.status === noAuth.status && changeEmail.json?.code === noAuth.json?.code,
+  `create ${noAuth.status}/${noAuth.json?.code} vs change_email ${changeEmail.status}/${changeEmail.json?.code}`);
 
 console.log(
   failures === 0

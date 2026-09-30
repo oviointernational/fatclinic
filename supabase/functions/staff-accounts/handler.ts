@@ -1,7 +1,7 @@
 /**
  * Privileged staff account operations: create a sign-in account, reset a
- * forgotten password, and email a reset link to an administrator who has
- * forgotten theirs.
+ * forgotten password, change the address an existing account signs in with,
+ * and email a reset link to an administrator who has forgotten theirs.
  *
  * WHY THIS EXISTS AS A SEPARATE FUNCTION
  * --------------------------------------
@@ -13,7 +13,7 @@
  *
  * The split is the whole point, and it is a narrow one: the browser keeps
  * writing ordinary clinic data straight to Postgres through RLS, and only the
- * three operations that genuinely require the privileged key come here.
+ * four operations that genuinely require the privileged key come here.
  *
  * WHAT IS TRUSTED HERE, AND WHAT IS NOT
  * -------------------------------------
@@ -66,6 +66,7 @@ export type FailureCode =
   | 'no_staff_profile'
   | 'account_exists'
   | 'no_auth_account'
+  | 'email_taken'
   | 'upstream_failure';
 
 /**
@@ -393,6 +394,12 @@ interface ResetBody {
   password: unknown;
 }
 
+interface ChangeEmailBody {
+  action: 'change_email';
+  userId: unknown;
+  email: unknown;
+}
+
 interface ForgotBody {
   action: 'forgot';
   email: unknown;
@@ -708,6 +715,149 @@ async function opReset(env: HandlerEnv, body: ResetBody, actor: StaffProfile) {
   };
 }
 
+/**
+ * Change the address a staff member signs in with.
+ *
+ * WHY THIS CANNOT HAPPEN IN THE BROWSER
+ * --------------------------------------
+ * Two records hold that address and only the second is privileged. The
+ * profile's `public.users.email` is an ordinary column any administrator can
+ * edit through RLS; GoTrue's copy lives behind the `service_role` key. The
+ * browser can therefore change one and not the other, which is not a partial
+ * save but a broken one: the profile would name an address the account has
+ * never signed in with, so their password no longer applies to it, and every
+ * RLS predicate in this database resolves identity by
+ * `lower(u.email) = lower(auth.jwt() ->> 'email')` (see database/fatclinic.sql),
+ * so their own live sessions would stop matching their own profile row. Both
+ * halves are changed here, together, by the one caller holding the key.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO
+ * --------------------------------
+ * No password is set and `must_change_password` is left exactly as it was:
+ * this changes who somebody IS, not what they may do. Forcing a password
+ * change on the strength of a corrected address would be inventing work for a
+ * clinician on the strength of a typo somebody else typed.
+ */
+async function opChangeEmail(env: HandlerEnv, body: ChangeEmailBody, actor: StaffProfile) {
+  const email = normaliseEmail(body.email);
+  if (!email) {
+    throw new HttpError(400, 'invalid_email', 'That email address is not valid.');
+  }
+
+  // The target is named by profile id, never by address: the address is the
+  // thing being changed, so it cannot also be how the row is found.
+  const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
+  if (!userId) {
+    throw new HttpError(400, 'no_staff_profile', 'No staff member was named for this change.');
+  }
+
+  const res = await restAsAdmin(
+    env,
+    `users?id=eq.${encodeURIComponent(userId)}&select=id,name,email,role,active,auth_user_id,must_change_password&limit=1`,
+  );
+  if (!res.ok) {
+    throw new HttpError(502, 'upstream_failure', 'Could not reach the staff register. Try again.');
+  }
+  const rows: StaffProfile[] = await readJson(res);
+  const profile = (rows ?? [])[0];
+  if (!profile) {
+    throw new HttpError(404, 'no_staff_profile', 'That staff member no longer has a profile.');
+  }
+
+  if (email === normaliseEmail(profile.email)) {
+    // Nothing to do, and reported as such rather than as a refusal: GoTrue
+    // treats a same-value write as a no-op, so this only saves a pointless
+    // round trip and an audit row describing a change that never happened.
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        code: 'email_changed',
+        message: 'That is already the address on file.',
+        data: { profileId: profile.id, email, hadAccount: Boolean(profile.auth_user_id) },
+      },
+    };
+  }
+
+  // Checked before anything is written rather than left to GoTrue's own 422,
+  // so the refusal names the actual reason - another colleague's account
+  // already signs in with this address, and two people cannot share one.
+  const taken = await findAuthUser(env, email);
+  if (taken && taken.id !== profile.auth_user_id) {
+    throw new HttpError(409, 'email_taken', 'Another sign-in account already uses that email address.');
+  }
+
+  if (profile.auth_user_id) {
+    // PUT is the only verb this project routes for an admin user update; PATCH
+    // answers 405. Confirmed by scripts/probe-auth-admin.mjs.
+    //
+    // `email_confirm: true` for the same reason create passes it: this project
+    // has no working mail relay, so an address left awaiting a confirmation
+    // mail would be an address nobody could ever sign in with.
+    const authRes = await gotrueAsAdmin(env, `/admin/users/${encodeURIComponent(profile.auth_user_id)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ email, email_confirm: true }),
+    });
+    const authBody = await readJson(authRes);
+    if (!authRes.ok || !authBody?.id) {
+      console.error('[staff-accounts] email change rejected by GoTrue', {
+        profile: profile.id,
+        auth_user_id: profile.auth_user_id,
+        status: authRes.status,
+        detail: authBody?.msg || authBody?.error_code || authBody,
+      });
+      // A race, not a mistake: something claimed the address between the
+      // check above and this write.
+      if (authRes.status === 422) {
+        throw new HttpError(409, 'email_taken', 'Another sign-in account already uses that email address.');
+      }
+      throw new HttpError(502, 'upstream_failure', 'The sign-in address could not be changed. Try again.');
+    }
+  }
+
+  const patch = await restAsAdmin(env, `users?id=eq.${encodeURIComponent(profile.id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ email }),
+  });
+  if (!patch.ok) {
+    console.error('[staff-accounts] email changed on the account but NOT on the profile', {
+      profile: profile.id,
+      status: patch.status,
+      detail: (await patch.text()).slice(0, 300),
+    });
+    // Said as the half-done state it is. With an account involved they can
+    // already sign in with the new address while the register still shows the
+    // old one, and hiding that behind "try again" would leave two sources
+    // disagreeing with no way for the administrator to know which is true.
+    throw new HttpError(
+      502,
+      'upstream_failure',
+      profile.auth_user_id
+        ? 'The sign-in address changed, but the staff register could not be updated. Save again to finish it.'
+        : 'The email address could not be saved. Try again.',
+    );
+  }
+
+  await audit(env, actor, {
+    action: 'CHANGE_STAFF_EMAIL',
+    targetEmail: email,
+    targetId: profile.id,
+    outcome: 'ok',
+  });
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      code: 'email_changed',
+      message: profile.auth_user_id
+        ? 'Sign-in address changed. They sign in with the new address from now on; if they are signed in right now, ask them to sign out and back in.'
+        : 'Email address updated.',
+      data: { profileId: profile.id, email, hadAccount: Boolean(profile.auth_user_id) },
+    },
+  };
+}
+
 // --- Entry point ------------------------------------------------------------
 
 const CORS_HEADERS: Record<string, string> = {
@@ -743,7 +893,7 @@ export async function handleStaffAccountRequest(req: Request, env: HandlerEnv): 
     return respond(500, { ok: false, code: 'upstream_failure', message: 'This function is not configured.' });
   }
 
-  let body: CreateBody | ResetBody | ForgotBody;
+  let body: CreateBody | ResetBody | ForgotBody | ChangeEmailBody;
   try {
     body = await req.json();
   } catch {
@@ -761,9 +911,9 @@ export async function handleStaffAccountRequest(req: Request, env: HandlerEnv): 
   // somebody signed out.
   //
   // Note what it does NOT do: it does not become a bypass for the other actions.
-  // `create` and `reset` fall straight through to the unchanged token check
-  // below, and an unrecognised action still cannot be distinguished from `create`
-  // or `reset` by a signed-out caller - they get the same 401, so the endpoint
+  // `create`, `reset` and `change_email` fall straight through to the unchanged
+  // token check below, and an unrecognised action still cannot be distinguished
+  // from those by a signed-out caller - they get the same 401, so the endpoint
   // still cannot be used to probe which action names exist.
   if (body?.action === 'forgot') {
     try {
@@ -815,13 +965,15 @@ export async function handleStaffAccountRequest(req: Request, env: HandlerEnv): 
         ? await opCreate(env, body as CreateBody, actor)
         : body?.action === 'reset'
           ? await opReset(env, body as ResetBody, actor)
-          : null;
+          : body?.action === 'change_email'
+            ? await opChangeEmail(env, body as ChangeEmailBody, actor)
+            : null;
 
     if (!result) {
       return respond(400, {
         ok: false,
         code: 'upstream_failure',
-        message: 'Unknown action. Expected "create" or "reset".',
+        message: 'Unknown action. Expected "create", "reset" or "change_email".',
       });
     }
     return respond(result.status, result.body);
@@ -831,10 +983,17 @@ export async function handleStaffAccountRequest(req: Request, env: HandlerEnv): 
       // malformed request, not an attempt at a known operation, and filing it
       // under whichever action it resembled would put a false entry in the log
       // an auditor reads.
-      const known = body?.action === 'create' || body?.action === 'reset';
-      if (known) {
+      const actionName =
+        body?.action === 'create'
+          ? 'CREATE_STAFF_ACCOUNT'
+          : body?.action === 'reset'
+            ? 'RESET_STAFF_PASSWORD'
+            : body?.action === 'change_email'
+              ? 'CHANGE_STAFF_EMAIL'
+              : null;
+      if (actionName) {
         await audit(env, actor, {
-          action: body.action === 'create' ? 'CREATE_STAFF_ACCOUNT' : 'RESET_STAFF_PASSWORD',
+          action: actionName,
           targetEmail: String((body as { email?: unknown })?.email ?? ''),
           targetId: null,
           outcome: `refused:${err.code}`,

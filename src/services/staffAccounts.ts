@@ -12,7 +12,7 @@
  *
  * The function is not a general-purpose backend and does not sit in the path of
  * clinic data. Ordinary records still go straight from the browser to Postgres
- * through RLS, exactly as before. This handles the two operations that genuinely
+ * through RLS, exactly as before. This handles the few operations that genuinely
  * require the privileged key, and nothing else.
  *
  * The request body is treated as a request, not as a claim: the function
@@ -37,6 +37,8 @@ export type StaffAccountFailure =
   | 'account_exists'
   /** No account exists, so "reset" is the wrong operation. */
   | 'no_auth_account'
+  /** Another account already signs in with the address being moved. */
+  | 'email_taken'
   | 'invalid_email'
   | 'weak_password'
   | 'unreachable';
@@ -93,6 +95,8 @@ function classify(status: number | undefined, code: string | undefined, fallback
       };
     case 'invalid_email':
       return { ok: false, reason: 'invalid_email', message };
+    case 'email_taken':
+      return { ok: false, reason: 'email_taken', message };
     case 'weak_password':
       return { ok: false, reason: 'weak_password', message };
     default:
@@ -117,6 +121,18 @@ function classify(status: number | undefined, code: string | undefined, fallback
 type FunctionReply = { ok: boolean; code?: string; message?: string };
 
 /**
+ * What the function accepts, one shape per operation.
+ *
+ * `change_email` is named by profile id rather than by the address, because the
+ * address is the thing being changed - the caller has to say which person it
+ * is about, and the only stable way to say that is the profile's own id.
+ */
+type StaffAccountRequest =
+  | { action: 'create'; email: string; password: string }
+  | { action: 'reset'; email: string; password: string }
+  | { action: 'change_email'; userId: string; email: string };
+
+/**
  * How many times the function is asked before a transient failure is reported.
  *
  * Free-tier projects put their Edge Function buckets to sleep; the first call
@@ -137,7 +153,7 @@ const RETRY_AFTER_MS = 900;
  */
 async function invokeOnce(
   client: NonNullable<ReturnType<typeof getSupabase>>,
-  body: { action: 'create' | 'reset'; email: string; password: string },
+  body: StaffAccountRequest,
 ): Promise<{ result: StaffAccountResult; transient: boolean }> {
   let payload: FunctionReply | null = null;
   let response: Response | null = null;
@@ -211,7 +227,7 @@ async function invokeOnce(
   }
 }
 
-async function call(body: { action: 'create' | 'reset'; email: string; password: string }): Promise<StaffAccountResult> {
+async function call(body: StaffAccountRequest): Promise<StaffAccountResult> {
   const client = getSupabase();
   if (!client) {
     return {
@@ -251,4 +267,27 @@ export function createStaffAccount(email: string, password: string): Promise<Sta
  */
 export function resetStaffPassword(email: string, password: string): Promise<StaffAccountResult> {
   return call({ action: 'reset', email: email.trim().toLowerCase(), password });
+}
+
+/**
+ * Change the address a staff member signs in with.
+ *
+ * Called only when the person already has an account. For somebody without one
+ * there is nothing privileged about an address change - the profile's `email`
+ * column is an ordinary field an administrator can edit through RLS - so the
+ * dashboard still edits that one directly and never pays for a round trip.
+ *
+ * WHY IT CANNOT BE LEFT TO THE RLS WRITE
+ * ---------------------------------------
+ * The sign-in address exists in two places, and only one of them is an ordinary
+ * column: `public.users.email`, which any administrator can write, and the
+ * Supabase Auth account, which needs the privileged key this function holds.
+ * Changing the first alone leaves the second pointing at the old address, and
+ * because every RLS predicate in this database resolves identity by
+ * `auth.jwt() ->> 'email'` against `users.email` (see database/fatclinic.sql),
+ * that does not merely stop them signing in again - it stops their existing
+ * session from matching their own profile row at all.
+ */
+export function changeStaffEmail(userId: string, email: string): Promise<StaffAccountResult> {
+  return call({ action: 'change_email', userId: userId.trim(), email: email.trim().toLowerCase() });
 }

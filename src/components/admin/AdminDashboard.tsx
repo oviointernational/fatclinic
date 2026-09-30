@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { db } from '../../services/db';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { useAuth, useCurrentUser } from '../../context/AuthContext';
-import { createStaffAccount, resetStaffPassword } from '../../services/staffAccounts';
+import { createStaffAccount, resetStaffPassword, changeStaffEmail } from '../../services/staffAccounts';
 import { passwordProblems, PASSWORD_RULES } from '../../services/passwordPolicy';
 import { 
   User, 
@@ -103,6 +103,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
   // Modal States: User
   const [isAddUserOpen, setIsAddUserOpen] = useState(false);
   const [editingUser, setEditingUser] = useState<User | null>(null);
+  const [isSavingUser, setIsSavingUser] = useState(false);
   const [userForm, setUserForm] = useState({
     name: '',
     email: '',
@@ -363,11 +364,60 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
     }
   };
 
-  const handleUpdateUser = (e: React.FormEvent) => {
+  /**
+   * Save an edited staff profile.
+   *
+   * The address is the one field that cannot be saved on its own once somebody
+   * has a sign-in account. `public.users.email` is an ordinary column this form
+   * can write through RLS, but the Supabase Auth account holds its own copy
+   * behind the privileged key - and since every RLS predicate in the database
+   * resolves identity by `auth.jwt() ->> 'email'` against `users.email`
+   * (database/fatclinic.sql), moving one without the other does not leave an
+   * inconvenience. It leaves a profile that no longer matches its own sessions,
+   * and a reset that then refuses with "no sign-in account yet" because it
+   * looks the account up by the address the form just changed.
+   *
+   * So the account is moved FIRST, through the function that can reach both
+   * halves. If it refuses - the address belongs to somebody else, the network
+   * is down - nothing has been written, the form still holds exactly what was
+   * typed, and the reason is shown where it can be acted on. On success the
+   * ordinary write below re-affirms the new address the server already has,
+   * which is a no-op rather than a conflict.
+   */
+  const handleUpdateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser || !editingUser) return;
+
+    // Read from the store, not from a captured copy: `editingUser` starts life as
+    // the stored row and only becomes a separate object once a field changes, so
+    // the two are the same thing exactly when nothing was edited - which is the
+    // one case that must not be treated as an address change.
+    const stored = db.getUserById(editingUser.id);
+    const emailChanged =
+      !!stored &&
+      stored.email.trim().toLowerCase() !== editingUser.email.trim().toLowerCase();
+
+    if (emailChanged && editingUser.authUserId) {
+      setIsSavingUser(true);
+      setAccountError(null);
+      try {
+        const moved = await changeStaffEmail(editingUser.id, editingUser.email);
+        if (!moved.ok) {
+          setAccountError(moved.message);
+          return;
+        }
+      } catch (err) {
+        console.error('[admin] could not change the sign-in address:', err);
+        setAccountError('The sign-in address could not be changed. Try again.');
+        return;
+      } finally {
+        setIsSavingUser(false);
+      }
+    }
+
     db.updateUser(editingUser, currentUser);
     setEditingUser(null);
+    setAccountError(null);
     showNotification('Staff profile & role updated!');
   };
 
@@ -1688,7 +1738,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
           <form onSubmit={handleUpdateUser} className="bg-white dark:bg-dark-card rounded-2xl border border-light-border dark:border-dark-border shadow-2xl p-6 w-full max-w-md space-y-4 text-xs">
             <div className="flex items-center justify-between border-b pb-3">
               <h3 className="font-extrabold text-sm text-slate-900 dark:text-white">Edit Staff Account: {editingUser.name}</h3>
-              <button type="button" onClick={() => setEditingUser(null)} className="text-slate-400 hover:text-slate-600">
+              <button type="button" onClick={() => { setEditingUser(null); setAccountError(null); }} className="text-slate-400 hover:text-slate-600">
                 <X className="w-4 h-4" />
               </button>
             </div>
@@ -1714,6 +1764,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
                   onChange={e => setEditingUser({ ...editingUser, email: e.target.value })}
                   className="w-full px-3 py-2 rounded-xl border bg-slate-50 dark:bg-dark-surface"
                 />
+                {editingUser.authUserId && (
+                  <p className="mt-1.5 text-[11px] font-semibold text-amber-700 dark:text-amber-400 leading-relaxed">
+                    This is also their sign-in address. Changing it moves their sign-in account with
+                    it, so they use the new address from now on — and if they are signed in at this
+                    moment, they will need to sign out and back in.
+                  </p>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -1765,19 +1822,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
               </div>
             </div>
 
+            {accountError && (
+              <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-[11px] font-bold text-rose-700 leading-relaxed">
+                {accountError}
+              </div>
+            )}
+
             <div className="flex justify-end space-x-2 pt-3 border-t">
               <button
                 type="button"
-                onClick={() => setEditingUser(null)}
-                className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-dark-surface font-bold text-slate-600"
+                onClick={() => { setEditingUser(null); setAccountError(null); }}
+                disabled={isSavingUser}
+                className="px-4 py-2 rounded-xl bg-slate-100 dark:bg-dark-surface font-bold text-slate-600 disabled:opacity-60"
               >
                 Cancel
               </button>
               <button
                 type="submit"
-                className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold shadow-sm"
+                disabled={isSavingUser}
+                className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white font-bold shadow-sm"
               >
-                Save Changes
+                {isSavingUser ? 'Saving…' : 'Save Changes'}
               </button>
             </div>
           </form>
