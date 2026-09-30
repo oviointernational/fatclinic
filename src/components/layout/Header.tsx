@@ -216,22 +216,17 @@ export const Header: React.FC<HeaderProps> = ({
   };
 
   return (
-    <header className="w-full h-16 px-6 flex items-center justify-between select-text bg-light-bg dark:bg-dark-bg text-light-text dark:text-dark-text transition-colors duration-200">
+    <header className="w-full h-14 px-4 sm:px-6 flex items-center justify-between select-text bg-light-bg dark:bg-dark-bg text-light-text dark:text-dark-text transition-colors duration-200">
       {/* Upper Left: Finely Crafted Name */}
       <div className="flex items-center space-x-3 cursor-pointer group" onClick={onNavigateHome}>
         <div className="w-10 h-10 rounded-full bg-gradient-to-tr from-emerald-600 via-teal-500 to-emerald-400 flex items-center justify-center text-white shadow-md group-hover:scale-105 transition-transform">
           <Activity className="w-5 h-5 text-white animate-pulse" />
         </div>
-        <div className="flex flex-col">
-          <div className="flex items-center space-x-1.5">
-            <span className="text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white font-sans">
-              Solace Medicare <span className="text-emerald-500">Consult</span>
-            </span>
-            <span className="px-2 py-0.5 text-[10px] font-bold tracking-widest uppercase rounded-full bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300">
-              EHR
-            </span>
-          </div>
-          <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 -mt-1 hidden sm:inline">
+        <div className="flex flex-col leading-tight">
+          <span className="text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white font-sans">
+            Solace Medicare <span className="text-emerald-500">Consult</span>
+          </span>
+          <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 hidden sm:inline">
             Precision Clinical & Hospital Information System
           </span>
         </div>
@@ -239,7 +234,7 @@ export const Header: React.FC<HeaderProps> = ({
 
       {/* Center: Global Fast Patient Search */}
       {isAuthenticated && (
-        <div className="relative w-72 md:w-96">
+        <div className="relative flex-1 min-w-[170px] max-w-md mx-4">
           <div className="relative flex items-center">
             <Search className="w-4 h-4 absolute left-3 text-slate-400 pointer-events-none" />
             <input
