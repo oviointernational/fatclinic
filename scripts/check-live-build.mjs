@@ -58,8 +58,62 @@ try {
   // Reported rather than assumed; an unknown HEAD cannot prove anything.
 }
 
+/**
+ * The newest commit that can change what a browser runs.
+ *
+ * The question a clinician cares about is not "is the site at HEAD?" but "is
+ * every fix that reaches a browser on the site?". A commit that only adds a
+ * check script or edits a comment produces no change to any bundle, and a check
+ * that calls the site stale for it is a check people learn to ignore - which
+ * loses the one property that made it worth writing.
+ *
+ * So HEAD is accepted, and so is the last commit to touch anything that ends up
+ * in the browser. What sits between them is named rather than counted, so what
+ * has been published without a deploy is visible instead of implied.
+ *
+ * `rev-list` and `--oneline` rather than `--format=%H` and `--format=%h %s`,
+ * because execSync on Windows goes through cmd.exe, which expands the `%h %s`
+ * pair as one undefined variable and replaces it with nothing. The log silently
+ * came back empty, and a tool whose entire job is to not be silent then reported
+ * that nothing had been skipped.
+ */
+function lastBrowserCommit() {
+  try {
+    return (
+      execSync('git rev-list -1 HEAD -- src public index.html vite.config.ts', {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'pipe', 'ignore'],
+        encoding: 'utf8',
+      }).trim() || head
+    );
+  } catch {
+    return head;
+  }
+}
+
+/** Commit subjects between two commits, newest first. */
+function commitsBetween(from, to) {
+  try {
+    return execSync(`git log --oneline ${from}..${to}`, {
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
+    })
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+const browserHead = head === 'unknown' ? head : lastBrowserCommit();
+
 console.log(`[deploy:check] ${LOCAL ? 'local build in dist/' : SITE}`);
 console.log(`[deploy:check] repository HEAD is ${head}`);
+if (browserHead !== head) {
+  console.log(`[deploy:check] newest commit touching the browser is ${browserHead.slice(0, 7)}`);
+}
 console.log('');
 
 let html;
@@ -144,6 +198,27 @@ if (!asset) {
       LOCAL
         ? '[deploy:check] this build carries the current commit, and is ready to publish.'
         : '[deploy:check] the live site is running the code in this repository.',
+    );
+  } else if (commits.includes(browserHead)) {
+    // The site is behind HEAD, but everything skipped since that build cannot
+    // reach a browser. Said plainly rather than reported as stale, because the
+    // whole point of this script is that it is worth believing when it says no.
+    const skipped = commitsBetween(commits[0], head);
+    console.log(`  the bundle was built from ${commits[0].slice(0, 7)}.`);
+    console.log(`  the repository is at ${head.slice(0, 7)}, and the newest change that`);
+    console.log(`  reaches a browser is ${browserHead.slice(0, 7)} - which is what is deployed.`);
+    if (skipped.length) {
+      console.log('');
+      console.log(`  ${skipped.length} commit(s) since then change no browser code:`);
+      for (const s of skipped) console.log(`      ${s}`);
+      console.log('');
+      console.log('  A deploy is not needed for any of these.');
+    }
+    console.log('');
+    console.log(
+      LOCAL
+        ? '[deploy:check] this build carries every change that reaches a browser.'
+        : '[deploy:check] the live site is running every fix that reaches a browser.',
     );
   } else {
     console.error(`  the bundle was built from ${commits[0].slice(0, 7)}.`);
