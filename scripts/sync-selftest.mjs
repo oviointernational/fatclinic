@@ -2137,6 +2137,81 @@ await block('a workflow change records who did it, and when the blood was drawn'
   check('an unentered panel releases nothing to describe', statusAuditDetail({ testName: 'Full Blood Count', results: [] }, 'Released').includes('analyte') === false);
 });
 
+await block('a status on screen cannot contradict the results beside it', async () => {
+  // A clinician reported being shown a released result beside the status
+  // "Processing". Nothing on screen was lying: the test really did have recorded
+  // analytes and a stored status of "Processing", because those two facts are
+  // stored independently. The rule below is what stops either view repeating
+  // that contradiction to whoever reads it.
+  const { reportedStatus, isFinalReport, hasReportedValues, statusInconsistency, storedStatusNote } =
+    await import('../src/services/labResults.ts');
+
+  const values = [
+    { parameterId: 'p', parameterName: 'Potassium', value: '6.4', unit: 'mmol/L', referenceRange: '3.5 - 5.1', flag: 'Critical' },
+  ];
+
+  // The reported case, exactly as it was found in the live database.
+  const stuck = { testName: 'Fasting Lipid Panel', status: 'Processing', results: values };
+
+  check('values recorded against a test are seen', hasReportedValues(stuck) === true);
+  check('a test with values and a lagging status is not a final report', isFinalReport(stuck) === false);
+  check('and the status shown is the one the data supports', reportedStatus(stuck) === 'Result Entered', reportedStatus(stuck));
+  check('never "Released", because nothing released it', reportedStatus(stuck) !== 'Released');
+  check('the stored status is still shown as a plain fact', storedStatusNote(stuck) === 'Recorded in the database as "Processing".', String(storedStatusNote(stuck)));
+
+  // A re-run keeps the earlier results until they are replaced, so a lagging
+  // status over recorded results is not by itself a defect - and must not be
+  // reported as one.
+  check('and is not reported as a lost workflow step', statusInconsistency(stuck) === null, String(statusInconsistency(stuck)));
+
+  // A normal release is untouched by any of this.
+  const released = { testName: 'Fasting Lipid Panel', status: 'Released', releasedAt: '2026-09-30T12:30:00.000Z', results: values };
+  check('a released report still reads as released', reportedStatus(released) === 'Released');
+  check('and is a final report', isFinalReport(released) === true);
+  check('with nothing to report against it', statusInconsistency(released) === null);
+  check('and no note, because the stored status is the one shown', storedStatusNote(released) === null);
+
+  // Verified is not Released, and must not be relabelled as one.
+  const verified = { ...released, status: 'Verified' };
+  check('a verified report keeps its own name', reportedStatus(verified) === 'Verified', reportedStatus(verified));
+  check('and is final', isFinalReport(verified) === true);
+
+  // A release time is a release, even when the status behind it is wrong.
+  const releasedTimeOnly = { status: 'Processing', releasedAt: '2026-09-30T12:30:00.000Z', results: values };
+  check('a recorded release time is a release whatever the status says', isFinalReport(releasedTimeOnly) === true);
+  check('and is shown as released', reportedStatus(releasedTimeOnly) === 'Released', reportedStatus(releasedTimeOnly));
+  check('with the stored value still reported', storedStatusNote(releasedTimeOnly) === 'Recorded in the database as "Processing".', String(storedStatusNote(releasedTimeOnly)));
+
+  // The dangerous direction: a release with nothing in it.
+  const emptyRelease = { status: 'Released', releasedAt: '2026-09-30T12:30:00.000Z', results: [] };
+  check('a released report with no results is not quietly believed', statusInconsistency(emptyRelease) !== null);
+  check('and is told plainly not to be treated as clear', statusInconsistency(emptyRelease).includes('do not treat it as a clear report'), statusInconsistency(emptyRelease));
+  check('whatever the derived label says', statusInconsistency({ status: 'Verified', results: [] }) !== null);
+
+  // A test nobody has touched keeps the status the laboratory gave it.
+  const pending = { status: 'Requested', results: [] };
+  check('an untouched test shows its own status', reportedStatus(pending) === 'Requested');
+  check('with no invented results', hasReportedValues(pending) === false);
+  check('and nothing to report', statusInconsistency(pending) === null);
+  check('and no note, because nothing was derived', storedStatusNote(pending) === null);
+
+  // Rows that exist but hold no value are not results.
+  const emptyRows = { status: 'Processing', results: [{ ...values[0], value: '   ' }] };
+  check('a row with only whitespace in it is not a recorded value', hasReportedValues(emptyRows) === false);
+  check('so the status is left as the laboratory set it', reportedStatus(emptyRows) === 'Processing', reportedStatus(emptyRows));
+
+  // The workflow the rule describes, end to end: nothing here can produce a
+  // contradiction from a correctly applied transition.
+  const user = { id: 'USR-1', name: 'Amaka Obi' };
+  const chain = ['Sample Collected', 'Processing', 'Result Entered', 'Released'].reduce(
+    (acc, status) => applyStatusChange(acc, status, { user, now: '2026-09-30T12:00:00.000Z', results: values }),
+    { testName: 'Urea, Electrolytes & Serum Creatinine', status: 'Requested' },
+  );
+  check('a correctly driven workflow ends released', reportedStatus(chain) === 'Released', reportedStatus(chain));
+  check('with nothing to report against it', statusInconsistency(chain) === null, String(statusInconsistency(chain)));
+  check('and the stored status agrees with the shown one', chain.status === reportedStatus(chain));
+});
+
 await block('a panel is read from the database and never written back to it', async () => {
   // The whole failure this file's section 18 is about, replayed as a write.
   //

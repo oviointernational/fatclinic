@@ -4,6 +4,8 @@ import { db } from '../../services/db';
 import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { isWithDoctor } from '../../services/consultationAccess';
+import { hasReportedValues, isFinalReport, reportedStatus } from '../../services/labResults';
+import { LabReportDialog } from '../laboratory/LabReportDialog';
 import { alertsFor, checkVitals, computeBmi, HEIGHT_MAX, HEIGHT_MIN, normaliseHeight, VITALS_LIMITS, WEIGHT_MAX, type VitalsProblem } from '../../services/vitalsLimits';
 import {
   CheckCircle2,
@@ -821,10 +823,14 @@ export const NursingStation: React.FC<NursingStationProps> = ({
                     readOnlyLabs.flatMap(r => r.tests).map(t => (
                       <div key={t.id} onClick={() => openDetailDialog('lab', t)} className="p-2.5 rounded-xl border text-xs flex justify-between gap-2 bg-slate-50 hover:bg-slate-100 cursor-pointer transition-colors">
                         <div><div className="font-bold">{t.testName}</div>
-                          {t.results && t.results.length > 0 && <div className="text-[10px] text-emerald-600 font-bold">✓ Results available</div>}
-                          {(!t.results || t.results.length === 0) && <div className="text-[10px] text-amber-600">Pending results</div>}
+                          {hasReportedValues(t) && (
+                            <div className={`text-[10px] font-bold ${isFinalReport(t) ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}`}>
+                              {isFinalReport(t) ? '✓ Results released' : 'Preliminary results — not released'}
+                            </div>
+                          )}
+                          {!hasReportedValues(t) && <div className="text-[10px] text-amber-600">Pending results</div>}
                         </div>
-                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full h-fit ${['Released', 'Verified'].includes(t.status) ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>{t.status}</span>
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full h-fit ${isFinalReport(t) ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300'}`}>{reportedStatus(t)}</span>
                       </div>
                     ))}
                   <div className="text-xs font-extrabold pt-1">Pharmacy — dispense status ({readOnlyRxs.flatMap(r => r.items).length})</div>
@@ -879,14 +885,26 @@ export const NursingStation: React.FC<NursingStationProps> = ({
         </div>
       )}
 
-      {/* Detail Dialog for Doctor's Requests */}
-      {showDetailDialog && detailDialogData && (
+      {/* Laboratory report. Its own dialog rather than a branch of the one below,
+          because the doctor's consultation form opens the same component for the
+          same investigation - two copies of a clinical report are two copies that
+          come to disagree about whether a result was released. */}
+      {showDetailDialog && detailDialogType === 'lab' && (
+        <LabReportDialog
+          test={detailDialogData}
+          request={readOnlyLabs.find((r: any) => r.tests?.some((t: any) => t.id === detailDialogData?.id))}
+          patientName={activePatient ? `${activePatient.firstName} ${activePatient.lastName}` : undefined}
+          onClose={() => setShowDetailDialog(false)}
+        />
+      )}
+
+      {/* Detail Dialog for the doctor's other requests */}
+      {showDetailDialog && detailDialogData && detailDialogType !== 'lab' && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-slate-900/60" onClick={() => setShowDetailDialog(false)} />
           <div className="relative bg-white dark:bg-dark-card rounded-2xl shadow-2xl w-full max-w-lg border max-h-[80vh] flex flex-col">
             <div className="px-5 py-4 border-b flex items-center justify-between flex-shrink-0">
               <h3 className="font-extrabold text-sm flex items-center space-x-2">
-                {detailDialogType === 'lab' && <><FlaskConical className="w-4 h-4 text-amber-500" /><span>Lab Test Details</span></>}
                 {detailDialogType === 'rx' && <><Pill className="w-4 h-4 text-blue-500" /><span>Prescription Details</span></>}
                 {detailDialogType === 'rad' && <><FlaskConical className="w-4 h-4 text-purple-500" /><span>Radiology Order Details</span></>}
                 {detailDialogType === 'physio' && <><HeartPulse className="w-4 h-4 text-rose-500" /><span>Physiotherapy Order Details</span></>}
@@ -894,25 +912,6 @@ export const NursingStation: React.FC<NursingStationProps> = ({
               <button onClick={() => setShowDetailDialog(false)} className="p-1.5 rounded-lg hover:bg-slate-100"><X className="w-4 h-4" /></button>
             </div>
             <div className="p-5 space-y-3 overflow-y-auto">
-              {detailDialogType === 'lab' && (
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between"><span className="text-sm font-extrabold">{detailDialogData.testName}</span><span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${['Released', 'Verified'].includes(detailDialogData.status) ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>{detailDialogData.status}</span></div>
-                  <div className="text-xs text-slate-500">Category: {detailDialogData.category} • Sample: {detailDialogData.sampleType}</div>
-                  {detailDialogData.results && detailDialogData.results.length > 0 ? (
-                    <div className="space-y-2">
-                      <div className="text-xs font-bold text-slate-700">Results:</div>
-                      {detailDialogData.results.map((r: any, i: number) => (
-                        <div key={i} className="p-2 rounded-lg bg-slate-50 border text-xs">
-                          <div className="flex justify-between"><span className="font-bold">{r.parameterName}</span><span className={`text-[10px] font-bold px-1 rounded ${r.flag === 'Normal' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>{r.flag}</span></div>
-                          <div className="text-slate-600">{r.value} {r.unit} {r.referenceRange && `(Ref: ${r.referenceRange})`}</div>
-                          {r.comments && <div className="text-[10px] text-slate-400 italic mt-1">{r.comments}</div>}
-                        </div>
-                      ))}
-                    </div>
-                  ) : <div className="text-xs text-slate-400">Results pending...</div>}
-                  {detailDialogData.comments && <div className="text-xs text-slate-500 bg-slate-50 p-2 rounded-lg">Notes: {detailDialogData.comments}</div>}
-                </div>
-              )}
               {detailDialogType === 'rx' && (
                 <div className="space-y-3">
                   <div className="flex items-center justify-between"><span className="text-sm font-extrabold">{detailDialogData.medicationName}</span><span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${detailDialogData.dispenseStatus === 'Dispensed' ? 'bg-emerald-200 text-emerald-800' : 'bg-slate-200 text-slate-600'}`}>{detailDialogData.dispenseStatus}</span></div>

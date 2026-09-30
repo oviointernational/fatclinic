@@ -217,7 +217,7 @@ check('every panel has a defined report order', dupOrder.length === 0, dupOrder.
 section('5. does a recorded result still point at an analyte that exists?');
 
 const results = await db.query(
-  `SELECT r.id, r.parameter_id, r.value,
+  `SELECT r.id, r.parameter_id, r.value, r.test_order_id,
           p.id IS NOT NULL AS resolves,
           o.id IS NOT NULL AS order_exists
      FROM public.lab_results r
@@ -226,8 +226,14 @@ const results = await db.query(
 );
 const orphans = results.rows.filter((r) => !r.resolves);
 check(`every recorded result names an analyte the panel has`, orphans.length === 0, `${orphans.length} of ${results.rows.length}: ${orphans.slice(0, 5).map((r) => r.parameter_id).join(', ')}`);
-const detached = results.rows.filter((r) => r.order_exists);
-check('and every recorded result belongs to a test order', detached.length === 0, `${detached.length} of ${results.rows.length}`);
+// A result with no test order belongs to nothing: it is in the database, on no
+// report, and no screen will ever show it. The filter selects the ones whose
+// order is MISSING - it used to select the ones whose order was present and then
+// assert there were none, which is backwards: it passed on orphaned results and
+// failed on correctly attached ones. It read "all pass" for as long as the
+// database held no results at all, because the count was empty either way.
+const detached = results.rows.filter((r) => !r.order_exists);
+check('and every recorded result belongs to a test order', detached.length === 0, detached.length ? `${detached.length} of ${results.rows.length}: ${detached.slice(0, 5).map((r) => `${r.id} -> ${r.test_order_id ?? '(none)'}`).join(', ')}` : `${results.rows.length} of ${results.rows.length} attached`);
 console.log(`      ${results.rows.length} result(s) recorded`);
 
 // The live orders are what make the next check meaningful: a panel can be correct
@@ -246,6 +252,42 @@ const boxless = liveOrders.rows.filter((r) => r.test_definition_id && r.analytes
 check('no live test order lands on the one-box screen', boxless.length === 0, boxless.map((r) => `${r.id} -> ${r.test_definition_id}`).join(', ') || 'none');
 for (const r of liveOrders.rows) {
   console.log(`      ${r.id.padEnd(14)} ${r.status.padEnd(11)} ${String(r.analytes).padStart(2)} analytes  ${r.name ?? '(investigation missing)'}`);
+}
+
+// A released report with nothing in it. A physician reads that as a clear
+// investigation, and it is not one - it is the state where a lost result write
+// hides behind a sign-off. It is also the only status/result disagreement with
+// no innocent explanation: a specimen sent back for a re-run legitimately keeps
+// its earlier results, so "results exist and the status is behind" is reported
+// for review but not failed here.
+const emptyReleases = await db.query(
+  `SELECT o.id, o.status, o.test_name
+     FROM public.lab_test_orders o
+    WHERE o.status IN ('Released', 'Verified')
+      AND NOT EXISTS (SELECT 1 FROM public.lab_results r WHERE r.test_order_id = o.id)
+    ORDER BY o.id`,
+);
+check('no released report is empty', emptyReleases.rows.length === 0, emptyReleases.rows.map((r) => `${r.id} (${r.status})`).join(', ') || 'none');
+if (emptyReleases.rows.length) {
+  console.log('      !! a physician would read these as clear investigations. They are not:');
+  for (const r of emptyReleases.rows) console.log(`         ${r.id}  ${r.status}  ${r.test_name}`);
+}
+
+const behindStatus = await db.query(
+  `SELECT o.id, o.status, o.test_name, count(r.id)::int AS results
+     FROM public.lab_test_orders o
+     JOIN public.lab_results r ON r.test_order_id = o.id
+    WHERE o.status NOT IN ('Released', 'Verified', 'Result Entered')
+    GROUP BY o.id, o.status, o.test_name
+    ORDER BY o.id`,
+);
+if (behindStatus.rows.length) {
+  console.log('');
+  console.log('   for review, not a failure - these have results recorded while their stored status is behind:');
+  for (const r of behindStatus.rows) {
+    console.log(`      ${r.id}  status=${r.status}  ${r.results} result(s)  ${r.test_name}`);
+  }
+  console.log('      A re-run legitimately looks like this. If it is not a re-run, a workflow step was not saved.');
 }
 
 // ---------------------------------------------------------------------------

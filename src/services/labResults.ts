@@ -194,6 +194,122 @@ export function canRelease(rows: LabResultValue[]): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// What a clinician may conclude from a stored test
+// ---------------------------------------------------------------------------
+
+/**
+ * Statuses that mean the report is signed off and final.
+ *
+ * `Verified` is here as well as `Released` because the schema carries both, and a
+ * test that reached one is not awaiting anything.
+ */
+const FINAL_STATUSES: readonly string[] = ['Released', 'Verified'];
+
+/** The parts of a test these rules need, so they work on any caller. */
+export interface LabTestForDisplay {
+  status: string;
+  results?: LabResultValue[];
+  releasedAt?: string;
+}
+
+/** Whether any analyte on a test has a value recorded against it. */
+export function hasReportedValues(test: LabTestForDisplay | undefined): boolean {
+  return enteredRows(test?.results ?? []).length > 0;
+}
+
+/**
+ * Whether a test's numbers are a final report or a work in progress.
+ *
+ * `releasedAt` is accepted alongside the status because the two are written by the
+ * same transition and either one is evidence a release happened. A test with a
+ * release time and a status of "Processing" has still been released; the status
+ * is the part that is wrong, and refusing to say so would hide a defect instead
+ * of reporting it.
+ */
+export function isFinalReport(test: LabTestForDisplay | undefined): boolean {
+  if (!test) return false;
+  return FINAL_STATUSES.includes(test.status) || Boolean(test.releasedAt);
+}
+
+/**
+ * The status to put on screen, which cannot contradict the numbers beside it.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * A clinician reported being shown a released result next to the status
+ * "Processing". The database agreed with them, and neither screen was lying: the
+ * test had four recorded analytes and a stored status of "Processing", because
+ * those two facts are stored independently and nothing reconciled them. A row
+ * like that is reachable - a result write that lands while the status write does
+ * not, a catalogue edited after a test was entered, a row imported from an older
+ * system - and every screen that rendered `test.status` next to `test.results`
+ * would show the contradiction to whoever read it.
+ *
+ * So the screen never reports a status the data does not support:
+ *
+ *   released, however it is recorded  ->  Released / Verified
+ *   values recorded, not released     ->  Result Entered
+ *   nothing recorded                  ->  the stored status, unchanged
+ *
+ * It never reports "Released" for a test that was not released. Promoting a
+ * stored status to released would make the contradiction disappear by inventing
+ * a clinical fact, which is the one thing this must not do - `statusInconsistency`
+ * exists so the real defect is still visible.
+ */
+export function reportedStatus(test: LabTestForDisplay | undefined): string {
+  if (!test) return '';
+  if (test.status === 'Verified') return 'Verified';
+  if (isFinalReport(test)) return 'Released';
+  if (hasReportedValues(test)) return 'Result Entered';
+  return test.status;
+}
+
+/**
+ * Whether the stored status contradicts the stored results in a way that is
+ * indefensible, and is described in words if so.
+ *
+ * ONE CASE ONLY: a test marked released with nothing recorded against it. A
+ * physician reads that as a clear report, and it is not one. This is the single
+ * state where showing a tidy version would be actively dangerous, so it is
+ * reported in words rather than left to a colour.
+ *
+ * Deliberately NOT covered: results recorded against a test whose stored status
+ * is still "Processing". That is the state this whole rule set was added for, and
+ * it is a legitimate one to be in - a specimen sent back for a re-run keeps the
+ * earlier results until they are replaced. So it is not called a defect here.
+ * `reportedStatus` makes the screen coherent about it, the values are labelled
+ * preliminary, and `storedStatusNote` reports the stored value as a plain fact
+ * for whoever looks later. Calling it a lost write would be asserting something
+ * about cause that this data cannot support.
+ */
+export function statusInconsistency(test: LabTestForDisplay | undefined): string | null {
+  if (!test) return null;
+  if (isFinalReport(test) && !hasReportedValues(test)) {
+    return (
+      `This investigation is marked ${test.status} but has no results recorded against it. ` +
+      `Either the results were not saved, or this test should not have been released. ` +
+      `Tell an administrator, and do not treat it as a clear report.`
+    );
+  }
+  return null;
+}
+
+/**
+ * The stored status, when it is not the one being shown - reported as a value, not
+ * as an explanation.
+ *
+ * The point of `reportedStatus` is that the badge cannot contradict the numbers
+ * beside it. That is a derived value, so the value it was derived from is still
+ * worth having on screen: an administrator reconciling the laboratory against
+ * this screen needs the stored one, and nobody reading a derived label alone
+ * could tell what it was derived from.
+ */
+export function storedStatusNote(test: LabTestForDisplay | undefined): string | null {
+  if (!test) return null;
+  return test.status === reportedStatus(test) ? null : `Recorded in the database as "${test.status}".`;
+}
+
+// ---------------------------------------------------------------------------
 // The workflow transitions
 // ---------------------------------------------------------------------------
 

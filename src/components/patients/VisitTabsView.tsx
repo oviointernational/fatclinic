@@ -3,6 +3,7 @@ import { Patient, Visit } from '../../types';
 import { db } from '../../services/db';
 import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
+import { isFinalReport, reportedStatus } from '../../services/labResults';
 import { 
   Calendar, 
   Plus, 
@@ -333,9 +334,9 @@ export const VisitTabsView: React.FC<VisitTabsViewProps> = ({
                           <span className="text-[10px] text-slate-400">{test.category.replace('_', ' ')}</span>
                         </div>
                         <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${
-                          test.status === 'Released' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
+                          isFinalReport(test) ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300'
                         }`}>
-                          {test.status}
+                          {reportedStatus(test)}
                         </span>
                       </div>
                     )))}

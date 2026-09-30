@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { Patient, Visit, ClinicalDiagnosis, LabCategory, LabInvestigationDefinition, Medication, wardName } from '../../types';
+import { Patient, Visit, ClinicalDiagnosis, LabCategory, LabInvestigationDefinition, LabTestOrder, Medication, wardName } from '../../types';
 import { db } from '../../services/db';
 import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
@@ -7,6 +7,8 @@ import { aiService } from '../../services/aiService';
 import { mayDoctorWrite, readOnlyReason } from '../../services/consultationAccess';
 import { formatSurgeryHistory, type SurgeryHistoryEntry } from '../../services/surgeryHistory';
 import { classifyExamEntry, isAdditionalFindings } from '../../services/physicalExam';
+import { enteredRows, hasReportedValues, isFinalReport, reportedStatus } from '../../services/labResults';
+import { LabReportDialog } from '../laboratory/LabReportDialog';
 import {
   entryText,
   foldHistory,
@@ -786,6 +788,14 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
    const visitLabRequests = activeVisit ? db.getLabRequests({ visitId: activeVisit.id }) : [];
   const visitPrescriptions = activeVisit && patient ? db.getPrescriptions(patient.id, activeVisit.id) : [];
 
+  // Which investigation's report is open, if any. Null means none is open, and
+  // the dialog treats null as closed - so closing is setting this back to null
+  // rather than a second flag that can disagree with it.
+  const [labReportTest, setLabReportTest] = useState<LabTestOrder | null>(null);
+  const labReportRequest = labReportTest
+    ? visitLabRequests.find(r => r.tests.some(t => t.id === labReportTest.id))
+    : undefined;
+
   // helper for vitals BMI display
   const bmiColor = vitals ? (vitals.bmi <18.5? 'text-blue-600' : vitals.bmi<25? 'text-emerald-600' : vitals.bmi<30? 'text-amber-600' : 'text-rose-600') : 'text-slate-500';
 
@@ -937,6 +947,15 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
 
   return (
     <div className="h-full flex flex-col select-text overflow-hidden">
+      {/* The laboratory report for an investigation on this visit. The same dialog
+          the nursing station opens, so a doctor and a nurse read one record the
+          same way and cannot be shown two different things. */}
+      <LabReportDialog
+        test={labReportTest}
+        request={labReportRequest}
+        patientName={patient ? `${patient.firstName} ${patient.lastName}` : undefined}
+        onClose={() => setLabReportTest(null)}
+      />
       {/* Compact context + action bar */}
       <div className="px-3 py-2 bg-white dark:bg-dark-card border-b border-light-border dark:border-dark-border flex flex-wrap items-center gap-2 text-xs flex-shrink-0">
         <div className="flex items-center space-x-1.5 font-bold text-slate-800 dark:text-slate-200">
@@ -1391,21 +1410,39 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
               ) : (
                 <div className="space-y-2">
                   {visitLabRequests.flatMap(r => r.tests).map(t => (
-                    <div key={t.id} className="p-3 rounded-xl border bg-white dark:bg-dark-card flex flex-wrap items-center justify-between gap-2 text-xs">
-                      <div>
-                        <div className="font-bold">{t.testName}</div>
-                        <div className="text-[10px] text-slate-500">{t.category} • Sample: {t.sampleType}</div>
-                        {t.results && t.results.length > 0 && (
-                          <div className="mt-1 space-y-0.5">
-                            {t.results.map((r, i) => (
-                              <div key={i} className="text-[11px]"><span className="font-semibold">{r.parameterName}:</span> <span className="font-bold">{r.value} {r.unit}</span> <span className={`text-[9px] font-bold px-1 rounded ${r.flag === 'Normal' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>{r.flag}</span></div>
-                            ))}
+                    <button
+                      type="button"
+                      key={t.id}
+                      onClick={() => setLabReportTest(t)}
+                      className="w-full text-left p-3 rounded-xl border border-light-border dark:border-dark-border bg-white dark:bg-dark-card hover:bg-slate-50 dark:hover:bg-dark-surface transition-colors flex flex-wrap items-center justify-between gap-2 text-xs cursor-pointer"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-bold text-slate-800 dark:text-slate-100">{t.testName}</div>
+                        <div className="text-[10px] text-slate-500">
+                          {t.category} • Sample: {t.sampleType}
+                        </div>
+                        {/* A count, never the values. A number read here is a number acted on. */}
+                        {hasReportedValues(t) ? (
+                          <div className="text-[10px] text-emerald-600 dark:text-emerald-400 font-bold mt-0.5">
+                            {isFinalReport(t)
+                              ? `✓ ${enteredRows(t.results ?? []).length} result(s) released — open for the full report`
+                              : 'Preliminary results recorded — not yet released'}
                           </div>
+                        ) : (
+                          <div className="text-[10px] text-amber-600 dark:text-amber-400">Pending results</div>
                         )}
-                        {t.comments && <div className="text-[10px] text-slate-500 italic mt-1">{t.comments}</div>}
                       </div>
-                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${['Released', 'Verified'].includes(t.status) ? 'bg-emerald-100 text-emerald-700 border border-emerald-300' : 'bg-amber-100 text-amber-700'}`}>{t.status}</span>
-                    </div>
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        {t.criticalAlert && (
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300">
+                            Critical
+                          </span>
+                        )}
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isFinalReport(t) ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300'}`}>
+                          {reportedStatus(t)}
+                        </span>
+                      </div>
+                    </button>
                   ))}
                 </div>
               )}

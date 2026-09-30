@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Patient, Visit, Vitals, Consultation, LabRequest, Prescription, Invoice } from '../../types';
 import { db } from '../../services/db';
 import { pdfService } from '../../services/pdfService';
+import { isFinalReport, reportedStatus } from '../../services/labResults';
 import { 
   X, 
   Download, 
@@ -472,9 +473,9 @@ export const PatientProfileDialog: React.FC<PatientProfileDialogProps> = ({
                                 {test.testName} <span className="text-[10px] font-semibold text-slate-400">({test.category.replace('_', ' ')})</span>
                               </span>
                               <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                                test.status === 'Released' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300'
+                                isFinalReport(test) ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300'
                               }`}>
-                                {test.status}
+                                {reportedStatus(test)}
                               </span>
                             </div>
 
