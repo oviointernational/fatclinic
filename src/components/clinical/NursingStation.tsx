@@ -315,9 +315,9 @@ export const NursingStation: React.FC<NursingStationProps> = ({
     if (problems.length > 0) {
       setVitalsProblems(problems);
       alert(
-        `Record vitals: nothing has been saved.\n\n${problems
+        `Vitals were not recorded.\n\n${problems
           .map((p) => `• ${p.message}`)
-          .join('\n')}`,
+          .join('\n')}\n\nFix the values listed above and save again.`,
       );
       return;
     }
@@ -595,7 +595,7 @@ export const NursingStation: React.FC<NursingStationProps> = ({
                 {vitalsProblems.length > 0 && (
                   <div className="rounded-xl border border-rose-200 dark:border-rose-900/60 bg-rose-50 dark:bg-rose-950/30 p-3 space-y-1">
                     <p className="text-[11px] font-extrabold text-rose-700 dark:text-rose-300">
-                      This reading has not been recorded. Nothing has been saved.
+                      This reading was not recorded. Fix the values below, then save again.
                     </p>
                     {vitalsProblems.map((p, i) => (
                       <p key={`${p.field}-${i}`} className="text-[11px] text-rose-700 dark:text-rose-300">

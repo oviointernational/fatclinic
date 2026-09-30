@@ -1996,9 +1996,28 @@ export async function hydrateAll(): Promise<Map<string, unknown>> {
   const childTables = new Map<string, ChildMap>();
   for (const map of TABLES) collectChildTables(map.children ?? [], childTables);
 
+  // Fire every table read at once. Hydration used to pull tables one after
+  // another, so a slow or sleeping project paid its latency once per table -
+  // roughly thirty round trips - and the register stayed empty for tens of
+  // seconds while the app looked broken. Started together and awaited later,
+  // every table pays the latency once, in parallel, and the nesting below
+  // does not need to change.
+  const pending = new Map<string, Promise<Record<string, any>[]>>();
+  const fetchTable = (table: string) => {
+    let p = pending.get(table);
+    if (!p) {
+      p = selectAll(client, table);
+      pending.set(table, p);
+    }
+    return p;
+  };
+  for (const map of TABLES) fetchTable(map.table);
+  for (const table of childTables.keys()) fetchTable(table);
+
   const childRows = new Map<string, Record<string, any>[]>();
   const load = async (table: string) => {
-    if (!childRows.has(table)) childRows.set(table, await selectAll(client, table));
+    const rows = await fetchTable(table);
+    if (!childRows.has(table)) childRows.set(table, rows);
     return childRows.get(table)!;
   };
 
@@ -2022,7 +2041,7 @@ export async function hydrateAll(): Promise<Map<string, unknown>> {
   };
 
   for (const map of [...TABLES].sort((a, b) => a.order - b.order)) {
-    const rows = await selectAll(client, map.table);
+    const rows = await fetchTable(map.table);
 
     if (map.single) {
       out.set(map.key, rows[0] ? map.rowToModel(rows[0]) : null);
