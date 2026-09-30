@@ -15,10 +15,10 @@ import {
 } from '../types';
 
 export const initialSettings: SystemSettings = {
-  hospitalName: 'Solace Medicares & Medical Specialties',
+  hospitalName: 'Solace Medicare Consult',
   tagline: 'Precision Care. Connected Health. Zero Compromise.',
   address: '14 Healthcare Boulevard, Medical District, Victoria Island',
-  phone: '+234 (0) 1 800-FATCLINIC',
+  phone: '+2348035992252',
   email: 'care@solacemedicares.com',
   currency: '₦',
   currencyCode: 'NGN',
@@ -28,10 +28,10 @@ export const initialSettings: SystemSettings = {
 };
 
 export const initialReceiptSettings: import('../types').ReceiptSettings = {
-  hospitalName: 'Solace Medicares & Medical Specialties',
+  hospitalName: 'Solace Medicare Consult',
   tagline: 'Precision Care. Connected Health. Zero Compromise.',
   address: '14 Healthcare Boulevard, Medical District, Victoria Island',
-  phone: '+234 (0) 1 800-FATCLINIC',
+  phone: '+2348035992252',
   email: 'care@solacemedicares.com',
   footerMessage: 'Thank you for your patronage. This receipt is computer-generated and valid without signature.',
   termsLine: 'Fees are payable before service except emergencies. Balances must be cleared before discharge.',

@@ -25,7 +25,7 @@ import { useAuth } from './context/AuthContext';
 import { hasResetLink } from './services/passwordReset';
 import { navigate, useRoute } from './router';
 
-const WORKSTATION_TITLE = 'Solace Medicares - Hospital Management & EHR System';
+const WORKSTATION_TITLE = 'Solace Medicare Consult - Hospital Management & EHR System';
 
 /** Centered splash shown for the instant before a redirect lands. */
 const RedirectSplash: React.FC = () => (
@@ -47,7 +47,7 @@ export const Root: React.FC = () => {
   useEffect(() => {
     document.title = staffRoute
       ? WORKSTATION_TITLE
-      : 'Solace Medicares & Medical Specialties — Book an Appointment';
+      : 'Solace Medicare Consult — Book an Appointment';
   }, [staffRoute]);
 
   useEffect(() => {

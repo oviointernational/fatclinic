@@ -147,7 +147,7 @@ export const App: React.FC = () => {
             S
           </div>
           <div>
-            <h2 className="text-lg font-extrabold text-slate-900 dark:text-white">Solace Medicares Workstation</h2>
+            <h2 className="text-lg font-extrabold text-slate-900 dark:text-white">Solace Medicare Consult Workstation</h2>
             <p className="text-xs text-slate-500 mt-1">You signed out. Patient data is hidden until you sign in again.</p>
           </div>
           <button

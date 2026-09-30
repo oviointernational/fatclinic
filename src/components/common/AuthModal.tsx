@@ -69,7 +69,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onOpenPas
           <div className="flex items-center space-x-2">
             <ShieldCheck className="w-5 h-5 text-emerald-500" />
             <h3 className="text-base font-extrabold text-slate-800 dark:text-white">
-              Solace Medicares Workstation Access
+              Solace Medicare Consult Workstation Access
             </h3>
           </div>
           <button

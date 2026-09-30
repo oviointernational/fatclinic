@@ -187,7 +187,11 @@ function saveStorage<T>(key: string, value: T): void {
 // (contact email care@solacemedicares.com). Bumping clears cached settings and
 // seeded records on machines that pre-date the rebrand, so the new identity is
 // what boots instead of a stale "FatClinic" cached in localStorage.
-const STORAGE_VERSION = 4;
+//
+// v5: the official name settled on "Solace Medicare Consult" and the contact
+// phone became +2348035992252. Bumping clears any machine that cached the v4
+// name so the settled identity is what boots everywhere.
+const STORAGE_VERSION = 5;
 const VERSION_KEY = 'fatclinic_schema_version';
 
 function ensureProductionStorage(): void {

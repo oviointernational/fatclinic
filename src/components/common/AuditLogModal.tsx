@@ -65,7 +65,7 @@ export const AuditLogModal: React.FC<AuditLogModalProps> = ({
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `SolaceMedicares_AuditLog_${patientId || 'Full'}_${new Date().toISOString().slice(0, 10)}.csv`);
+    link.setAttribute('download', `SolaceMedicareConsult_AuditLog_${patientId || 'Full'}_${new Date().toISOString().slice(0, 10)}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -204,7 +204,7 @@ export const AuditLogModal: React.FC<AuditLogModalProps> = ({
         {/* Footer */}
         <div className="px-6 py-2.5 border-t border-light-border dark:border-dark-border bg-slate-50 dark:bg-dark-surface/40 text-[11px] text-slate-400 flex justify-between items-center">
           <span>Showing <strong>{filteredLogs.length}</strong> recorded actions in tamper-proof ledger</span>
-          <span>Solace Medicares Certified Immutable Security Stream</span>
+          <span>Solace Medicare Consult Certified Immutable Security Stream</span>
         </div>
       </div>
     </div>

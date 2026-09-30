@@ -1,4 +1,4 @@
-# Solace Medicares EHR
+# Solace Medicare Consult EHR
 
 Hospital information system: dashboard, front desk, clinical care & triage,
 laboratory, pharmacy, radiology, physiotherapy, billing, AI assistant, admin.

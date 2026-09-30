@@ -189,7 +189,7 @@ export const OnlineBookingModal: React.FC<OnlineBookingModalProps> = ({
                   </button>
                 </div>
                 <p className="text-[11px] text-slate-600 dark:text-slate-300 leading-relaxed">
-                  When you arrive at <strong>Solace Medicares</strong>, simply present this <strong>Patient Code</strong> to the Front Desk officer to immediately pull up your record, finalize registration, and proceed to clinical triage.
+                  When you arrive at <strong>Solace Medicare Consult</strong>, simply present this <strong>Patient Code</strong> to the Front Desk officer to immediately pull up your record, finalize registration, and proceed to clinical triage.
                 </p>
               </div>
 

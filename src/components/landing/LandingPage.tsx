@@ -60,10 +60,10 @@ import { navigate } from '../../router';
 /* ------------------------------------------------------------------ */
 
 const CLINIC = {
-  name: 'Solace Medicares & Medical Specialties',
-  shortName: 'Solace Medicares',
+  name: 'Solace Medicare Consult',
+  shortName: 'Solace Medicare',
   address: '14 Healthcare Boulevard, Medical District, Victoria Island',
-  phone: '+234 (0) 1 800-FATCLINIC',
+  phone: '+2348035992252',
   email: 'care@solacemedicares.com',
 };
 
@@ -120,7 +120,7 @@ function BrandMark({ className = '' }: { className?: string }) {
           {CLINIC.shortName}
         </span>
         <span className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400 tracking-wide uppercase">
-          & Medical Specialties
+          Consult
         </span>
       </span>
     </a>
@@ -146,7 +146,7 @@ export const LandingPage: React.FC = () => {
   useEffect(() => {
     document.title = `${CLINIC.name} — Book an Appointment`;
     return () => {
-      document.title = 'Solace Medicares - Hospital Management & EHR System';
+      document.title = 'Solace Medicare Consult - Hospital Management & EHR System';
     };
   }, []);
 
@@ -463,7 +463,7 @@ export const LandingPage: React.FC = () => {
       <section id="why-us" className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-20 lg:py-24 scroll-mt-16">
         <Reveal className="max-w-2xl">
           <span className="text-xs font-black uppercase tracking-widest text-emerald-600 dark:text-emerald-400">
-            Why Solace Medicares
+            Why Solace Medicare
           </span>
           <h2 className="mt-3 text-3xl sm:text-4xl font-black text-slate-900 dark:text-white tracking-tight">
             Modern medicine, run the way it should be
