@@ -61,6 +61,7 @@ import {
   recordPersisted,
 } from './sync';
 import { computeBmi, normaliseHeight } from './vitalsLimits';
+import { applyStatusChange, statusAuditDetail } from './labResults';
 
 const STORAGE_KEYS = {
   SETTINGS: 'fatclinic_settings',
@@ -943,28 +944,29 @@ class FatClinicDatabase {
     return newRequest;
   }
 
+  /**
+   * Move one test through the laboratory workflow.
+   *
+   * What a transition writes - the draw time, the critical-alert flag, who did it -
+   * is decided by `applyStatusChange` in src/services/labResults.ts rather than
+   * here, because those three fields are precisely what was silently not being
+   * written while it was decided inline in this method. See that module for why
+   * each one matters; there is a test for all three.
+   */
   public updateLabTestStatus(
     requestId: string, 
     testOrderId: string, 
     status: LabRequest['tests'][0]['status'], 
     user: User, 
     results?: LabRequest['tests'][0]['results'], 
-    comments?: string
+    comments?: string,
+    criticalAlert?: boolean
   ): void {
     this.labRequests = this.labRequests.map(req => {
       if (req.id !== requestId) return req;
       const updatedTests = req.tests.map(t => {
         if (t.id !== testOrderId) return t;
-        return {
-          ...t,
-          status,
-          results: results !== undefined ? results : t.results,
-          comments: comments !== undefined ? comments : t.comments,
-          scientistId: user.role === 'LAB_SCIENTIST' ? user.id : t.scientistId,
-          scientistName: user.role === 'LAB_SCIENTIST' ? user.name : t.scientistName,
-          verifiedBy: status === 'Released' ? user.name : t.verifiedBy,
-          releasedAt: status === 'Released' ? new Date().toISOString() : t.releasedAt
-        };
+        return applyStatusChange(t, status, { user, results, comments, criticalAlert });
       });
       return { ...req, tests: updatedTests };
     });
@@ -983,7 +985,10 @@ class FatClinicDatabase {
       patientName: patient ? `${patient.firstName} ${patient.lastName}` : undefined,
       action: status === 'Released' ? 'RELEASE_LAB_RESULT' : 'UPDATE_LAB_STATUS',
       category: 'LABORATORY',
-      details: `Investigation ${test?.testName || testOrderId} status changed to ${status}.`
+      // The audit entry names the analytes a release covered and the flags they
+      // carried. "Status changed to Released" leaves a disputed result with nothing
+      // in the log to check it against.
+      details: statusAuditDetail(test, status)
     });
 
     this.notify();

@@ -237,6 +237,15 @@ export const LabDashboard: React.FC<LabDashboardProps> = ({
                           </span>
                         )}
                       </div>
+                      {/* When the specimen was actually drawn. It was recorded but never
+                          shown, and it is the fact a turnaround time is measured from:
+                          an hour between "Collect Sample" and the draw is an hour the
+                          queue does not show anybody. */}
+                      {test.collectedAt && (
+                        <div className="text-[9px] text-slate-400 mt-1 font-mono">
+                          drawn {new Date(test.collectedAt).toLocaleString()}
+                        </div>
+                      )}
                     </td>
 
                     {/* Fee */}

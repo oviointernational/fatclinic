@@ -1,4 +1,7 @@
-import { 
+// `import type`, like the other services: these are all interfaces, so a value
+// import is erased by the bundler but not by Node, which scripts/sync-selftest.mjs
+// uses to import this module and check the catalogue against the seed.
+import type {
   User, 
   Patient, 
   Visit, 
@@ -58,24 +61,46 @@ export const initialReceiptSettings: import('../types').ReceiptSettings = {
 // See database/fatclinic.sql for the same note on the SQL side.
 export const initialUsers: User[] = [];
 
+// The laboratory catalogue, GENERATED - do not hand-edit below this line.
+//
+// The catalogue is declared once, in database/fatclinic.sql, because that is what
+// a fresh install runs. This copy exists so the browser has the same catalogue to
+// show before it has ever signed in. The two used to be maintained by hand and
+// drifted, and that drift is the whole reason Full Blood Count could be recorded
+// in a single free-text box: nine of the investigations came from here and five
+// from the schema file, and where both claimed the same id the first one to arrive
+// won, so FBC was in the database with no panel at all while its panel sat here in
+// a browser cache.
+//
+// Regenerate after changing the seed:  node scripts/generate-lab-catalogue.mjs
+// db:sync:test fails if this file and the seed ever disagree again.
 export const initialLabInvestigations: LabInvestigationDefinition[] = [
-  // 1. HEMATOLOGY
   {
     id: 'LAB-HEM-01',
     code: 'FBC',
-    name: 'Full Blood Count (Complete Blood Count)',
+    name: 'Full Blood Count',
     category: 'HEMATOLOGY',
-    price: 5000,
-    sampleType: 'Whole Blood (EDTA - Purple Top)',
-    turnaroundTime: '2 Hours',
-    description: 'Comprehensive assessment of RBCs, WBCs, platelets, and hemoglobin indices.',
+    price: 3500,
+    sampleType: 'Whole Blood (EDTA)',
+    turnaroundTime: '2-4 hours',
+    description: 'Haemoglobin, red-cell indices, total and differential white-cell count, platelets and a morphology note.',
     parameters: [
-      { id: 'p_hb', name: 'Hemoglobin (Hb)', unit: 'g/dL', referenceRange: '12.0 - 17.5', resultType: 'numeric' },
-      { id: 'p_pcv', name: 'Packed Cell Volume (PCV)', unit: '%', referenceRange: '36.0 - 52.0', resultType: 'numeric' },
-      { id: 'p_wbc', name: 'Total White Blood Cell Count', unit: 'x10^9/L', referenceRange: '4.0 - 11.0', resultType: 'numeric' },
-      { id: 'p_neut', name: 'Neutrophils', unit: '%', referenceRange: '40 - 75', resultType: 'numeric' },
-      { id: 'p_lymph', name: 'Lymphocytes', unit: '%', referenceRange: '20 - 45', resultType: 'numeric' },
-      { id: 'p_plt', name: 'Platelet Count', unit: 'x10^9/L', referenceRange: '150 - 450', resultType: 'numeric' }
+      { id: 'LAB-HEM-01.p_hb', name: 'Hemoglobin (Hb)', unit: 'g/dL', referenceRange: '12.0 - 17.5', refLow: 12, refHigh: 17.5, sortOrder: 10, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_rbc', name: 'Red Blood Cell Count (RBC)', unit: 'x10^12/L', referenceRange: '4.5 - 6.5', refLow: 4.5, refHigh: 6.5, sortOrder: 20, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_pcv', name: 'Packed Cell Volume (PCV)', unit: '%', referenceRange: '36.0 - 52.0', refLow: 36, refHigh: 52, sortOrder: 30, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_mcv', name: 'Mean Corpuscular Volume (MCV)', unit: 'fL', referenceRange: '80.0 - 100.0', refLow: 80, refHigh: 100, sortOrder: 40, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_mch', name: 'Mean Corpuscular Hemoglobin (MCH)', unit: 'pg', referenceRange: '27.0 - 33.0', refLow: 27, refHigh: 33, sortOrder: 50, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_mchc', name: 'Mean Corpuscular Hemoglobin Concentration (MCHC)', unit: 'g/dL', referenceRange: '32.0 - 36.0', refLow: 32, refHigh: 36, sortOrder: 60, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_rdw', name: 'Red Cell Distribution Width (RDW)', unit: '%', referenceRange: '11.0 - 14.0', refLow: 11, refHigh: 14, sortOrder: 70, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_wbc', name: 'Total White Blood Cell Count (WBC)', unit: 'x10^9/L', referenceRange: '4.0 - 11.0', refLow: 4, refHigh: 11, sortOrder: 80, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_neut', name: 'Neutrophils (Neutrophil %)', unit: '%', referenceRange: '40 - 75', refLow: 40, refHigh: 75, sortOrder: 90, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_lymph', name: 'Lymphocytes (Lymphocyte %)', unit: '%', referenceRange: '20 - 45', refLow: 20, refHigh: 45, sortOrder: 100, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_mono', name: 'Monocytes (Monocyte %)', unit: '%', referenceRange: '2 - 10', refLow: 2, refHigh: 10, sortOrder: 110, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_eos', name: 'Eosinophils (Eosinophil %)', unit: '%', referenceRange: '1 - 6', refLow: 1, refHigh: 6, sortOrder: 120, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_baso', name: 'Basophils (Basophil %)', unit: '%', referenceRange: '0 - 2', refLow: 0, refHigh: 2, sortOrder: 130, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_plt', name: 'Platelet Count', unit: 'x10^9/L', referenceRange: '150 - 450', refLow: 150, refHigh: 450, sortOrder: 140, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_mpv', name: 'Mean Platelet Volume (MPV)', unit: 'fL', referenceRange: '7.0 - 12.0', refLow: 7, refHigh: 12, sortOrder: 150, resultType: 'numeric' },
+      { id: 'LAB-HEM-01.p_morph', name: 'Red Cell Morphology & Comment', unit: '-', referenceRange: 'Normochromic normocytes', refLow: null, refHigh: null, sortOrder: 160, resultType: 'text' }
     ]
   },
   {
@@ -85,10 +110,10 @@ export const initialLabInvestigations: LabInvestigationDefinition[] = [
     category: 'HEMATOLOGY',
     price: 2500,
     sampleType: 'Whole Blood (Sodium Citrate - Black Top)',
-    turnaroundTime: '1.5 Hours',
+    turnaroundTime: '1.5 hours',
     description: 'Nonspecific marker of systemic inflammation and active infection.',
     parameters: [
-      { id: 'p_esr', name: 'Westergren ESR (1 hour)', unit: 'mm/hr', referenceRange: '0 - 20', resultType: 'numeric' }
+      { id: 'LAB-HEM-02.p_esr', name: 'Westergren ESR (1 hour)', unit: 'mm/hr', referenceRange: '0 - 20', refLow: 0, refHigh: 20, sortOrder: 10, resultType: 'numeric' }
     ]
   },
   {
@@ -98,29 +123,28 @@ export const initialLabInvestigations: LabInvestigationDefinition[] = [
     category: 'HEMATOLOGY',
     price: 7500,
     sampleType: 'Citrated Plasma (Blue Top)',
-    turnaroundTime: '3 Hours',
+    turnaroundTime: '3 hours',
     description: 'Extrinsic and intrinsic coagulation cascade screening.',
     parameters: [
-      { id: 'p_pt', name: 'Prothrombin Time (PT)', unit: 'seconds', referenceRange: '11.0 - 14.0', resultType: 'numeric' },
-      { id: 'p_inr', name: 'International Normalized Ratio (INR)', unit: 'ratio', referenceRange: '0.8 - 1.2', resultType: 'numeric' },
-      { id: 'p_aptt', name: 'Activated Partial Thromboplastin Time (aPTT)', unit: 'seconds', referenceRange: '25.0 - 35.0', resultType: 'numeric' }
+      { id: 'LAB-HEM-03.p_pt', name: 'Prothrombin Time (PT)', unit: 'seconds', referenceRange: '11.0 - 14.0', refLow: 11, refHigh: 14, sortOrder: 10, resultType: 'numeric' },
+      { id: 'LAB-HEM-03.p_inr', name: 'International Normalized Ratio (INR)', unit: 'ratio', referenceRange: '0.8 - 1.2', refLow: 0.8, refHigh: 1.2, sortOrder: 20, resultType: 'numeric' },
+      { id: 'LAB-HEM-03.p_aptt', name: 'Activated Partial Thromboplastin Time (aPTT)', unit: 'seconds', referenceRange: '25.0 - 35.0', refLow: 25, refHigh: 35, sortOrder: 30, resultType: 'numeric' }
     ]
   },
-
-  // 2. MEDICAL MICROBIOLOGY
   {
     id: 'LAB-MIC-01',
-    code: 'MAL_TEST',
-    name: 'Malaria Parasite Screen (Thick & Thin Film / Ag)',
+    code: 'URC',
+    name: 'Urine Culture',
     category: 'MICROBIOLOGY',
-    price: 3000,
-    sampleType: 'Capillary / EDTA Whole Blood',
-    turnaroundTime: '1 Hour',
-    description: 'Gold-standard Giemsa microscopic examination for Plasmodium falciparum/vivax.',
+    price: 6000,
+    sampleType: 'Urine (sterile container)',
+    turnaroundTime: '48-72 hours',
+    description: 'Quantitative urine culture with the organism isolated and its antibiotic susceptibility pattern.',
     parameters: [
-      { id: 'p_mp_density', name: 'Malaria Parasite Microscopic Density', unit: 'parasites/µL', referenceRange: 'Not Detected', resultType: 'text' },
-      { id: 'p_species', name: 'Plasmodium Species Identified', unit: '-', referenceRange: 'None', resultType: 'text' },
-      { id: 'p_rdt', name: 'PfHRP2 Rapid Diagnostic Test', unit: '-', referenceRange: 'Negative', resultType: 'reactive', options: ['Negative', 'Positive (Pf)', 'Positive (Pan)'] }
+      { id: 'LAB-MIC-01.p_culture_growth', name: 'Quantitative Culture (Colony Count)', unit: 'CFU/mL', referenceRange: '< 100000', refLow: null, refHigh: 100000, sortOrder: 10, resultType: 'numeric' },
+      { id: 'LAB-MIC-01.p_isolate', name: 'Organism Isolated', unit: '-', referenceRange: 'No growth', refLow: null, refHigh: null, sortOrder: 20, resultType: 'text' },
+      { id: 'LAB-MIC-01.p_sens_interp', name: 'Sensitivity Interpretation', unit: '-', referenceRange: 'Sensitive (S)', refLow: null, refHigh: null, sortOrder: 30, resultType: 'select', options: ['Sensitive (S)', 'Intermediate (I)', 'Resistant (R)'] },
+      { id: 'LAB-MIC-01.p_sens_pattern', name: 'Antibiotic Susceptibility Pattern', unit: '-', referenceRange: 'Record each drug as S, I or R', refLow: null, refHigh: null, sortOrder: 40, resultType: 'text' }
     ]
   },
   {
@@ -130,14 +154,16 @@ export const initialLabInvestigations: LabInvestigationDefinition[] = [
     category: 'MICROBIOLOGY',
     price: 6000,
     sampleType: 'Clean Catch Mid-Stream Urine (Sterile Cup)',
-    turnaroundTime: '48 Hours',
+    turnaroundTime: '48 hours',
     description: 'Direct urinalysis followed by microbiological agar culture and antibiotic susceptibility profiling.',
     parameters: [
-      { id: 'p_appearance', name: 'Appearance & Color', unit: '-', referenceRange: 'Clear Straw', resultType: 'text' },
-      { id: 'p_wbc_hpf', name: 'WBC (Pus Cells)', unit: '/HPF', referenceRange: '0 - 5', resultType: 'text' },
-      { id: 'p_rbc_hpf', name: 'RBCs', unit: '/HPF', referenceRange: '0 - 2', resultType: 'text' },
-      { id: 'p_culture_growth', name: 'Bacterial Colony Count', unit: 'CFU/mL', referenceRange: '<10^4 (No Significant Growth)', resultType: 'text' },
-      { id: 'p_isolate', name: 'Isolated Pathogen', unit: '-', referenceRange: 'None', resultType: 'text' }
+      { id: 'LAB-MIC-02.p_appearance', name: 'Appearance & Color', unit: '-', referenceRange: 'Clear Straw', refLow: null, refHigh: null, sortOrder: 10, resultType: 'text' },
+      { id: 'LAB-MIC-02.p_wbc_hpf', name: 'WBC (Pus Cells)', unit: '/HPF', referenceRange: '0 - 5', refLow: 0, refHigh: 5, sortOrder: 20, resultType: 'numeric' },
+      { id: 'LAB-MIC-02.p_rbc_hpf', name: 'RBCs', unit: '/HPF', referenceRange: '0 - 2', refLow: 0, refHigh: 2, sortOrder: 30, resultType: 'numeric' },
+      { id: 'LAB-MIC-02.p_culture_growth', name: 'Bacterial Colony Count', unit: 'CFU/mL', referenceRange: '< 100000', refLow: null, refHigh: 100000, sortOrder: 40, resultType: 'numeric' },
+      { id: 'LAB-MIC-02.p_isolate', name: 'Isolated Pathogen', unit: '-', referenceRange: 'None', refLow: null, refHigh: null, sortOrder: 50, resultType: 'text' },
+      { id: 'LAB-MIC-02.p_sens_interp', name: 'Sensitivity Interpretation', unit: '-', referenceRange: 'Sensitive (S)', refLow: null, refHigh: null, sortOrder: 60, resultType: 'select', options: ['Sensitive (S)', 'Intermediate (I)', 'Resistant (R)'] },
+      { id: 'LAB-MIC-02.p_sens_pattern', name: 'Antibiotic Susceptibility Pattern', unit: '-', referenceRange: 'Record each drug as S, I or R', refLow: null, refHigh: null, sortOrder: 70, resultType: 'text' }
     ]
   },
   {
@@ -147,15 +173,30 @@ export const initialLabInvestigations: LabInvestigationDefinition[] = [
     category: 'MICROBIOLOGY',
     price: 3500,
     sampleType: 'Fresh Stool Specimen',
-    turnaroundTime: '2 Hours',
-    description: 'Detection of parasitic ova, cysts, protozoa, and fecal occult hemoglobin.',
+    turnaroundTime: '2 hours',
+    description: 'Macroscopic and microscopic examination for parasites, and fecal occult hemoglobin.',
     parameters: [
-      { id: 'p_fob', name: 'Fecal Occult Blood (FOB)', unit: '-', referenceRange: 'Negative', resultType: 'reactive', options: ['Negative', 'Positive'] },
-      { id: 'p_ova_cysts', name: 'Microscopic Ova / Cysts / Trophozoites', unit: '-', referenceRange: 'None Seen', resultType: 'text' }
+      { id: 'LAB-MIC-03.p_macro', name: 'Macroscopic Examination', unit: '-', referenceRange: 'Formed, brown, no mucus or blood', refLow: null, refHigh: null, sortOrder: 10, resultType: 'text' },
+      { id: 'LAB-MIC-03.p_ova_cysts', name: 'Microscopic Ova / Cysts / Trophozoites', unit: '-', referenceRange: 'None Seen', refLow: null, refHigh: null, sortOrder: 20, resultType: 'text' },
+      { id: 'LAB-MIC-03.p_fob', name: 'Fecal Occult Blood (FOB)', unit: '-', referenceRange: 'Negative', refLow: null, refHigh: null, sortOrder: 30, resultType: 'reactive', options: ['Negative', 'Positive'] }
     ]
   },
-
-  // 3. CHEMICAL PATHOLOGY
+  {
+    id: 'LAB-MIC-04',
+    code: 'MAL_TEST',
+    name: 'Malaria Parasite Screen (Thick & Thin Film / RDT)',
+    category: 'MICROBIOLOGY',
+    price: 3000,
+    sampleType: 'Capillary or EDTA Whole Blood',
+    turnaroundTime: '1 hour',
+    description: 'Giemsa-stained thick and thin films for species and density, with a PfHRP2 rapid diagnostic test.',
+    parameters: [
+      { id: 'LAB-MIC-04.p_mp_density', name: 'Malaria Parasite Density', unit: 'parasites/uL', referenceRange: '0 - 0', refLow: 0, refHigh: 0, sortOrder: 10, resultType: 'numeric' },
+      { id: 'LAB-MIC-04.p_species', name: 'Plasmodium Species Identified', unit: '-', referenceRange: 'None', refLow: null, refHigh: null, sortOrder: 20, resultType: 'select', options: ['None', 'P. falciparum', 'P. vivax', 'P. ovale', 'P. malariae', 'P. knowlesi', 'Mixed infection'] },
+      { id: 'LAB-MIC-04.p_stage', name: 'Parasite Stage Seen', unit: '-', referenceRange: 'None seen', refLow: null, refHigh: null, sortOrder: 30, resultType: 'select', options: ['None seen', 'Ring forms', 'Trophozoites', 'Schizonts', 'Gametocytes'] },
+      { id: 'LAB-MIC-04.p_rdt', name: 'PfHRP2 Rapid Diagnostic Test', unit: '-', referenceRange: 'Negative', refLow: null, refHigh: null, sortOrder: 40, resultType: 'reactive', options: ['Negative', 'Positive (Pf)', 'Invalid - repeat test'] }
+    ]
+  },
   {
     id: 'LAB-CHE-01',
     code: 'LFT',
@@ -163,16 +204,17 @@ export const initialLabInvestigations: LabInvestigationDefinition[] = [
     category: 'CHEMICAL_PATHOLOGY',
     price: 7000,
     sampleType: 'Serum (Gold/Red Top SST)',
-    turnaroundTime: '3 Hours',
+    turnaroundTime: '3 hours',
     description: 'Enzymatic and synthetic functional profile of hepatic parenchyma.',
     parameters: [
-      { id: 'p_alt', name: 'Alanine Aminotransferase (ALT/SGPT)', unit: 'U/L', referenceRange: '7 - 45', resultType: 'numeric' },
-      { id: 'p_ast', name: 'Aspartate Aminotransferase (AST/SGOT)', unit: 'U/L', referenceRange: '8 - 40', resultType: 'numeric' },
-      { id: 'p_alp', name: 'Alkaline Phosphatase (ALP)', unit: 'U/L', referenceRange: '40 - 130', resultType: 'numeric' },
-      { id: 'p_tbil', name: 'Total Bilirubin', unit: 'mg/dL', referenceRange: '0.2 - 1.2', resultType: 'numeric' },
-      { id: 'p_dbil', name: 'Direct (Conjugated) Bilirubin', unit: 'mg/dL', referenceRange: '0.0 - 0.3', resultType: 'numeric' },
-      { id: 'p_alb', name: 'Serum Albumin', unit: 'g/dL', referenceRange: '3.5 - 5.0', resultType: 'numeric' },
-      { id: 'p_tprot', name: 'Total Serum Protein', unit: 'g/dL', referenceRange: '6.4 - 8.3', resultType: 'numeric' }
+      { id: 'LAB-CHE-01.p_alt', name: 'Alanine Aminotransferase (ALT/SGPT)', unit: 'U/L', referenceRange: '7 - 45', refLow: 7, refHigh: 45, sortOrder: 10, resultType: 'numeric' },
+      { id: 'LAB-CHE-01.p_ast', name: 'Aspartate Aminotransferase (AST/SGOT)', unit: 'U/L', referenceRange: '8 - 40', refLow: 8, refHigh: 40, sortOrder: 20, resultType: 'numeric' },
+      { id: 'LAB-CHE-01.p_alp', name: 'Alkaline Phosphatase (ALP)', unit: 'U/L', referenceRange: '40 - 130', refLow: 40, refHigh: 130, sortOrder: 30, resultType: 'numeric' },
+      { id: 'LAB-CHE-01.p_ggt', name: 'Gamma-Glutamyl Transferase (GGT)', unit: 'U/L', referenceRange: '10 - 71', refLow: 10, refHigh: 71, sortOrder: 40, resultType: 'numeric' },
+      { id: 'LAB-CHE-01.p_tbil', name: 'Total Bilirubin', unit: 'mg/dL', referenceRange: '0.2 - 1.2', refLow: 0.2, refHigh: 1.2, sortOrder: 50, resultType: 'numeric' },
+      { id: 'LAB-CHE-01.p_dbil', name: 'Direct (Conjugated) Bilirubin', unit: 'mg/dL', referenceRange: '0.0 - 0.3', refLow: 0, refHigh: 0.3, sortOrder: 60, resultType: 'numeric' },
+      { id: 'LAB-CHE-01.p_tprot', name: 'Total Serum Protein', unit: 'g/dL', referenceRange: '6.4 - 8.3', refLow: 6.4, refHigh: 8.3, sortOrder: 70, resultType: 'numeric' },
+      { id: 'LAB-CHE-01.p_alb', name: 'Serum Albumin', unit: 'g/dL', referenceRange: '3.5 - 5.0', refLow: 3.5, refHigh: 5, sortOrder: 80, resultType: 'numeric' }
     ]
   },
   {
@@ -182,15 +224,16 @@ export const initialLabInvestigations: LabInvestigationDefinition[] = [
     category: 'CHEMICAL_PATHOLOGY',
     price: 6500,
     sampleType: 'Serum (Gold/Red Top SST)',
-    turnaroundTime: '3 Hours',
-    description: 'Renal clearance and systemic electrolyte homeostasis monitoring.',
+    turnaroundTime: '3 hours',
+    description: 'Renal clearance, estimated glomerular filtration, and systemic electrolyte homeostasis.',
     parameters: [
-      { id: 'p_sodium', name: 'Sodium (Na+)', unit: 'mmol/L', referenceRange: '135 - 145', resultType: 'numeric' },
-      { id: 'p_potassium', name: 'Potassium (K+)', unit: 'mmol/L', referenceRange: '3.5 - 5.1', resultType: 'numeric' },
-      { id: 'p_chloride', name: 'Chloride (Cl-)', unit: 'mmol/L', referenceRange: '98 - 107', resultType: 'numeric' },
-      { id: 'p_bicarb', name: 'Bicarbonate (HCO3-)', unit: 'mmol/L', referenceRange: '22 - 29', resultType: 'numeric' },
-      { id: 'p_urea', name: 'Blood Urea Nitrogen (BUN)', unit: 'mg/dL', referenceRange: '7 - 20', resultType: 'numeric' },
-      { id: 'p_creat', name: 'Serum Creatinine', unit: 'mg/dL', referenceRange: '0.6 - 1.3', resultType: 'numeric' }
+      { id: 'LAB-CHE-02.p_sodium', name: 'Sodium (Na+)', unit: 'mmol/L', referenceRange: '135 - 145', refLow: 135, refHigh: 145, sortOrder: 10, resultType: 'numeric' },
+      { id: 'LAB-CHE-02.p_potassium', name: 'Potassium (K+)', unit: 'mmol/L', referenceRange: '3.5 - 5.1', refLow: 3.5, refHigh: 5.1, sortOrder: 20, resultType: 'numeric' },
+      { id: 'LAB-CHE-02.p_chloride', name: 'Chloride (Cl-)', unit: 'mmol/L', referenceRange: '98 - 107', refLow: 98, refHigh: 107, sortOrder: 30, resultType: 'numeric' },
+      { id: 'LAB-CHE-02.p_bicarb', name: 'Bicarbonate (HCO3-)', unit: 'mmol/L', referenceRange: '22 - 29', refLow: 22, refHigh: 29, sortOrder: 40, resultType: 'numeric' },
+      { id: 'LAB-CHE-02.p_urea', name: 'Blood Urea Nitrogen (BUN)', unit: 'mg/dL', referenceRange: '7 - 20', refLow: 7, refHigh: 20, sortOrder: 50, resultType: 'numeric' },
+      { id: 'LAB-CHE-02.p_creat', name: 'Serum Creatinine', unit: 'mg/dL', referenceRange: '0.6 - 1.3', refLow: 0.6, refHigh: 1.3, sortOrder: 60, resultType: 'numeric' },
+      { id: 'LAB-CHE-02.p_egfr', name: 'Estimated Glomerular Filtration Rate (eGFR)', unit: 'mL/min/1.73m2', referenceRange: '> 90', refLow: 90, refHigh: null, sortOrder: 70, resultType: 'numeric' }
     ]
   },
   {
@@ -200,11 +243,11 @@ export const initialLabInvestigations: LabInvestigationDefinition[] = [
     category: 'CHEMICAL_PATHOLOGY',
     price: 6000,
     sampleType: 'Whole Blood (EDTA)',
-    turnaroundTime: '2 Hours',
-    description: 'Long-term glycemic control over preceding 90-120 days.',
+    turnaroundTime: '2 hours',
+    description: 'Long-term glycemic control over the preceding 90-120 days.',
     parameters: [
-      { id: 'p_hba1c', name: 'HbA1c Percentage', unit: '%', referenceRange: '4.0 - 5.6 (Non-Diabetic)', resultType: 'numeric' },
-      { id: 'p_eag', name: 'Estimated Average Glucose (eAG)', unit: 'mg/dL', referenceRange: '70 - 114', resultType: 'numeric' }
+      { id: 'LAB-CHE-03.p_hba1c', name: 'HbA1c Percentage', unit: '%', referenceRange: '4.0 - 5.6', refLow: 4, refHigh: 5.6, sortOrder: 10, resultType: 'numeric' },
+      { id: 'LAB-CHE-03.p_eag', name: 'Estimated Average Glucose (eAG)', unit: 'mg/dL', referenceRange: '70 - 114', refLow: 70, refHigh: 114, sortOrder: 20, resultType: 'numeric' }
     ]
   },
   {
@@ -214,31 +257,48 @@ export const initialLabInvestigations: LabInvestigationDefinition[] = [
     category: 'CHEMICAL_PATHOLOGY',
     price: 6500,
     sampleType: 'Serum (Fasting 12h)',
-    turnaroundTime: '3 Hours',
+    turnaroundTime: '3 hours',
     description: 'Cardiovascular atherosclerotic risk screening.',
     parameters: [
-      { id: 'p_tchol', name: 'Total Cholesterol', unit: 'mg/dL', referenceRange: '< 200', resultType: 'numeric' },
-      { id: 'p_ldl', name: 'LDL Cholesterol (Calculated)', unit: 'mg/dL', referenceRange: '< 100', resultType: 'numeric' },
-      { id: 'p_hdl', name: 'HDL Cholesterol', unit: 'mg/dL', referenceRange: '> 40 (Male) / > 50 (Female)', resultType: 'numeric' },
-      { id: 'p_tg', name: 'Serum Triglycerides', unit: 'mg/dL', referenceRange: '< 150', resultType: 'numeric' }
+      { id: 'LAB-CHE-04.p_tchol', name: 'Total Cholesterol', unit: 'mg/dL', referenceRange: '< 200', refLow: null, refHigh: 200, sortOrder: 10, resultType: 'numeric' },
+      { id: 'LAB-CHE-04.p_ldl', name: 'LDL Cholesterol (Calculated)', unit: 'mg/dL', referenceRange: '< 100', refLow: null, refHigh: 100, sortOrder: 20, resultType: 'numeric' },
+      { id: 'LAB-CHE-04.p_hdl', name: 'HDL Cholesterol', unit: 'mg/dL', referenceRange: '> 40', refLow: 40, refHigh: null, sortOrder: 30, resultType: 'numeric' },
+      { id: 'LAB-CHE-04.p_tg', name: 'Serum Triglycerides', unit: 'mg/dL', referenceRange: '< 150', refLow: null, refHigh: 150, sortOrder: 40, resultType: 'numeric' }
     ]
   },
-
-  // 4. HISTOPATHOLOGY
+  {
+    id: 'LAB-CHP-01',
+    code: 'EUC',
+    name: 'Electrolytes, Urea & Creatinine',
+    category: 'CHEMICAL_PATHOLOGY',
+    price: 5500,
+    sampleType: 'Serum (plain tube)',
+    turnaroundTime: '4-6 hours',
+    description: 'Electrolyte and renal analyte panel reported without the indices.',
+    parameters: [
+      { id: 'LAB-CHP-01.p_sodium', name: 'Sodium (Na+)', unit: 'mmol/L', referenceRange: '135 - 145', refLow: 135, refHigh: 145, sortOrder: 10, resultType: 'numeric' },
+      { id: 'LAB-CHP-01.p_potassium', name: 'Potassium (K+)', unit: 'mmol/L', referenceRange: '3.5 - 5.1', refLow: 3.5, refHigh: 5.1, sortOrder: 20, resultType: 'numeric' },
+      { id: 'LAB-CHP-01.p_chloride', name: 'Chloride (Cl-)', unit: 'mmol/L', referenceRange: '98 - 107', refLow: 98, refHigh: 107, sortOrder: 30, resultType: 'numeric' },
+      { id: 'LAB-CHP-01.p_bicarb', name: 'Bicarbonate (HCO3-)', unit: 'mmol/L', referenceRange: '22 - 29', refLow: 22, refHigh: 29, sortOrder: 40, resultType: 'numeric' },
+      { id: 'LAB-CHP-01.p_urea', name: 'Blood Urea Nitrogen (BUN)', unit: 'mg/dL', referenceRange: '7 - 20', refLow: 7, refHigh: 20, sortOrder: 50, resultType: 'numeric' },
+      { id: 'LAB-CHP-01.p_creat', name: 'Serum Creatinine', unit: 'mg/dL', referenceRange: '0.6 - 1.3', refLow: 0.6, refHigh: 1.3, sortOrder: 60, resultType: 'numeric' }
+    ]
+  },
   {
     id: 'LAB-HIS-01',
-    code: 'BIOPSY_HISTO',
-    name: 'Tissue Biopsy Histopathological Evaluation',
+    code: 'HPE',
+    name: 'Histopathology Examination',
     category: 'HISTOPATHOLOGY',
-    price: 20000,
-    sampleType: 'Formalin-fixed Tissue Specimen (10% Neutral Buffered Formalin)',
-    turnaroundTime: '5 - 7 Days',
-    description: 'Gross anatomical grossing, paraffin embedding, microtome sectioning, H&E staining, and board-certified pathologist diagnosis.',
+    price: 25000,
+    sampleType: 'Tissue in formalin',
+    turnaroundTime: '5-7 days',
+    description: 'Gross description, microscopic examination, pathological diagnosis, and margin status.',
     parameters: [
-      { id: 'p_gross', name: 'Macroscopic / Gross Description', unit: '-', referenceRange: 'Descriptive', resultType: 'text' },
-      { id: 'p_micro', name: 'Microscopic Examination', unit: '-', referenceRange: 'Descriptive', resultType: 'text' },
-      { id: 'p_histo_diag', name: 'Histopathological Pathological Diagnosis', unit: '-', referenceRange: 'Benign / Malignant classification', resultType: 'text' },
-      { id: 'p_margins', name: 'Surgical Resection Margins', unit: '-', referenceRange: 'Clear / Involved', resultType: 'text' }
+      { id: 'LAB-HIS-01.p_gross', name: 'Macroscopic / Gross Description', unit: '-', referenceRange: 'Descriptive', refLow: null, refHigh: null, sortOrder: 10, resultType: 'text' },
+      { id: 'LAB-HIS-01.p_micro', name: 'Microscopic Examination', unit: '-', referenceRange: 'Descriptive', refLow: null, refHigh: null, sortOrder: 20, resultType: 'text' },
+      { id: 'LAB-HIS-01.p_diagnosis', name: 'Pathological Diagnosis', unit: '-', referenceRange: 'Benign / Malignant classification', refLow: null, refHigh: null, sortOrder: 30, resultType: 'text' },
+      { id: 'LAB-HIS-01.p_margins', name: 'Surgical Resection Margins', unit: '-', referenceRange: 'Clear', refLow: null, refHigh: null, sortOrder: 40, resultType: 'select', options: ['Clear', 'Close (<1mm)', 'Involved', 'Not applicable'] },
+      { id: 'LAB-HIS-01.p_grade', name: 'Tumour Grade / Differentiation', unit: '-', referenceRange: 'Not graded', refLow: null, refHigh: null, sortOrder: 50, resultType: 'text' }
     ]
   },
   {
@@ -248,14 +308,32 @@ export const initialLabInvestigations: LabInvestigationDefinition[] = [
     category: 'HISTOPATHOLOGY',
     price: 9000,
     sampleType: 'Endocervical Brush Vial Specimen',
-    turnaroundTime: '3 Days',
-    description: 'Screening for epithelial cervical dysplasia according to the Bethesda Classification.',
+    turnaroundTime: '3 days',
+    description: 'Screening for epithelial cervical dysplasia according to the Bethesda classification.',
     parameters: [
-      { id: 'p_adequacy', name: 'Specimen Adequacy', unit: '-', referenceRange: 'Satisfactory for evaluation', resultType: 'text' },
-      { id: 'p_bethesda', name: 'Bethesda Category Classification', unit: '-', referenceRange: 'NILM (Negative for Intraepithelial Lesion or Malignancy)', resultType: 'text' },
-      { id: 'p_cyto_comments', name: 'Cytotechnologist / Pathologist Remarks', unit: '-', referenceRange: 'No atypia', resultType: 'text' }
+      { id: 'LAB-HIS-02.p_adequacy', name: 'Specimen Adequacy', unit: '-', referenceRange: 'Satisfactory for evaluation', refLow: null, refHigh: null, sortOrder: 10, resultType: 'select', options: ['Satisfactory for evaluation', 'Satisfactory but limited by inflammation', 'Unsatisfactory - repeat in 3 months'] },
+      { id: 'LAB-HIS-02.p_bethesda', name: 'Bethesda Category Classification (NILM = Negative for Intraepithelial Lesion or Malignancy)', unit: '-', referenceRange: 'NILM', refLow: null, refHigh: null, sortOrder: 20, resultType: 'select', options: ['NILM', 'ASC-US', 'ASC-H', 'LSIL', 'HSIL', 'Atypical glandular cells', 'Malignant', 'Insufficient sample'] },
+      { id: 'LAB-HIS-02.p_cyto_comments', name: 'Cytotechnologist / Pathologist Remarks', unit: '-', referenceRange: 'No atypia', refLow: null, refHigh: null, sortOrder: 30, resultType: 'text' }
     ]
-  }
+  },
+  {
+    id: 'LAB-MOL-01',
+    code: 'PCR',
+    name: 'Polymerase Chain Reaction',
+    category: 'MOLECULAR',
+    price: 30000,
+    sampleType: 'Swab / Blood',
+    turnaroundTime: '24-48 hours',
+    description: 'Nucleic-acid amplification with the target, assay, interpretation, cycle threshold and quantitation recorded.',
+    parameters: [
+      { id: 'LAB-MOL-01.p_target', name: 'Molecular Target / Gene Assayed', unit: '-', referenceRange: 'Name the target assayed', refLow: null, refHigh: null, sortOrder: 10, resultType: 'text' },
+      { id: 'LAB-MOL-01.p_tech', name: 'Assay Platform / Method', unit: '-', referenceRange: 'Name the platform', refLow: null, refHigh: null, sortOrder: 20, resultType: 'text' },
+      { id: 'LAB-MOL-01.p_result', name: 'Result Interpretation', unit: '-', referenceRange: 'Not detected', refLow: null, refHigh: null, sortOrder: 30, resultType: 'select', options: ['Not detected', 'Detected', 'Equivocal / inconclusive', 'Insufficient sample for testing', 'Invalid - repeat sample'] },
+      { id: 'LAB-MOL-01.p_ct', name: 'Cycle Threshold (Ct / Cq)', unit: 'cycles', referenceRange: 'Not applicable', refLow: null, refHigh: null, sortOrder: 40, resultType: 'numeric' },
+      { id: 'LAB-MOL-01.p_load', name: 'Viral Load / Quantitation', unit: 'copies/mL', referenceRange: 'Below detection limit', refLow: null, refHigh: null, sortOrder: 50, resultType: 'text' },
+      { id: 'LAB-MOL-01.p_genotype', name: 'Genotype / Variant Identified', unit: '-', referenceRange: 'Not applicable', refLow: null, refHigh: null, sortOrder: 60, resultType: 'text' }
+    ]
+  },
 ];
 
 export const initialMedications: Medication[] = [

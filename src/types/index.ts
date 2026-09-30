@@ -55,15 +55,21 @@ export interface User {
   /**
    * May this person recover their own password by email?
    *
-   * An administrator can always do this. A clinician cannot, unless an
-   * administrator has turned this on for them, which is the clinic saying they
-   * do not have to phone anyone for a new password. Default false, including for
-   * administrators, so nobody gets self-service by accident.
+   * An administrator can always do this. A clinician cannot, unless the column
+   * `users.allow_password_reset_email` is TRUE for them, which is the clinic
+   * saying they do not have to phone anyone for a new password. False for
+   * everyone by default, including administrators, so nobody gets self-service by
+   * accident.
    *
-   * The grant is deliberately a column in the staff register and not something
-   * the sign-in screen can decide: the person it is about cannot be signed in to
-   * grant it to themselves, and the whole rule is decided server-side by the
-   * `staff-accounts` function regardless of what this says.
+   * READ-ONLY IN THE APP, and that is not an oversight. This is a permission
+   * about an account the person currently cannot reach, so it is granted from the
+   * database - `npm run staff:self-reset -- --grant USR-004` - and this field is
+   * only ever read from the server. It is omitted from every write out of the
+   * browser, so a stale local copy cannot grant or revoke it, and no screen in
+   * the app sets it.
+   *
+   * `must_change_password` sits beside it for the same reason: the server sets
+   * both, and the register is the record.
    */
   allowPasswordResetEmail?: boolean;
   active: boolean;
@@ -223,12 +229,28 @@ export type LabCategory =
   | 'HISTOPATHOLOGY'
   | 'MOLECULAR';
 
+/**
+ * One analyte of an investigation's panel.
+ *
+ * A Full Blood Count carries sixteen of these; an investigation with none can
+ * only be recorded as free text, which is why every catalogue entry seeded by
+ * `database/fatclinic.sql` has at least one.
+ */
 export interface LabParameterTemplate {
+  /** Namespaced by its investigation (`LAB-HEM-01.p_hb`), so one analyte can appear on more than one panel. */
   id: string;
   name: string;
   unit: string;
+  /** The range as printed on the report. Prose is allowed and normal for a non-numeric analyte. */
   referenceRange: string;
+  /** Lower bound of the reference interval, or null when there is none. Decides Low. */
+  refLow?: number | null;
+  /** Upper bound of the reference interval, or null when there is none. Decides High. */
+  refHigh?: number | null;
+  /** Position on the panel and on the report. */
+  sortOrder?: number;
   resultType: 'numeric' | 'text' | 'select' | 'reactive';
+  /** The values offered as a dropdown. The FIRST entry is the normal or negative one. */
   options?: string[];
 }
 

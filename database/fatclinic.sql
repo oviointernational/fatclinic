@@ -166,12 +166,17 @@ CREATE TABLE IF NOT EXISTS role_permissions (
 --                        to an active profile with this set AND a linked
 --                        account; the column is the grant, not the enforcement.
 --
---                        Set by an administrator in the edit-staff modal and
---                        written by the ordinary users_update policy, which
---                        requires app_is_admin(). A clinician cannot grant it to
---                        themselves: it is not among the columns
---                        app_update_own_profile will write, so the one account
---                        they are locked out of cannot be the one they open up.
+--                        DATABASE-SET, and deliberately not editable in the app.
+--                        Granted with
+--                          npm run staff:self-reset -- --grant USR-003
+--                        and read back by the admin staff list, which shows who
+--                        holds it. Two reasons it is not a screen: it is a
+--                        permission about an account the holder cannot currently
+--                        sign in to, and the sync layer omits this column from
+--                        every write the browser makes - so a stale local copy
+--                        cannot grant it, revoke it, or preserve it by accident.
+--                        Only the privileged key can, which is what that command
+--                        holds. must_change_password is server-set the same way.
 --
 -- There is intentionally no password column: passwords belong to Supabase Auth.
 -- See section 12 for how the two are linked.
@@ -357,13 +362,54 @@ CREATE TABLE IF NOT EXISTS lab_investigations (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- One row per analyte that can be reported on an investigation: the panel.
+--
+-- A Full Blood Count is not one result, it is sixteen (haemoglobin, the red-cell
+-- indices, the white-cell differential, the platelet count, a morphology note).
+-- This table is that list, and `lab_results` below is where a value is recorded
+-- against one of these rows. The result-entry screen renders one line per row
+-- here, which is why an investigation whose panel is empty can only offer a
+-- single free-text box: there is nothing else to render.
+--
+-- Panels are part of the catalogue and are seeded in section 15, not edited from
+-- a screen. A panel is clinical content - the analytes a test reports and the
+-- range each is judged against - so it belongs to the same place as the test
+-- itself rather than to whoever is signed in.
 CREATE TABLE IF NOT EXISTS lab_parameters (
   id               TEXT PRIMARY KEY,
   investigation_id TEXT NOT NULL REFERENCES lab_investigations(id) ON DELETE CASCADE,
   name             TEXT NOT NULL,
   unit             TEXT NOT NULL DEFAULT '',
+  -- The range as it is printed on the report. Free text, because it is prose for
+  -- a non-numeric analyte ("None Seen") and sex-specific text for a numeric one.
   reference_range  TEXT NOT NULL DEFAULT '',
+  -- The numeric bounds the printed range abbreviates, which is what a result is
+  -- compared against to decide Normal / Low / High.
+  --
+  -- Stored beside `reference_range` rather than parsed out of it because the
+  -- printed range cannot be parsed reliably: "< 200", "> 40 (Male) / > 50
+  -- (Female)" and "Not detected" are three different shapes and a miss would
+  -- either leave every value unflagged or flag a normal result. NULL on a side
+  -- that is unbounded, and both NULL when no interval applies (a PCR cycle
+  -- threshold, a morphology note), which the screen reads as "no automatic
+  -- judgement available" instead of silently calling it normal.
+  --
+  -- Held to the printed range by scripts/check-lab-catalogue.mjs: a numeric
+  -- parameter whose range reads "a - b", "< b" or "> a" must carry those bounds,
+  -- and one whose range is prose must carry none.
+  ref_low          NUMERIC,
+  ref_high         NUMERIC,
+  -- Position within the panel. A report that lists its analytes in whatever order
+  -- the database happened to return is not a report a clinician can read off
+  -- quickly, and the order was previously undefined: no ORDER BY anywhere on the
+  -- way from Postgres to the screen.
+  sort_order       INTEGER NOT NULL DEFAULT 100,
   result_type      TEXT NOT NULL CHECK (result_type IN ('numeric','text','select','reactive')),
+  -- For a 'select' or 'reactive' parameter, the values offered as a dropdown
+  -- rather than typed as free text: a species list, a Bethesda category, an
+  -- S/I/R verdict. The FIRST entry is the normal or negative one, because that
+  -- is what the screen compares the rest against to decide the flag; a list that
+  -- starts with a positive result would report every normal specimen abnormal.
   options          TEXT[] NOT NULL DEFAULT '{}'
 );
 
@@ -1255,10 +1301,10 @@ BEGIN
   -- active, auth_user_id and must_change_password are absent too.
   --
   -- allow_password_reset_email is absent as well, and for the same reason as
-  -- role: it is a permission, granted by an administrator. A clinician cannot
-  -- widen their own access to the account they are locked out of, and
-  -- users_update (the policy covering the whole table) requires app_is_admin(),
-  -- so the only way to set it is an administrator's ordinary staff save.
+  -- role: it is a permission, and specifically one about the account the caller
+  -- is currently locked out of. A clinician must not be able to open their own
+  -- way back in, which is why it is not among these four columns and why the
+  -- browser cannot write it at all - see the users table comment.
   --
   -- A NULL argument leaves that column alone. An empty name or a PIN that is
   -- not exactly four digits is refused. Returns TRUE when a row was updated,
@@ -1293,7 +1339,7 @@ BEGIN
   $fn$;
 
   COMMENT ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) IS
-    'Updates a clinician''s own name, department, avatar and device PIN. No id is accepted - the row is the caller''s profile resolved from the JWT, so it cannot reach another person. role, active, email, auth_user_id and allow_password_reset_email are not settable through it. NULL leaves a column unchanged; an empty name or malformed PIN is refused. Returns TRUE when a row was updated.';
+    'Updates a clinician''s own name, department, avatar and device PIN. No id is accepted - the row is the caller''s profile resolved from the JWT, so it cannot reach another person. role, active, email, auth_user_id, must_change_password and allow_password_reset_email are not settable through it. NULL leaves a column unchanged; an empty name or malformed PIN is refused. Returns TRUE when a row was updated.';
 
   -- Public self-booking: a visitor's appointment request, submitted with no
   -- session and no sign-in.
@@ -1541,6 +1587,62 @@ BEGIN
     EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon';
     EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon';
   END IF;
+
+  -- One column is taken back off `authenticated`, and it is the self-service
+  -- password-reset grant.
+  --
+  -- WHY THIS IS NEEDED AND NOT JUST THE APP SITTING STILL
+  -- ------------------------------------------------------
+  -- The browser already omits `allow_password_reset_email` from every write it
+  -- makes, and no screen sets it. That is a promise about this codebase, though,
+  -- and the RLS policy covering `users` admits any administrator - so a signed-in
+  -- administrator could still put the column on the wire by hand (devtools, curl)
+  -- and the database would apply it. A grant is supposed to be an administrator's
+  -- deliberate act, taken in a terminal where they can see what they did; allowing
+  -- it to be changed from a screen re-opens exactly the door the flag exists to
+  -- close, which is a person opening their own way back in to the account they
+  -- are locked out of.
+  --
+  -- A column-level revoke is narrower than the table-level grant above rather than
+  -- an alternative to it: `authenticated` keeps INSERT/UPDATE/DELETE on every
+  -- other column of `users`, so the ordinary admin staff save is unaffected. Only
+  -- this column is unreachable, and the only writer left is the privileged key -
+  -- which is what `npm run staff:self-reset` holds. service_role is a different
+  -- role and keeps its own grants, which is why that command still works.
+  --
+  -- INSERT is revoked too, so a newly created profile cannot arrive already
+  -- granted; the column's NOT NULL DEFAULT FALSE applies instead.
+  --
+  -- Asserted by scripts/check-forgot-password.mjs, which asks the database to
+  -- refuse this column while still allowing the rest of the row.
+  REVOKE INSERT (allow_password_reset_email), UPDATE (allow_password_reset_email)
+    ON TABLE public.users FROM authenticated;
+
+  -- The second table a client may read but not write: `lab_parameters`, the
+  -- analyte panel of an investigation.
+  --
+  -- What a full blood count reports, and the interval each analyte is judged
+  -- against, is the laboratory's reference data rather than a clinical record.
+  -- Nothing in the app edits it - there is no screen for it - so every write the
+  -- app ever made came from a copy held in a browser, and that copy goes stale the
+  -- moment the catalogue changes. A parent write re-pushes the whole nested array,
+  -- so an administrator correcting a price on a device that had not signed in
+  -- since the panel changed would delete the analytes the server had gained and
+  -- re-insert the old ones. No error, no warning, and a blood count quietly back
+  -- to one box: the defect this table's existence is meant to end.
+  --
+  -- So the table-level grant above is narrowed for this one table: SELECT stays,
+  -- so any staff member can read the panel to enter a result against it, and the
+  -- three write privileges are taken back. `service_role` is a different role and
+  -- keeps its own grants, which is how the panel is seeded and migrated - the same
+  -- arrangement as the reset grant above.
+  --
+  -- The application agrees with the grant rather than relying on it: the
+  -- `lab_parameters` child in src/services/sync.ts is marked `readOnly`, so no
+  -- upsert and no delete is ever planned for it. If the grant were removed and the
+  -- app still tried, the write would fail loudly rather than silently - the
+  -- opposite of the arrangement being avoided here.
+  REVOKE INSERT, UPDATE, DELETE ON TABLE public.lab_parameters FROM authenticated;
 
   -- Policies invoke these as the table owner; clients must not call them
   -- directly, so EXECUTE is revoked from PUBLIC and regranted narrowly.
@@ -1927,12 +2029,192 @@ INSERT INTO service_prices (id, name, category, price, active) VALUES
   ('SVC-010','Follow-up Visit','Consultation',5000,TRUE)
 ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO lab_investigations (id, code, name, category, price, sample_type, turnaround_time) VALUES
-  ('LAB-HEM-01','FBC','Full Blood Count','HEMATOLOGY',3500,'Whole Blood (EDTA)','2-4 hours'),
-  ('LAB-MIC-01','URC','Urine Culture','MICROBIOLOGY',6000,'Urine (sterile container)','48-72 hours'),
-  ('LAB-CHP-01','EUC','Electrolytes, Urea & Creatinine','CHEMICAL_PATHOLOGY',5500,'Serum (plain tube)','4-6 hours'),
-  ('LAB-HIS-01','HPE','Histopathology Examination','HISTOPATHOLOGY',25000,'Tissue in formalin','5-7 days'),
-  ('LAB-MOL-01','PCR','Polymerase Chain Reaction','MOLECULAR',30000,'Swab / Blood','24-48 hours')
+-- -----------------------------------------------------------------------------
+-- Laboratory catalogue and panels.
+--
+-- The catalogue and its panels are one unit. A test that exists without its
+-- panel is the defect this seed exists to prevent: the result-entry screen can
+-- only offer one free-text box for it, so a Full Blood Count comes back as one
+-- line of free text instead of sixteen analytes, and nobody can tell from the
+-- record which of them were actually run.
+--
+-- WHAT IS SEEDED HERE
+--   15 investigations across the five departments, and 90 analyte rows, every
+--   investigation carrying at least one. Anything not listed here has no panel by
+--   design, and the only investigation allowed to reach the screen that way is
+--   one an administrator has added since - which says so on the screen.
+--
+-- PARAMETER IDS ARE NAMESPACED (`LAB-HEM-01.p_hb`)
+--   `lab_parameters.id` is the primary key, so a bare `p_sodium` could belong to
+--   exactly one investigation - which would mean serum creatinine could not
+--   appear on both the renal profile and the electrolytes panel, or a platelet
+--   count on both a blood count and a coagulation profile. Prefixing each id
+--   with its investigation makes the same analyte reusable across panels and
+--   makes a result's parameter self-identifying, since `lab_results` carries the
+--   parameter id and a reviewer reading one row should be able to tell which
+--   panel it belongs to. Enforced by scripts/check-lab-catalogue.mjs.
+--
+-- REFERENCE RANGES ARE ADULT AND SEX-INDEPENDENT
+--   Each printed range is an envelope covering adult men and women, and each
+--   numeric range is accompanied by the bounds that decide Low / High. Where a
+--   laboratory applies sex- or age-specific limits, widen `reference_range` and
+--   move `ref_low` / `ref_high` with it - an envelope flags in the safe
+--   direction, whereas a bound copied from one sex would flag the other wrongly
+--   in whichever direction the bound was wrong. Ranges for a paediatric panel
+--   belong on a separate investigation, not on this one.
+--
+--   That change is made in the database, not in a screen, for the reason given at
+--   the REVOKE on this table: the panel is reference data, and a browser's copy of
+--   it goes stale. It is a migration, and scripts/migrate-lab-panels.mjs is the
+--   shape of one.
+--
+-- `ON CONFLICT (id) DO NOTHING`, as everywhere else in this file: a seed states
+-- the catalogue, it does not overwrite a price or a range somebody has already
+-- set. There is no UPDATE here, so re-running this file cannot change an existing
+-- investigation's name, price or panel - which is also why the panel migration in
+-- scripts/migrate-lab-panels.mjs exists, and why that script reports before and
+-- after.
+-- -----------------------------------------------------------------------------
+INSERT INTO lab_investigations (id, code, name, category, price, sample_type, turnaround_time, description) VALUES
+  ('LAB-HEM-01','FBC','Full Blood Count','HEMATOLOGY',3500,'Whole Blood (EDTA)','2-4 hours',
+   'Haemoglobin, red-cell indices, total and differential white-cell count, platelets and a morphology note.'),
+  ('LAB-HEM-02','ESR','Erythrocyte Sedimentation Rate','HEMATOLOGY',2500,'Whole Blood (Sodium Citrate - Black Top)','1.5 hours',
+   'Nonspecific marker of systemic inflammation and active infection.'),
+  ('LAB-HEM-03','COAG','Coagulation Profile (PT/INR & aPTT)','HEMATOLOGY',7500,'Citrated Plasma (Blue Top)','3 hours',
+   'Extrinsic and intrinsic coagulation cascade screening.'),
+  ('LAB-MIC-01','URC','Urine Culture','MICROBIOLOGY',6000,'Urine (sterile container)','48-72 hours',
+   'Quantitative urine culture with the organism isolated and its antibiotic susceptibility pattern.'),
+  ('LAB-MIC-02','URINE_MCS','Urine Microscopy, Culture & Sensitivity','MICROBIOLOGY',6000,'Clean Catch Mid-Stream Urine (Sterile Cup)','48 hours',
+   'Direct urinalysis followed by microbiological agar culture and antibiotic susceptibility profiling.'),
+  ('LAB-MIC-03','STOOL_TEST','Stool Routine Microscopy & Occult Blood','MICROBIOLOGY',3500,'Fresh Stool Specimen','2 hours',
+   'Macroscopic and microscopic examination for parasites, and fecal occult hemoglobin.'),
+  ('LAB-MIC-04','MAL_TEST','Malaria Parasite Screen (Thick & Thin Film / RDT)','MICROBIOLOGY',3000,'Capillary or EDTA Whole Blood','1 hour',
+   'Giemsa-stained thick and thin films for species and density, with a PfHRP2 rapid diagnostic test.'),
+  ('LAB-CHE-01','LFT','Liver Function Tests (Hepatic Panel)','CHEMICAL_PATHOLOGY',7000,'Serum (Gold/Red Top SST)','3 hours',
+   'Enzymatic and synthetic functional profile of hepatic parenchyma.'),
+  ('LAB-CHE-02','UE_CREAT','Urea, Electrolytes & Serum Creatinine (Renal Profile)','CHEMICAL_PATHOLOGY',6500,'Serum (Gold/Red Top SST)','3 hours',
+   'Renal clearance, estimated glomerular filtration, and systemic electrolyte homeostasis.'),
+  ('LAB-CHE-03','HBA1C','Glycated Hemoglobin (HbA1c)','CHEMICAL_PATHOLOGY',6000,'Whole Blood (EDTA)','2 hours',
+   'Long-term glycemic control over the preceding 90-120 days.'),
+  ('LAB-CHE-04','LIPID','Fasting Lipid Panel','CHEMICAL_PATHOLOGY',6500,'Serum (Fasting 12h)','3 hours',
+   'Cardiovascular atherosclerotic risk screening.'),
+  ('LAB-CHP-01','EUC','Electrolytes, Urea & Creatinine','CHEMICAL_PATHOLOGY',5500,'Serum (plain tube)','4-6 hours',
+   'Electrolyte and renal analyte panel reported without the indices.'),
+  ('LAB-HIS-01','HPE','Histopathology Examination','HISTOPATHOLOGY',25000,'Tissue in formalin','5-7 days',
+   'Gross description, microscopic examination, pathological diagnosis, and margin status.'),
+  ('LAB-HIS-02','PAP_SMEAR','Cervical Liquid-Based Cytology (Pap Smear)','HISTOPATHOLOGY',9000,'Endocervical Brush Vial Specimen','3 days',
+   'Screening for epithelial cervical dysplasia according to the Bethesda classification.'),
+  ('LAB-MOL-01','PCR','Polymerase Chain Reaction','MOLECULAR',30000,'Swab / Blood','24-48 hours',
+   'Nucleic-acid amplification with the target, assay, interpretation, cycle threshold and quantitation recorded.')
+ON CONFLICT (id) DO NOTHING;
+
+-- HEMATOLOGY -----------------------------------------------------------------
+
+INSERT INTO lab_parameters (id, investigation_id, name, unit, reference_range, ref_low, ref_high, sort_order, result_type, options) VALUES
+  ('LAB-HEM-01.p_hb','LAB-HEM-01','Hemoglobin (Hb)','g/dL','12.0 - 17.5',12.0,17.5,10,'numeric','{}'),
+  ('LAB-HEM-01.p_rbc','LAB-HEM-01','Red Blood Cell Count (RBC)','x10^12/L','4.5 - 6.5',4.5,6.5,20,'numeric','{}'),
+  ('LAB-HEM-01.p_pcv','LAB-HEM-01','Packed Cell Volume (PCV)','%','36.0 - 52.0',36.0,52.0,30,'numeric','{}'),
+  ('LAB-HEM-01.p_mcv','LAB-HEM-01','Mean Corpuscular Volume (MCV)','fL','80.0 - 100.0',80.0,100.0,40,'numeric','{}'),
+  ('LAB-HEM-01.p_mch','LAB-HEM-01','Mean Corpuscular Hemoglobin (MCH)','pg','27.0 - 33.0',27.0,33.0,50,'numeric','{}'),
+  ('LAB-HEM-01.p_mchc','LAB-HEM-01','Mean Corpuscular Hemoglobin Concentration (MCHC)','g/dL','32.0 - 36.0',32.0,36.0,60,'numeric','{}'),
+  ('LAB-HEM-01.p_rdw','LAB-HEM-01','Red Cell Distribution Width (RDW)','%','11.0 - 14.0',11.0,14.0,70,'numeric','{}'),
+  ('LAB-HEM-01.p_wbc','LAB-HEM-01','Total White Blood Cell Count (WBC)','x10^9/L','4.0 - 11.0',4.0,11.0,80,'numeric','{}'),
+  ('LAB-HEM-01.p_neut','LAB-HEM-01','Neutrophils (Neutrophil %)','%','40 - 75',40,75,90,'numeric','{}'),
+  ('LAB-HEM-01.p_lymph','LAB-HEM-01','Lymphocytes (Lymphocyte %)','%','20 - 45',20,45,100,'numeric','{}'),
+  ('LAB-HEM-01.p_mono','LAB-HEM-01','Monocytes (Monocyte %)','%','2 - 10',2,10,110,'numeric','{}'),
+  ('LAB-HEM-01.p_eos','LAB-HEM-01','Eosinophils (Eosinophil %)','%','1 - 6',1,6,120,'numeric','{}'),
+  ('LAB-HEM-01.p_baso','LAB-HEM-01','Basophils (Basophil %)','%','0 - 2',0,2,130,'numeric','{}'),
+  ('LAB-HEM-01.p_plt','LAB-HEM-01','Platelet Count','x10^9/L','150 - 450',150,450,140,'numeric','{}'),
+  ('LAB-HEM-01.p_mpv','LAB-HEM-01','Mean Platelet Volume (MPV)','fL','7.0 - 12.0',7.0,12.0,150,'numeric','{}'),
+  ('LAB-HEM-01.p_morph','LAB-HEM-01','Red Cell Morphology & Comment','-','Normochromic normocytes',NULL,NULL,160,'text','{}'),
+  ('LAB-HEM-02.p_esr','LAB-HEM-02','Westergren ESR (1 hour)','mm/hr','0 - 20',0,20,10,'numeric','{}'),
+  ('LAB-HEM-03.p_pt','LAB-HEM-03','Prothrombin Time (PT)','seconds','11.0 - 14.0',11.0,14.0,10,'numeric','{}'),
+  ('LAB-HEM-03.p_inr','LAB-HEM-03','International Normalized Ratio (INR)','ratio','0.8 - 1.2',0.8,1.2,20,'numeric','{}'),
+  ('LAB-HEM-03.p_aptt','LAB-HEM-03','Activated Partial Thromboplastin Time (aPTT)','seconds','25.0 - 35.0',25.0,35.0,30,'numeric','{}')
+ON CONFLICT (id) DO NOTHING;
+
+-- MICROBIOLOGY ---------------------------------------------------------------
+
+INSERT INTO lab_parameters (id, investigation_id, name, unit, reference_range, ref_low, ref_high, sort_order, result_type, options) VALUES
+  ('LAB-MIC-01.p_culture_growth','LAB-MIC-01','Quantitative Culture (Colony Count)','CFU/mL','< 100000',NULL,100000,10,'numeric','{}'),
+  ('LAB-MIC-01.p_isolate','LAB-MIC-01','Organism Isolated','-','No growth',NULL,NULL,20,'text','{}'),
+  ('LAB-MIC-01.p_sens_interp','LAB-MIC-01','Sensitivity Interpretation','-','Sensitive (S)',NULL,NULL,30,'select',
+   '{Sensitive (S),Intermediate (I),Resistant (R)}'),
+  ('LAB-MIC-01.p_sens_pattern','LAB-MIC-01','Antibiotic Susceptibility Pattern','-','Record each drug as S, I or R',NULL,NULL,40,'text','{}'),
+  ('LAB-MIC-02.p_appearance','LAB-MIC-02','Appearance & Color','-','Clear Straw',NULL,NULL,10,'text','{}'),
+  ('LAB-MIC-02.p_wbc_hpf','LAB-MIC-02','WBC (Pus Cells)','/HPF','0 - 5',0,5,20,'numeric','{}'),
+  ('LAB-MIC-02.p_rbc_hpf','LAB-MIC-02','RBCs','/HPF','0 - 2',0,2,30,'numeric','{}'),
+  ('LAB-MIC-02.p_culture_growth','LAB-MIC-02','Bacterial Colony Count','CFU/mL','< 100000',NULL,100000,40,'numeric','{}'),
+  ('LAB-MIC-02.p_isolate','LAB-MIC-02','Isolated Pathogen','-','None',NULL,NULL,50,'text','{}'),
+  ('LAB-MIC-02.p_sens_interp','LAB-MIC-02','Sensitivity Interpretation','-','Sensitive (S)',NULL,NULL,60,'select',
+   '{Sensitive (S),Intermediate (I),Resistant (R)}'),
+  ('LAB-MIC-02.p_sens_pattern','LAB-MIC-02','Antibiotic Susceptibility Pattern','-','Record each drug as S, I or R',NULL,NULL,70,'text','{}'),
+  ('LAB-MIC-03.p_macro','LAB-MIC-03','Macroscopic Examination','-','Formed, brown, no mucus or blood',NULL,NULL,10,'text','{}'),
+  ('LAB-MIC-03.p_ova_cysts','LAB-MIC-03','Microscopic Ova / Cysts / Trophozoites','-','None Seen',NULL,NULL,20,'text','{}'),
+  ('LAB-MIC-03.p_fob','LAB-MIC-03','Fecal Occult Blood (FOB)','-','Negative',NULL,NULL,30,'reactive',
+   '{Negative,Positive}'),
+  ('LAB-MIC-04.p_mp_density','LAB-MIC-04','Malaria Parasite Density','parasites/uL','0 - 0',0,0,10,'numeric','{}'),
+  ('LAB-MIC-04.p_species','LAB-MIC-04','Plasmodium Species Identified','-','None',NULL,NULL,20,'select',
+   '{None,P. falciparum,P. vivax,P. ovale,P. malariae,P. knowlesi,Mixed infection}'),
+  ('LAB-MIC-04.p_stage','LAB-MIC-04','Parasite Stage Seen','-','None seen',NULL,NULL,30,'select',
+   '{None seen,Ring forms,Trophozoites,Schizonts,Gametocytes}'),
+  ('LAB-MIC-04.p_rdt','LAB-MIC-04','PfHRP2 Rapid Diagnostic Test','-','Negative',NULL,NULL,40,'reactive',
+   '{Negative,Positive (Pf),Invalid - repeat test}')
+ON CONFLICT (id) DO NOTHING;
+
+-- CHEMICAL PATHOLOGY ---------------------------------------------------------
+
+INSERT INTO lab_parameters (id, investigation_id, name, unit, reference_range, ref_low, ref_high, sort_order, result_type, options) VALUES
+  ('LAB-CHE-01.p_alt','LAB-CHE-01','Alanine Aminotransferase (ALT/SGPT)','U/L','7 - 45',7,45,10,'numeric','{}'),
+  ('LAB-CHE-01.p_ast','LAB-CHE-01','Aspartate Aminotransferase (AST/SGOT)','U/L','8 - 40',8,40,20,'numeric','{}'),
+  ('LAB-CHE-01.p_alp','LAB-CHE-01','Alkaline Phosphatase (ALP)','U/L','40 - 130',40,130,30,'numeric','{}'),
+  ('LAB-CHE-01.p_ggt','LAB-CHE-01','Gamma-Glutamyl Transferase (GGT)','U/L','10 - 71',10,71,40,'numeric','{}'),
+  ('LAB-CHE-01.p_tbil','LAB-CHE-01','Total Bilirubin','mg/dL','0.2 - 1.2',0.2,1.2,50,'numeric','{}'),
+  ('LAB-CHE-01.p_dbil','LAB-CHE-01','Direct (Conjugated) Bilirubin','mg/dL','0.0 - 0.3',0.0,0.3,60,'numeric','{}'),
+  ('LAB-CHE-01.p_tprot','LAB-CHE-01','Total Serum Protein','g/dL','6.4 - 8.3',6.4,8.3,70,'numeric','{}'),
+  ('LAB-CHE-01.p_alb','LAB-CHE-01','Serum Albumin','g/dL','3.5 - 5.0',3.5,5.0,80,'numeric','{}'),
+  ('LAB-CHE-02.p_sodium','LAB-CHE-02','Sodium (Na+)','mmol/L','135 - 145',135,145,10,'numeric','{}'),
+  ('LAB-CHE-02.p_potassium','LAB-CHE-02','Potassium (K+)','mmol/L','3.5 - 5.1',3.5,5.1,20,'numeric','{}'),
+  ('LAB-CHE-02.p_chloride','LAB-CHE-02','Chloride (Cl-)','mmol/L','98 - 107',98,107,30,'numeric','{}'),
+  ('LAB-CHE-02.p_bicarb','LAB-CHE-02','Bicarbonate (HCO3-)','mmol/L','22 - 29',22,29,40,'numeric','{}'),
+  ('LAB-CHE-02.p_urea','LAB-CHE-02','Blood Urea Nitrogen (BUN)','mg/dL','7 - 20',7,20,50,'numeric','{}'),
+  ('LAB-CHE-02.p_creat','LAB-CHE-02','Serum Creatinine','mg/dL','0.6 - 1.3',0.6,1.3,60,'numeric','{}'),
+  ('LAB-CHE-02.p_egfr','LAB-CHE-02','Estimated Glomerular Filtration Rate (eGFR)','mL/min/1.73m2','> 90',90,NULL,70,'numeric','{}'),
+  ('LAB-CHE-03.p_hba1c','LAB-CHE-03','HbA1c Percentage','%','4.0 - 5.6',4.0,5.6,10,'numeric','{}'),
+  ('LAB-CHE-03.p_eag','LAB-CHE-03','Estimated Average Glucose (eAG)','mg/dL','70 - 114',70,114,20,'numeric','{}'),
+  ('LAB-CHE-04.p_tchol','LAB-CHE-04','Total Cholesterol','mg/dL','< 200',NULL,200,10,'numeric','{}'),
+  ('LAB-CHE-04.p_ldl','LAB-CHE-04','LDL Cholesterol (Calculated)','mg/dL','< 100',NULL,100,20,'numeric','{}'),
+  ('LAB-CHE-04.p_hdl','LAB-CHE-04','HDL Cholesterol','mg/dL','> 40',40,NULL,30,'numeric','{}'),
+  ('LAB-CHE-04.p_tg','LAB-CHE-04','Serum Triglycerides','mg/dL','< 150',NULL,150,40,'numeric','{}'),
+  ('LAB-CHP-01.p_sodium','LAB-CHP-01','Sodium (Na+)','mmol/L','135 - 145',135,145,10,'numeric','{}'),
+  ('LAB-CHP-01.p_potassium','LAB-CHP-01','Potassium (K+)','mmol/L','3.5 - 5.1',3.5,5.1,20,'numeric','{}'),
+  ('LAB-CHP-01.p_chloride','LAB-CHP-01','Chloride (Cl-)','mmol/L','98 - 107',98,107,30,'numeric','{}'),
+  ('LAB-CHP-01.p_bicarb','LAB-CHP-01','Bicarbonate (HCO3-)','mmol/L','22 - 29',22,29,40,'numeric','{}'),
+  ('LAB-CHP-01.p_urea','LAB-CHP-01','Blood Urea Nitrogen (BUN)','mg/dL','7 - 20',7,20,50,'numeric','{}'),
+  ('LAB-CHP-01.p_creat','LAB-CHP-01','Serum Creatinine','mg/dL','0.6 - 1.3',0.6,1.3,60,'numeric','{}')
+ON CONFLICT (id) DO NOTHING;
+
+-- HISTOPATHOLOGY AND MOLECULAR -----------------------------------------------
+
+INSERT INTO lab_parameters (id, investigation_id, name, unit, reference_range, ref_low, ref_high, sort_order, result_type, options) VALUES
+  ('LAB-HIS-01.p_gross','LAB-HIS-01','Macroscopic / Gross Description','-','Descriptive',NULL,NULL,10,'text','{}'),
+  ('LAB-HIS-01.p_micro','LAB-HIS-01','Microscopic Examination','-','Descriptive',NULL,NULL,20,'text','{}'),
+  ('LAB-HIS-01.p_diagnosis','LAB-HIS-01','Pathological Diagnosis','-','Benign / Malignant classification',NULL,NULL,30,'text','{}'),
+  ('LAB-HIS-01.p_margins','LAB-HIS-01','Surgical Resection Margins','-','Clear',NULL,NULL,40,'select',
+   '{Clear,Close (<1mm),Involved,Not applicable}'),
+  ('LAB-HIS-01.p_grade','LAB-HIS-01','Tumour Grade / Differentiation','-','Not graded',NULL,NULL,50,'text','{}'),
+  ('LAB-HIS-02.p_adequacy','LAB-HIS-02','Specimen Adequacy','-','Satisfactory for evaluation',NULL,NULL,10,'select',
+   '{Satisfactory for evaluation,Satisfactory but limited by inflammation,Unsatisfactory - repeat in 3 months}'),
+  ('LAB-HIS-02.p_bethesda','LAB-HIS-02','Bethesda Category Classification (NILM = Negative for Intraepithelial Lesion or Malignancy)','-','NILM',NULL,NULL,20,'select',
+   '{NILM,ASC-US,ASC-H,LSIL,HSIL,Atypical glandular cells,Malignant,Insufficient sample}'),
+  ('LAB-HIS-02.p_cyto_comments','LAB-HIS-02','Cytotechnologist / Pathologist Remarks','-','No atypia',NULL,NULL,30,'text','{}'),
+  ('LAB-MOL-01.p_target','LAB-MOL-01','Molecular Target / Gene Assayed','-','Name the target assayed',NULL,NULL,10,'text','{}'),
+  ('LAB-MOL-01.p_tech','LAB-MOL-01','Assay Platform / Method','-','Name the platform',NULL,NULL,20,'text','{}'),
+  ('LAB-MOL-01.p_result','LAB-MOL-01','Result Interpretation','-','Not detected',NULL,NULL,30,'select',
+   '{Not detected,Detected,Equivocal / inconclusive,Insufficient sample for testing,Invalid - repeat sample}'),
+  ('LAB-MOL-01.p_ct','LAB-MOL-01','Cycle Threshold (Ct / Cq)','cycles','Not applicable',NULL,NULL,40,'numeric','{}'),
+  ('LAB-MOL-01.p_load','LAB-MOL-01','Viral Load / Quantitation','copies/mL','Below detection limit',NULL,NULL,50,'text','{}'),
+  ('LAB-MOL-01.p_genotype','LAB-MOL-01','Genotype / Variant Identified','-','Not applicable',NULL,NULL,60,'text','{}')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO medications (id, name, generic_name, category, dosage_form, strength, unit_price, current_stock, min_stock_alert, dispensing_unit) VALUES

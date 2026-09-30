@@ -198,6 +198,25 @@ interface ChildMap {
   modelToRow: (item: any, parentId: string) => Record<string, unknown>;
   /** Columns the database maintains; never sent by the client. */
   omit?: string[];
+  /**
+   * This child is read but never written: the database owns it, and the app
+   * plans no upsert and no delete for it however the parent's array differs.
+   *
+   * `lab_parameters` is the case that needs it. The analyte panel of an
+   * investigation is clinical reference data - what a test reports and the range
+   * each is judged against - and the app has no screen that edits it, so every
+   * write it ever made came from a copy held in a browser. That copy goes stale
+   * the moment the catalogue changes, and a parent write re-pushes the whole
+   * nested array: an administrator correcting a price on a laptop that had not
+   * signed in since the panel changed would delete the analytes the server had
+   * gained and re-insert the old ones, with no error anywhere. A full blood
+   * count quietly back to one analyte again.
+   *
+   * Paired with a REVOKE in the schema, so nothing reaches the table from a
+   * client at all. Changing a panel is a migration, the way a price change made
+   * in the database rather than in a browser is not.
+   */
+  readOnly?: boolean;
   /** Grandchildren, e.g. lab_results hanging off lab_test_orders. */
   children?: ChildMap[];
 }
@@ -337,7 +356,15 @@ export const TABLES: TableMap[] = [
     // `password` is deliberately absent: public.users has no such column and
     // credentials belong to Supabase Auth. Reading it back would also be a
     // silent failure, because the column does not exist to read.
-    omit: [...SERVER_MANAGED, 'auth_user_id'],
+    // `allow_password_reset_email` is omitted from every write for the same
+    // reason, and it is the one that would have been tempting to leave in: it
+    // looks like an ordinary staff field, so the edit-user modal could set it
+    // like any other. It is not. The grant is a permission about a locked-out
+    // account, decided from the database (`npm run staff:self-reset`), and the
+    // browser is not a place that decision is made - a stale local copy must not
+    // be able to grant or revoke it by being written back. `must_change_password`
+    // is server-set in exactly this way.
+    omit: [...SERVER_MANAGED, 'auth_user_id', 'allow_password_reset_email'],
     normalises: ['email'],
     rowToModel: (r): User => ({
       id: text(r.id),
@@ -353,9 +380,8 @@ export const TABLES: TableMap[] = [
       // from one that does not; `omit` below keeps it out of every write, so
       // nothing in the browser can re-point a profile at another account.
       authUserId: optText(r.auth_user_id),
-      // Read as a plain boolean, never as `undefined`, because the server is the
-      // only place this rule is actually enforced and a missing field there must
-      // read as "not granted" rather than as "ask again".
+      // Read as a plain boolean, never as `undefined`, so the admin list can show
+      // who has the grant. It is not written back - see `omit` above.
       allowPasswordResetEmail: Boolean(r.allow_password_reset_email),
       active: Boolean(r.active),
     }),
@@ -379,11 +405,6 @@ export const TABLES: TableMap[] = [
       pin: m.pin || '1234',
       custom_role_id: orNull(m.customRoleId),
       must_change_password: Boolean(m.mustChangePassword),
-      // Writable, unlike `auth_user_id`: granting self-service password reset is
-      // an ordinary administrative decision about a staff member, made by an
-      // administrator through the RLS-protected write like any other field. The
-      // server still decides what the grant actually permits.
-      allow_password_reset_email: Boolean(m.allowPasswordResetEmail),
       active: m.active !== false,
     }),
   },
@@ -662,6 +683,10 @@ export const TABLES: TableMap[] = [
         table: 'lab_parameters',
         fk: 'investigation_id',
         property: 'parameters',
+        // The panel belongs to the catalogue, not to whoever is signed in. The app
+        // reads it to render result entry and never writes it, so a device holding
+        // an out-of-date copy cannot revert a panel when its user corrects a price.
+        readOnly: true,
         keyOf: (p: LabParameterTemplate) => p.id,
         dbKeyOf: (p: LabParameterTemplate) => p.id,
         rowToModel: (r): LabParameterTemplate => ({
@@ -669,6 +694,12 @@ export const TABLES: TableMap[] = [
           name: text(r.name),
           unit: text(r.unit),
           referenceRange: text(r.reference_range),
+          // Numeric bounds beside the printed range rather than parsed from it,
+          // and read as null when absent so a missing bound is never read as
+          // zero - which would flag every result above it as High.
+          refLow: r.ref_low === null || r.ref_low === undefined ? null : num(r.ref_low),
+          refHigh: r.ref_high === null || r.ref_high === undefined ? null : num(r.ref_high),
+          sortOrder: Number(r.sort_order ?? 100),
           resultType: text(r.result_type) as LabParameterTemplate['resultType'],
           options: list(r.options),
         }),
@@ -678,6 +709,9 @@ export const TABLES: TableMap[] = [
           name: p.name,
           unit: p.unit ?? '',
           reference_range: p.referenceRange ?? '',
+          ref_low: p.refLow ?? null,
+          ref_high: p.refHigh ?? null,
+          sort_order: p.sortOrder ?? 100,
           result_type: p.resultType,
           options: list(p.options),
         }),
@@ -1733,6 +1767,19 @@ interface Op {
  * Grandchildren are planned per surviving child, because their foreign key is
  * the child's own id rather than the top-level parent's. They are appended after
  * their parent's upserts so the row they point at exists first.
+ *
+ * A child is written when its row differs, not merely when its key is absent.
+ * That distinction is the whole reason a laboratory test could be marked "Sample
+ * Collected" all afternoon and still be "Requested" in the database: a child that
+ * kept its id was treated as unchanged and skipped, so the status, the draw time,
+ * the critical-alert flag and the release stamp were all dropped. The comparison
+ * is made on the mapped row rather than on the model, because the mapped row is
+ * what the database compares - two models that differ only in a field the omit
+ * list drops are the same write, and sending it would be noise.
+ *
+ * A `readOnly` child is skipped entirely. Nothing is planned for it - not an
+ * upsert, and not the deletes its stale copy would otherwise produce - so a
+ * parent write cannot carry an out-of-date copy of a table the database owns.
  */
 function planChildOps(
   child: ChildMap,
@@ -1741,8 +1788,13 @@ function planChildOps(
   after: unknown,
   ops: Op[],
 ): void {
+  if (child.readOnly) return;
+
   const beforeItems = (Array.isArray(before) ? before : []) as any[];
   const afterItems = (Array.isArray(after) ? after : []) as any[];
+
+  const toRow = (item: any) =>
+    forPostgres(applyOmit(child.modelToRow(item, parentId), child.omit), child.table);
 
   const upserts: Record<string, unknown>[] = [];
   const beforeByKey = new Map<string, any>();
@@ -1752,8 +1804,12 @@ function planChildOps(
   for (const item of afterItems) {
     const key = child.keyOf(item);
     afterKeys.add(key);
-    if (beforeByKey.has(key)) continue; // unchanged: nothing to send
-    upserts.push(forPostgres(applyOmit(child.modelToRow(item, parentId), child.omit), child.table));
+    const row = toRow(item);
+    const previous = beforeByKey.get(key);
+    if (previous !== undefined && JSON.stringify(toRow(previous)) === JSON.stringify(row)) {
+      continue; // the same row: nothing to send
+    }
+    upserts.push(row);
   }
 
   const deletes: string[] = [];

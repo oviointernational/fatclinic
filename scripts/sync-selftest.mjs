@@ -71,6 +71,11 @@ const {
   COLUMN_RANGES,
 } = await import('../src/services/sync.ts');
 
+// Imported here rather than alongside the rest of the laboratory rules further
+// down, because the diff test below composes the two: `applyStatusChange` decides
+// what a workflow move writes and `pushDiff` has to actually send it.
+const { applyStatusChange } = await import('../src/services/labResults.ts');
+
 // ---------------------------------------------------------------------------
 // Test harness
 // ---------------------------------------------------------------------------
@@ -566,6 +571,35 @@ await block('credentials never leave the browser', async () => {
     'users row carries no auth_user_id (Supabase owns it)',
     !('auth_user_id' in row),
   );
+  // The self-service reset grant, the same way. It is a permission, granted with
+  // `npm run staff:self-reset` and read back by the admin list; nothing the
+  // browser does may write it. Checked on the row that goes on the wire rather
+  // than on the model, because a model field is harmless on its own - it is the
+  // push that would change a locked-out clinician's ability to reset their own
+  // password without anybody deciding to.
+  check(
+    'users row carries no allow_password_reset_email (the database decides it)',
+    !('allow_password_reset_email' in row),
+  );
+  check(
+    'and a model that sets it still cannot put it on the wire',
+    !('allow_password_reset_email' in users.modelToRow({
+      ...users.rowToModel(syntheticRow('users')),
+      allowPasswordResetEmail: true,
+    })),
+  );
+  check(
+    'while the value is still read back, so the admin list can show who has it',
+    users.rowToModel({ ...syntheticRow('users'), allow_password_reset_email: true })
+      .allowPasswordResetEmail === true,
+  );
+  // And it must be dropped by the omit list, not merely absent from modelToRow:
+  // a later edit that added it back to the mapper would otherwise ship a grant.
+  check(
+    'the column is named in the users omit list, so a later mapper cannot ship it',
+    (users.omit ?? []).includes('allow_password_reset_email'),
+    (users.omit ?? []).join(', ') || 'omit list is empty',
+  );
 
   // Stronger than "the value is blank". The previous build carried
   // `password: ''` on the model, which meant a field existed that any later
@@ -652,7 +686,13 @@ function probeValueFor(type) {
     return -987654.321;
   }
   if (type.startsWith('INT') || type.startsWith('SERIAL')) return 4242;
-  if (type.startsWith('BOOLEAN')) return 'PROBE_TOGGLE';
+  // FALSE, and not a truthy string. `valueFor` gives every boolean column TRUE,
+  // so a truthy probe would coerce back to the same value, the comparison would
+  // see no change, and the field would never make it into the skip list below -
+  // which would then fail the round trip for any boolean column listed in
+  // `omit`. Latent until the first such column existed: users.allow_password_
+  // reset_email. A probe has to differ from the value it is probing.
+  if (type.startsWith('BOOLEAN')) return false;
   if (type.endsWith('[]')) return ['PROBE_SENTINEL'];
   return 'PROBE_SENTINEL';
 }
@@ -895,6 +935,120 @@ await block('diff: nested children follow their parent', async () => {
   );
 });
 
+await block('diff: a child that changed but kept its id is still written', async () => {
+  // THE DEFECT THIS EXISTS TO CATCH
+  // -------------------------------
+  // A child was skipped whenever its id was already present on both sides of the
+  // diff. Ids do not change when a laboratory test moves along its workflow, so
+  // "Sample Collected", "Processing", "Result Entered" and "Released" all saved
+  // the request, updated localStorage, showed the new status on screen - and sent
+  // no UPDATE. The row in the database kept saying "Requested", with no draw time,
+  // no critical-alert flag and no releaser, until the page was reloaded.
+  //
+  // Everything above it was right: the mapper sent `status`, the column existed,
+  // the policy admitted the write. The write simply was not sent, so no amount of
+  // checking a mapper or a schema would have found it. This is the check that
+  // fails if the comparison goes back to comparing identities.
+  const map = TABLE_BY_KEY.get('fatclinic_lab_requests');
+  const child = map.children[0];
+
+  const order = (over = {}) => ({
+    id: 'LTO-CHILDDIFF',
+    requestId: 'LRQ-CHILDDIFF',
+    testDefinitionId: 'LAB-HEM-01',
+    testName: 'Full Blood Count',
+    category: 'HEMATOLOGY',
+    price: 15000,
+    sampleType: 'EDTA Whole Blood',
+    status: 'Requested',
+    results: [],
+    ...over,
+  });
+  const request = (tests) => ({
+    id: 'LRQ-CHILDDIFF',
+    visitId: 'VISIT-1',
+    patientId: 'P-1',
+    requestedAt: '2026-09-30T07:00:00.000Z',
+    priority: 'Routine',
+    paymentStatus: 'Paid',
+    totalPrice: 15000,
+    tests,
+  });
+
+  const server = fakeServer();
+  await seedVisit(server, 'VISIT-1', 'P-1');
+  // The order's foreign key into the catalogue, which the fake server enforces
+  // like Postgres does. Seeding the row by hand rather than through pushDiff also
+  // keeps the "before" side honest: it is the persisted state, not something this
+  // test just wrote.
+  await server.client.from('lab_investigations').upsert(
+    [{ id: 'LAB-HEM-01', code: 'FBC', name: 'Full Blood Count', category: 'HEMATOLOGY', price: 15000 }],
+    { onConflict: 'id' },
+  );
+  // The scientist, for the same reason: `scientist_id` references `users`, and the
+  // fake server would refuse the whole upsert for a foreign key that is a fixture's
+  // fault rather than the code under test's.
+  await server.client.from('users').upsert(
+    [{ id: 'USR-1', name: 'Amaka Obi', email: 'amaka.obi@clinic.test', role: 'LAB_SCIENTIST', active: true }],
+    { onConflict: 'id' },
+  );
+  await server.client.from('lab_requests').upsert(
+    [map.modelToRow(request([order()]))],
+    { onConflict: 'id' },
+  );
+  await server.client.from('lab_test_orders').upsert(
+    [{ ...child.modelToRow(order(), 'LRQ-CHILDDIFF') }],
+    { onConflict: 'id' },
+  );
+  const before = [request([order()])];
+
+  // Four workflow moves, each with the same order id as the last, driven through
+  // `applyStatusChange` exactly as the dashboard drives them - so this covers the
+  // composition of the two halves: the rule that decides what a move writes, and
+  // the diff that writes it. A move replaces the whole order, so a rule that failed
+  // to carry `collectedAt` forward would show up here as a cleared draw time.
+  let current = order();
+  const moves = [
+    ['Sample Collected', {}],
+    ['Processing', {}],
+    ['Result Entered', { criticalAlert: true }],
+    ['Released', { comments: 'Called the physician.' }],
+  ];
+  let drawnAt = null;
+  for (const [status, extra] of moves) {
+    const now = `2026-09-30T0${moves.findIndex((m) => m[0] === status) + 8}:15:00.000Z`;
+    const next = applyStatusChange(current, status, { user: { id: 'USR-1', name: 'Amaka Obi' }, now, ...extra });
+    await pushDiff(map, [request([current])], [request([next])], server.client);
+    const row = server.rows('lab_test_orders').find((r) => r.id === 'LTO-CHILDDIFF');
+    check(`"${status}" reaches the database`, row?.status === status, String(row?.status));
+    if (status === 'Sample Collected') drawnAt = row?.collected_at;
+    // The draw time is stamped once. If a later move cleared it, the specimen
+    // would have no recorded draw time at the moment the report was released.
+    check(`and "${status}" leaves the draw time alone`, row?.collected_at === drawnAt, String(row?.collected_at));
+    current = next;
+  }
+
+  const final = server.rows('lab_test_orders').find((r) => r.id === 'LTO-CHILDDIFF');
+  check('the draw time is recorded', !!final?.collected_at, String(final?.collected_at));
+  check('the scientist who took it is on the row', final?.scientist_name === 'Amaka Obi', String(final?.scientist_name));
+  check('the critical alert the checkbox raised is on the row', final?.critical_alert === true, String(final?.critical_alert));
+  check('the release stamp is there', !!final?.released_at, String(final?.released_at));
+  check('the releaser is named', final?.verified_by === 'Amaka Obi', String(final?.verified_by));
+  check('the comment is stored', final?.comments === 'Called the physician.', String(final?.comments));
+  check('and the order was not duplicated', server.rows('lab_test_orders').length === 1, `${server.rows('lab_test_orders').length} rows`);
+
+  // A save that changes nothing still writes nothing, or every keystroke would
+  // become an UPDATE.
+  let wrote = 0;
+  const spy = async (table) => {
+    if (table === 'lab_test_orders') wrote += 1;
+    return { error: null };
+  };
+  const settled = [request([current])];
+  await pushDiff(map, settled, settled, { ...server.client, from: spy });
+  check('and a save that changes nothing sends no statement', wrote === 0, `${wrote} statements`);
+});
+
 await block('diff: a child removed from the model is deleted', async () => {
   const map = TABLE_BY_KEY.get('fatclinic_consultations');
   const base = map.rowToModel(rowWithoutForeignKeys('consultations'));
@@ -1031,8 +1185,20 @@ await block('diff: invoices leave the arithmetic to the database', async () => {
   // A discount is clamped to the subtotal by the trigger, so it has to be
   // re-asserted after the line items land. Without the settle pass the discount
   // is clamped away and never comes back.
-  const writes = server.ops.filter((o) => o.table === 'invoices' && o.op === 'upsert').length;
-  check('the invoice is written once on insert', writes === 1, writes);
+  //
+  // Every write is counted, not only the upserts. The settle pass is a plain
+  // UPDATE by design - see the block below - so an extra settle on insert shows
+  // up as an `update` and was invisible to a count that looked only at `upsert`.
+  // That made the defect "the settle pass also runs on insert" undetectable: it
+  // was declared in scripts/sync-defects.mjs, injected on every run, and nothing
+  // failed. The gap was in the assertion, not in the code.
+  const writes = server.ops.filter((o) => o.table === 'invoices');
+  check(
+    'the invoice is written once on insert, with no settle pass behind it',
+    writes.length === 1,
+    `${writes.length}: ${writes.map((o) => o.op).join(', ')}`,
+  );
+  check('and the one write is the insert', writes.length === 1 && writes[0].op === 'upsert', writes[0]?.op);
 });
 
 await block('diff: settle re-asserts discount on UPDATE, never an upsert', async () => {
@@ -1614,6 +1780,423 @@ await block('every guarded range is a range the schema states', async () => {
     'and the form really does check it',
     checkVitals({ temperature: 22, systolicBp: 120, diastolicBp: 80, pulse: 72, respiratoryRate: 16, spo2: 98, weight: 70, height: 1.7 }).length > 0,
   );
+});
+
+// ---------------------------------------------------------------------------
+// 18. The laboratory catalogue
+// ---------------------------------------------------------------------------
+//
+// A Full Blood Count is sixteen analytes. It was being recorded in one free-text
+// box, and the reason was not in the screen: the panel it should have been
+// recorded against was empty in the database, while a different copy of the panel
+// sat in src/services/seedData.ts. Nine investigations were seeded from that file
+// and five from the schema, and where both claimed the same id the first to arrive
+// won - so FBC was in the database with no parameters at all.
+//
+// The screen could only offer what it had, so it offered one box. Nothing
+// complained: no error, no rejected row, a clean "Result Entered". An empty panel
+// is invisible, which is what makes it dangerous.
+//
+// So the catalogue is checked like everything else here, against the same rule -
+// the schema file is the truth, and the browser's copy has to match it.
+
+const { readCatalogueSeed, boundsIn } = await import('./lab-catalogue-seed.mjs');
+const { initialLabInvestigations } = await import('../src/services/seedData.ts');
+const {
+  buildRows,
+  canRelease,
+  criticalRows,
+  enteredCount,
+  enteredRows,
+  flagForValue,
+  panelFor,
+  statusAuditDetail,
+} = await import('../src/services/labResults.ts');
+
+const catalogue = readCatalogueSeed(sql);
+
+await block('every investigation in the catalogue has a panel', () => {
+  const bare = catalogue.filter((i) => i.parameters.length === 0).map((i) => i.id);
+  check('no investigation is left without a panel', bare.length === 0, bare.join(', '));
+  check(
+    'a Full Blood Count is a full blood count',
+    (catalogue.find((i) => i.code === 'FBC')?.parameters.length ?? 0) >= 14,
+    `FBC has ${catalogue.find((i) => i.code === 'FBC')?.parameters.length ?? 0} analytes`,
+  );
+  const categories = new Set(catalogue.map((i) => i.category));
+  check(
+    'every department the schema allows is represented',
+    ['HEMATOLOGY', 'MICROBIOLOGY', 'CHEMICAL_PATHOLOGY', 'HISTOPATHOLOGY', 'MOLECULAR'].every((c) => categories.has(c)),
+    [...categories].join(', '),
+  );
+});
+
+await block('a parameter is identified by the panel it belongs to', () => {
+  // lab_parameters.id is the primary key, so a bare `p_sodium` could belong to
+  // exactly one investigation - which would mean serum creatinine could not
+  // appear on both the renal profile and the electrolytes panel. Prefixing each id
+  // with its investigation is what makes one analyte reusable.
+  const misfiled = catalogue
+    .flatMap((i) => i.parameters.map((p) => ({ id: p.id, of: i.id })))
+    .filter((p) => !p.id.startsWith(`${p.of}.`));
+  check('every parameter id is namespaced by its investigation', misfiled.length === 0, misfile(misfiled));
+
+  const seen = new Map();
+  const clashes = [];
+  for (const inv of catalogue) {
+    for (const p of inv.parameters) {
+      if (seen.has(p.id)) clashes.push(`${p.id}: ${seen.get(p.id)} and ${inv.id}`);
+      seen.set(p.id, inv.id);
+    }
+  }
+  check('and no two panels claim the same parameter id', clashes.length === 0, clashes.join(', '));
+
+  const disordered = catalogue.filter(
+    (i) => new Set(i.parameters.map((p) => p.sortOrder)).size !== i.parameters.length,
+  );
+  check('every panel has a distinct position per analyte', disordered.length === 0, disordered.map((i) => i.id).join(', '));
+});
+
+function misfile(rows) {
+  return rows.map((r) => `${r.id} (panel ${r.of})`).join(', ');
+}
+
+await block('a printed range and the bounds behind it agree', () => {
+  const wrong = [];
+  const missing = [];
+  for (const inv of catalogue) {
+    for (const p of inv.parameters) {
+      if (p.resultType !== 'numeric') {
+        if (p.refLow !== null || p.refHigh !== null) wrong.push(`${p.id} is not numeric but carries bounds`);
+        continue;
+      }
+      const stated = boundsIn(p.referenceRange);
+      if (!stated) {
+        if (p.refLow !== null || p.refHigh !== null) {
+          wrong.push(`${p.id} prints "${p.referenceRange}" but carries bounds`);
+        }
+        // Prose is a legitimate printed range for an analyte with no interval -
+        // "Not applicable" against a polymerase chain reaction's cycle threshold -
+        // but prose that CONTAINS NUMBERS is a number the flag could not read.
+        // "4.0 - 5.6 (Non-Diabetic)" was in this seed until a panel was rebuilt, and
+        // it passed this rule: two numbers and a gloss, which `boundsIn` returns
+        // nothing for, so a diabetic HbA1c was flagged Normal against it forever.
+        // The digit is the tell, and a rule that cannot see it is not a rule.
+        if (/\d/.test(p.referenceRange) && p.refLow === null && p.refHigh === null) {
+          missing.push(`${p.id} prints "${p.referenceRange}", which no bound can read`);
+        }
+        continue;
+      }
+      // A one-sided interval carries one bound and that is correct: "< 200" has no
+      // lower limit. What must never happen is a printed interval with no bounds
+      // behind it at all, because then nothing is ever flagged against it.
+      if (p.refLow === null && p.refHigh === null) {
+        missing.push(`${p.id} prints "${p.referenceRange}" but no bound decides it`);
+      }
+      if (p.refLow !== stated.low || p.refHigh !== stated.high) {
+        wrong.push(`${p.id} prints "${p.referenceRange}" (${stated.low}..${stated.high}) but carries ${p.refLow}..${p.refHigh}`);
+      }
+      if (!p.unit) missing.push(`${p.id} is numeric with no unit`);
+    }
+  }
+  check('no parameter prints a range its bounds contradict', wrong.length === 0, wrong.join('; '));
+  check('and no numeric analyte lacks its interval or its unit', missing.length === 0, missing.join('; '));
+});
+
+await block('a parameter that offers a choice offers a normal one', () => {
+  // The first option is what the screen compares the rest against to decide the
+  // flag, so a list starting with a positive result would report every normal
+  // specimen abnormal.
+  const choosers = catalogue.flatMap((i) => i.parameters).filter((p) => p.resultType === 'select' || p.resultType === 'reactive');
+  const noOptions = choosers.filter((p) => p.options.length === 0).map((p) => p.id);
+  const wrongType = choosers.filter((p) => p.options.length > 0 && p.resultType !== 'select' && p.resultType !== 'reactive').map((p) => p.id);
+  check('every dropdown parameter has options to choose from', noOptions.length === 0, noOptions.join(', '));
+  check('and no free-text parameter is pretending to be a dropdown', wrongType.length === 0, wrongType.join(', '));
+});
+
+await block('the browser catalogue is the seeded catalogue', () => {
+  const byId = new Map(catalogue.map((i) => [i.id, i]));
+  const browserIds = initialLabInvestigations.map((i) => i.id).sort();
+  check(
+    'the same investigations',
+    JSON.stringify(browserIds) === JSON.stringify([...byId.keys()].sort()),
+    `seed ${byId.size}, browser ${initialLabInvestigations.length}`,
+  );
+
+  const problems = [];
+  for (const inv of initialLabInvestigations) {
+    const seeded = byId.get(inv.id);
+    if (!seeded) {
+      problems.push(`${inv.id} is in the browser only - it has no panel in the database`);
+      continue;
+    }
+    for (const field of ['code', 'name', 'category', 'sampleType', 'turnaroundTime', 'description']) {
+      if ((inv[field] ?? '') !== seeded[field]) {
+        problems.push(`${inv.id}.${field}: browser "${inv[field]}" vs seed "${seeded[field]}"`);
+      }
+    }
+    if (inv.price !== seeded.price) problems.push(`${inv.id}.price: browser ${inv.price} vs seed ${seeded.price}`);
+    if ((inv.parameters ?? []).length !== seeded.parameters.length) {
+      problems.push(`${inv.id}: browser has ${(inv.parameters ?? []).length} analytes, seed has ${seeded.parameters.length}`);
+      continue;
+    }
+    inv.parameters.forEach((p, i) => {
+      const s = seeded.parameters[i];
+      const same =
+        p.id === s.id &&
+        p.name === s.name &&
+        p.unit === s.unit &&
+        p.referenceRange === s.referenceRange &&
+        p.resultType === s.resultType &&
+        p.sortOrder === s.sortOrder &&
+        (p.refLow ?? null) === s.refLow &&
+        (p.refHigh ?? null) === s.refHigh &&
+        JSON.stringify(p.options ?? []) === JSON.stringify(s.options);
+      if (!same) {
+        problems.push(`${inv.id} analyte ${i + 1}: browser ${p.id} vs seed ${s.id} (${p.name} / ${s.name})`);
+      }
+    });
+  }
+  check(
+    'and the same analytes, in the same order, with the same ranges',
+    problems.length === 0,
+    problems.slice(0, 4).join('; '),
+  );
+});
+
+await block('a value is flagged from its own reference interval', () => {
+  const fbc = catalogue.find((i) => i.code === 'FBC');
+  const byId = new Map(fbc.parameters.map((p) => [p.id, p]));
+  const flag = (id, value, current = 'Normal') => flagForValue(byId.get(id), value, current);
+  const renal = new Map(catalogue.find((i) => i.code === 'UE_CREAT').parameters.map((p) => [p.id, p]));
+
+  // The case that made this a clinical defect rather than a cosmetic one: a
+  // potassium of 6.4 used to be released as a normal potassium, because the flag
+  // was a dropdown that started on Normal and nothing recomputed it.
+  check('a potassium above the interval is High', flagForValue(renal.get('LAB-CHE-02.p_potassium'), '6.4', 'Normal') === 'High');
+  check('a potassium inside the interval is Normal', flagForValue(renal.get('LAB-CHE-02.p_potassium'), '4.1', 'Normal') === 'Normal');
+  check('a potassium below the interval is Low', flagForValue(renal.get('LAB-CHE-02.p_potassium'), '2.8', 'Normal') === 'Low');
+  check('a haemoglobin of 7.9 is Low, not normal', flag('LAB-HEM-01.p_hb', '7.9') === 'Low');
+  check('a haemoglobin of 14.2 is Normal', flag('LAB-HEM-01.p_hb', '14.2') === 'Normal');
+  check('a platelet count of 42 is Low', flag('LAB-HEM-01.p_plt', '42') === 'Low');
+  check('an MCV of 104 is High (macrocytosis)', flag('LAB-HEM-01.p_mcv', '104') === 'High');
+  check('the boundary itself is inside the interval', flag('LAB-HEM-01.p_hb', '12.0') === 'Normal');
+  check('just outside it is not', flag('LAB-HEM-01.p_hb', '11.9') === 'Low');
+
+  // A one-sided interval only judges its own side: eGFR is "> 90" and a value of
+  // 120 is not a high eGFR.
+  check('a one-sided interval judges only its own side', flagForValue(renal.get('LAB-CHE-02.p_egfr'), '45', 'Normal') === 'Low');
+  check('and a good value on the open side stays Normal', flagForValue(renal.get('LAB-CHE-02.p_egfr'), '120', 'Normal') === 'Normal');
+
+  // Parasite density is "0 - 0": not detected is a number, and any count is high.
+  const malaria = new Map(catalogue.find((i) => i.code === 'MAL_TEST').parameters.map((p) => [p.id, p]));
+  check('a negative parasite density is Normal', flagForValue(malaria.get('LAB-MIC-04.p_mp_density'), '0', 'Normal') === 'Normal');
+  check('any parasites at all is High', flagForValue(malaria.get('LAB-MIC-04.p_mp_density'), '250', 'Normal') === 'High');
+
+  // A value that is not a number cannot be compared to an interval, so the
+  // scientist's own flag stands rather than being overwritten with Normal.
+  check('a non-numeric value leaves the flag alone', flagForValue(byId.get('LAB-HEM-01.p_hb'), 'Trace', 'Abnormal') === 'Abnormal');
+  check('and an emptied field leaves it alone too', flagForValue(byId.get('LAB-HEM-01.p_hb'), '', 'Low') === 'Low');
+
+  // Nothing is flagged Critical automatically. A critical result is a judgement
+  // about the patient, not a comparison with two numbers.
+  const flags = ['-1', '0', '12', '17.5', '200'];
+  check('no value is ever automatically Critical', flags.every((v) => flag('LAB-HEM-01.p_hb', v) !== 'Critical'));
+});
+
+await block('a chosen option decides the flag', () => {
+  const sens = catalogue
+    .find((i) => i.code === 'URC')
+    .parameters.find((p) => p.id.endsWith('p_sens_interp'));
+  check('the first option, the sensitive one, is Normal', flagForValue(sens, 'Sensitive (S)', 'Normal') === 'Normal');
+  check('an intermediate result is Abnormal', flagForValue(sens, 'Intermediate (I)', 'Normal') === 'Abnormal');
+  check('resistance is Abnormal', flagForValue(sens, 'Resistant (R)', 'Normal') === 'Abnormal');
+
+  const fob = catalogue
+    .find((i) => i.code === 'STOOL_TEST')
+    .parameters.find((p) => p.id.endsWith('p_fob'));
+  check('a negative occult blood is Normal', flagForValue(fob, 'Negative', 'Normal') === 'Normal');
+  check('a positive occult blood is Abnormal', flagForValue(fob, 'Positive', 'Normal') === 'Abnormal');
+});
+
+await block('only the analytes that were filled in are saved', () => {
+  const fbc = catalogue.find((i) => i.code === 'FBC');
+  const rows = buildRows(panelFor({ ...fbc }), []);
+  check('the panel is offered in panel order, not database order', rows.map((r) => r.parameterId).join() ===
+    fbc.parameters.map((p) => p.id).join());
+  check('an untouched analyte has no value', rows.every((r) => r.value === ''));
+  check('and the count of recorded analytes starts at zero', enteredCount(rows) === 0);
+
+  const typed = rows.map((r, i) => (i < 4 ? { ...r, value: i === 0 ? ' 7.9 ' : '13.1', flag: flagForValue(panelFor({ ...fbc })[i], i === 0 ? '7.9' : '13.1', 'Normal') } : r));
+  const saved = enteredRows(typed);
+  check('the four that were filled in are saved', saved.length === 4, `saved ${saved.length}`);
+  check('and the value is trimmed', saved[0].value === '7.9', saved[0].value);
+  check('with the flag the interval gave it', saved[0].flag === 'Low', saved[0].flag);
+  check('nothing is released from an empty panel', canRelease(rows) === false);
+  check('but a partial panel is', canRelease(typed) === true);
+  check('critical analytes are found by flag, not by value', criticalRows(typed).length === 0);
+
+  const critical = typed.map((r, i) => (i === 0 ? { ...r, flag: 'Critical' } : r));
+  check('and a critical one is', criticalRows(critical).length === 1);
+  check('an untouched row cannot be critical', criticalRows([{ ...rows[0], flag: 'Critical' }]).length === 0);
+});
+
+await block('a result already recorded keeps its value when the panel is reloaded', () => {
+  const fbc = catalogue.find((i) => i.code === 'FBC');
+  const panel = panelFor({ ...fbc });
+  const saved = [
+    { parameterId: 'LAB-HEM-01.p_hb', parameterName: 'Haemoglobin (Hb)', value: '9.4', unit: 'g/dL', referenceRange: '12.0 - 17.5', flag: 'Low' },
+    // A result whose parameter has since been removed from the panel. Dropping it
+    // would hide a finding that was actually observed.
+    { parameterId: 'LAB-HEM-01.p_retired', parameterName: 'Formerly reported analyte', value: 'seen', unit: '', referenceRange: '', flag: 'Abnormal' },
+  ];
+  const rows = buildRows(panel, saved);
+  const hb = rows.find((r) => r.parameterId === 'LAB-HEM-01.p_hb');
+  check('the recorded value comes back', hb.value === '9.4');
+  check('with the flag it was given', hb.flag === 'Low');
+  check('and the panel is the authority on the unit and the range', hb.unit === 'g/dL' && hb.referenceRange === '12.0 - 17.5');
+  check('every analyte is still offered for entry', rows.length === panel.length + 1, `${rows.length} rows for ${panel.length} analytes`);
+  check('and the retired result is still on the report', rows.some((r) => r.parameterId === 'LAB-HEM-01.p_retired'));
+});
+
+await block('a workflow change records who did it, and when the blood was drawn', () => {
+  // "Collect sample", the critical-result tick and "release" were the three
+  // workflow changes reported as not sticking. They did not fail loudly: the
+  // status advanced in the browser and the derived columns were never written at
+  // all, so nothing looked wrong until a report came back with no draw time on it.
+  const scientist = { id: 'USR-SCIENTIST', name: 'Amaka Obi' };
+  const requested = {
+    id: 'LTO-TEST',
+    testName: 'Full Blood Count',
+    status: 'Requested',
+    results: [],
+  };
+  const drawn = { ...requested, status: 'Requested' };
+
+  // 1. The draw time. `lab_test_orders.collected_at` has been in the schema since
+  //    the beginning and, before this, no code path anywhere wrote it.
+  const collected = applyStatusChange(requested, 'Sample Collected', { user: scientist, now: '2026-09-30T08:15:00.000Z' });
+  check('collecting the specimen records when it was drawn', collected.collectedAt === '2026-09-30T08:15:00.000Z', String(collected.collectedAt));
+  check('and records who took it', collected.scientistName === 'Amaka Obi' && collected.scientistId === 'USR-SCIENTIST');
+
+  // Not overwritten: a test that is sent back to processing must still show the
+  // moment the blood was drawn, not the moment somebody reopened the record.
+  const reopened = applyStatusChange(collected, 'Processing', { user: scientist, now: '2026-09-30T11:40:00.000Z' });
+  check('reopening the record does not move the draw time', reopened.collectedAt === '2026-09-30T08:15:00.000Z', String(reopened.collectedAt));
+  check('but processing is still stamped as reached', reopened.status === 'Processing');
+  check('and the second person is the one on the record now', reopened.scientistName === 'Amaka Obi');
+
+  // A second collector is a different person and must say so.
+  const second = applyStatusChange(requested, 'Sample Collected', { user: { id: 'USR-NURSE', name: 'Bola Ade' }, now: '2026-09-30T08:20:00.000Z' });
+  check('a specimen collected by anyone is attributed to them', second.scientistId === 'USR-NURSE' && second.scientistName === 'Bola Ade');
+
+  // A transition that is not about the specimen must not invent a draw time.
+  check('nothing else stamps a draw time', applyStatusChange(requested, 'Paid', { user: scientist }).collectedAt === undefined);
+  check('and a release of an uncollected test is not stamped either', applyStatusChange(requested, 'Released', { user: scientist }).collectedAt === undefined);
+
+  // 2. The critical alert. This was a checkbox that set a state and dropped it.
+  const renal = catalogue.find((i) => i.code === 'UE_CREAT');
+  const k = renal.parameters.find((p) => p.id.endsWith('p_potassium'));
+  const criticalValue = { parameterId: k.id, parameterName: k.name, value: '6.4', unit: k.unit, referenceRange: k.referenceRange, flag: 'Critical' };
+  const alerted = applyStatusChange(reopened, 'Result Entered', { user: scientist, results: [criticalValue], criticalAlert: true, now: '2026-09-30T11:55:00.000Z' });
+  check('a critical result is saved with the alert raised', alerted.criticalAlert === true);
+  check('and the result itself is stored', alerted.results.length === 1 && alerted.results[0].value === '6.4');
+
+  // The alert is a parameter, not a derivation, so a normal panel leaves it as it
+  // was rather than quietly clearing a flag somebody set earlier in the session.
+  const routine = applyStatusChange(reopened, 'Result Entered', { user: scientist, results: [criticalValue], now: '2026-09-30T11:55:00.000Z' });
+  check('an unraised alert is not cleared on the way through', routine.criticalAlert === undefined);
+
+  // 3. The release. `released_at` and `verified_by` are what tell a physician that
+  //    somebody signed this off, and by whom.
+  const released = applyStatusChange(alerted, 'Released', { user: scientist, now: '2026-09-30T12:30:00.000Z' });
+  check('release stamps the release time', released.releasedAt === '2026-09-30T12:30:00.000Z', String(released.releasedAt));
+  check('and names who released it', released.verifiedBy === 'Amaka Obi');
+  check('the critical alert survives the release', released.criticalAlert === true);
+  check('and the release does not move the draw time', released.collectedAt === '2026-09-30T08:15:00.000Z');
+
+  // 4. Omitted means "leave it alone", not "clear it". A modal that saves the
+  //    status without sending the results would otherwise blank a recorded panel.
+  const kept = applyStatusChange(released, 'Verified', { user: scientist });
+  check('omitting results leaves the recorded ones alone', kept.results.length === 1 && kept.results[0].value === '6.4');
+  check('omitting the alert leaves it alone', kept.criticalAlert === true);
+  check('omitting comments leaves them alone', kept.comments === released.comments);
+  check('and a test that is only verified does not get a release time again', kept.releasedAt === released.releasedAt);
+  check('but verifying does not claim to be a release', kept.verifiedBy === 'Amaka Obi');
+
+  // 5. The audit sentence has to be checkable against the report it describes.
+  const detail = statusAuditDetail(
+    { ...released, testName: 'Urea, Electrolytes & Serum Creatinine' },
+    'Released',
+  );
+  check('the audit names the investigation', detail.startsWith('Investigation Urea, Electrolytes & Serum Creatinine'), detail);
+  check('says how many analytes were released', detail.includes('1 analyte recorded'), detail);
+  check('names the flagged one with its flag', detail.includes(`${k.name} Critical`), detail);
+  check('and states the alert was raised', detail.includes('Critical result alert raised'), detail);
+  check('a normal release names no flags', statusAuditDetail({ testName: 'Full Blood Count', results: [{ ...criticalValue, flag: 'Normal' }] }, 'Released').includes('Flagged') === false);
+  check('an unentered panel releases nothing to describe', statusAuditDetail({ testName: 'Full Blood Count', results: [] }, 'Released').includes('analyte') === false);
+});
+
+await block('a panel is read from the database and never written back to it', async () => {
+  // The whole failure this file's section 18 is about, replayed as a write.
+  //
+  // A device holds the catalogue as it was at sign-in. Later that day the panel
+  // changes in the database - a migration adds the red-cell indices to a blood
+  // count. In the evening the same administrator corrects a price from their
+  // browser, which is a legitimate action, and the diff for that one investigation
+  // carries the nested array along with it. If panels were writable, the stale
+  // copy would delete the four analytes the server had gained and re-insert the
+  // six it had before, and every screen would say the price was saved.
+  const map = TABLE_BY_KEY.get('fatclinic_lab_defs');
+  const server = fakeServer();
+
+  const seeded = map.rowToModel({ ...rowWithoutForeignKeys('lab_investigations'), id: 'LAB-HEM-01' });
+  seeded.price = 5000;
+  // The server is ahead: sixteen analytes, with the indices this device has
+  // never heard of.
+  const serverPanel = catalogue
+    .find((i) => i.id === 'LAB-HEM-01')
+    .parameters.map((p) => map.children[0].rowToModel({
+      id: p.id,
+      investigation_id: 'LAB-HEM-01',
+      name: p.name,
+      unit: p.unit,
+      reference_range: p.referenceRange,
+      ref_low: p.refLow,
+      ref_high: p.refHigh,
+      sort_order: p.sortOrder,
+      result_type: p.resultType,
+      options: p.options,
+    }));
+  await server.client.from('lab_investigations').upsert([map.modelToRow({ ...seeded, parameters: serverPanel })], { onConflict: 'id' });
+  for (const p of serverPanel) {
+    await server.client.from('lab_parameters').upsert([map.children[0].modelToRow(p, 'LAB-HEM-01')], { onConflict: 'id' });
+  }
+  const before = server.count('lab_parameters');
+  check('the server holds the full panel', before === 16, `${before} analytes`);
+
+  // What this device still believes: the six-analyte panel from before, and a
+  // price it is correcting now.
+  const stalePanel = [
+    { id: 'LAB-HEM-01.p_hb', name: 'Hemoglobin (Hb)', unit: 'g/dL', referenceRange: '12.0 - 17.5', refLow: 12, refHigh: 17.5, sortOrder: 10, resultType: 'numeric', options: [] },
+    { id: 'LAB-HEM-01.p_pcv', name: 'Packed Cell Volume (PCV)', unit: '%', referenceRange: '36.0 - 52.0', refLow: 36, refHigh: 52, sortOrder: 20, resultType: 'numeric', options: [] },
+    { id: 'LAB-HEM-01.p_wbc', name: 'Total White Blood Cell Count (WBC)', unit: 'x10^9/L', referenceRange: '4.0 - 11.0', refLow: 4, refHigh: 11, sortOrder: 30, resultType: 'numeric', options: [] },
+    { id: 'LAB-HEM-01.p_neut', name: 'Neutrophils (Neutrophil %)', unit: '%', referenceRange: '40 - 75', refLow: 40, refHigh: 75, sortOrder: 40, resultType: 'numeric', options: [] },
+    { id: 'LAB-HEM-01.p_lymph', name: 'Lymphocytes (Lymphocyte %)', unit: '%', referenceRange: '20 - 45', refLow: 20, refHigh: 45, sortOrder: 50, resultType: 'numeric', options: [] },
+    { id: 'LAB-HEM-01.p_plt', name: 'Platelet Count', unit: 'x10^9/L', referenceRange: '150 - 450', refLow: 150, refHigh: 450, sortOrder: 60, resultType: 'numeric', options: [] },
+  ];
+  const after = [{ ...seeded, price: 7500, parameters: stalePanel }];
+
+  let threw = null;
+  try {
+    await pushDiff(map, [{ ...seeded, price: 5000, parameters: stalePanel }], after, server.client);
+  } catch (err) {
+    threw = err.message;
+  }
+  check('the price correction is not refused', !threw, threw);
+  check('and the price really is saved', server.find('lab_investigations', 'LAB-HEM-01')?.price === 7500, String(server.find('lab_investigations', 'LAB-HEM-01')?.price));
+  check('not one analyte was deleted', server.count('lab_parameters') === before, `${server.count('lab_parameters')} of ${before}`);
+  check('and none was rewritten by the stale copy', server.find('lab_parameters', 'LAB-HEM-01.p_mcv')?.name === 'Mean Corpuscular Volume (MCV)');
 });
 
 // ---------------------------------------------------------------------------
