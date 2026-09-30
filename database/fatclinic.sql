@@ -166,6 +166,13 @@ CREATE TABLE IF NOT EXISTS role_permissions (
 --                        to an active profile with this set AND a linked
 --                        account; the column is the grant, not the enforcement.
 --
+--                        Set by an administrator in the edit-staff modal and
+--                        written by the ordinary users_update policy, which
+--                        requires app_is_admin(). A clinician cannot grant it to
+--                        themselves: it is not among the columns
+--                        app_update_own_profile will write, so the one account
+--                        they are locked out of cannot be the one they open up.
+--
 -- There is intentionally no password column: passwords belong to Supabase Auth.
 -- See section 12 for how the two are linked.
 -- ----------------------------------------------------------------------------
@@ -1247,6 +1254,12 @@ BEGIN
   -- person edit it would lock them out of the account they just edited. role,
   -- active, auth_user_id and must_change_password are absent too.
   --
+  -- allow_password_reset_email is absent as well, and for the same reason as
+  -- role: it is a permission, granted by an administrator. A clinician cannot
+  -- widen their own access to the account they are locked out of, and
+  -- users_update (the policy covering the whole table) requires app_is_admin(),
+  -- so the only way to set it is an administrator's ordinary staff save.
+  --
   -- A NULL argument leaves that column alone. An empty name or a PIN that is
   -- not exactly four digits is refused. Returns TRUE when a row was updated,
   -- so a caller can tell a saved change from a refused one.
@@ -1280,7 +1293,7 @@ BEGIN
   $fn$;
 
   COMMENT ON FUNCTION public.app_update_own_profile(TEXT, TEXT, TEXT, TEXT) IS
-    'Updates a clinician''s own name, department, avatar and device PIN. No id is accepted - the row is the caller''s profile resolved from the JWT, so it cannot reach another person. role, active, email and auth_user_id are not settable through it. NULL leaves a column unchanged; an empty name or malformed PIN is refused. Returns TRUE when a row was updated.';
+    'Updates a clinician''s own name, department, avatar and device PIN. No id is accepted - the row is the caller''s profile resolved from the JWT, so it cannot reach another person. role, active, email, auth_user_id and allow_password_reset_email are not settable through it. NULL leaves a column unchanged; an empty name or malformed PIN is refused. Returns TRUE when a row was updated.';
 
   -- Public self-booking: a visitor's appointment request, submitted with no
   -- session and no sign-in.
