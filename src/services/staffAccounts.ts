@@ -61,9 +61,11 @@ const GENERIC =
 /**
  * Translate whatever came back into a reason and a sentence for a clinician.
  *
- * A missing deployment gets its own message on purpose. It is the single most
- * likely failure in a fresh install, and "Relay Error invoking the Edge
- * Function" is not something an administrator can act on.
+ * A genuinely missing deployment - the gateway answering 404 for the
+ * function's own name - gets its own message on purpose: "Relay Error
+ * invoking the Edge Function" is not something an administrator can act on.
+ * Reachability problems are diagnosed in `invokeOnce` instead, so this only
+ * sees a 404 when the function is really absent.
  */
 function classify(status: number | undefined, code: string | undefined, fallback: string): StaffAccountResult {
   const message = (fallback || '').trim() || GENERIC;
@@ -114,6 +116,101 @@ function classify(status: number | undefined, code: string | undefined, fallback
 /** The function's own JSON shape, from handler.ts. */
 type FunctionReply = { ok: boolean; code?: string; message?: string };
 
+/**
+ * How many times the function is asked before a transient failure is reported.
+ *
+ * Free-tier projects put their Edge Function buckets to sleep; the first call
+ * after idle can 503 or stall while the bucket wakes up. One retry after a
+ * short pause usually succeeds, and beats making an administrator diagnose a
+ * cold start.
+ */
+const MAX_ATTEMPTS = 2;
+const RETRY_AFTER_MS = 900;
+
+/**
+ * One attempt at invoking the function.
+ *
+ * Returns the result to show, plus whether the failure was *temporary* (a
+ * network problem or a 5xx cold-start wake-up) and worth retrying. Handler
+ * refusals come back signed with a `code` and are never retried - they will
+ * not change on a second attempt.
+ */
+async function invokeOnce(
+  client: NonNullable<ReturnType<typeof getSupabase>>,
+  body: { action: 'create' | 'reset'; email: string; password: string },
+): Promise<{ result: StaffAccountResult; transient: boolean }> {
+  let payload: FunctionReply | null = null;
+  let response: Response | null = null;
+
+  try {
+    // The signed-in clinician's JWT is attached automatically by supabase-js,
+    // so the function learns who is calling from the token and not the body.
+    const { data, error } = await client.functions.invoke('staff-accounts', { body });
+
+    if (!error) {
+      payload = (data ?? null) as FunctionReply | null;
+      if (payload?.ok) return { result: { ok: true, message: payload.message ?? 'Done.' }, transient: false };
+      return { result: classify(500, payload?.code, payload?.message ?? ''), transient: false };
+    }
+
+    // A non-2xx still carries the function's own explanation, and it is far
+    // more useful than the SDK's generic text, so the body is read back out.
+    const context = (error as { context?: unknown }).context;
+    response = context instanceof Response ? context : null;
+    if (response) {
+      try {
+        payload = (await response.clone().json()) as FunctionReply;
+      } catch {
+        payload = null;
+      }
+    }
+
+    // Every handler refusal is signed with a `code`; interpret it directly.
+    if (payload?.code) {
+      return { result: classify(response?.status, payload.code, payload.message ?? ''), transient: false };
+    }
+
+    // Only a genuine gateway 404 for the function's own name means "not
+    // deployed" - and that is a real finding, worth its own fixable message.
+    // Everything else without a handler reply (network failure, DNS, timeout,
+    // a 5xx from a bucket that is still waking up) is a reachability problem,
+    // not a missing deployment, and is retried once before being reported.
+    const status = response?.status;
+    if (status === 404) {
+      return { result: classify(404, undefined, ''), transient: false };
+    }
+
+    const temporary =
+      error.name === 'FunctionsFetchError' || (status !== undefined && status >= 500);
+    if (temporary) {
+      return {
+        result: {
+          ok: false,
+          reason: 'unreachable',
+          message:
+            'The sign-in service did not answer. It may be waking up, or your connection to it is ' +
+            'down - check your connection and try again.',
+        },
+        transient: true,
+      };
+    }
+
+    return { result: { ok: false, reason: 'unreachable', message: GENERIC }, transient: false };
+  } catch (err) {
+    // A thrown error here is a network or DNS failure, not a refusal - the
+    // same family as FunctionsFetchError, and worth the same single retry.
+    console.error('[staff-accounts] invocation threw:', err);
+    return {
+      result: {
+        ok: false,
+        reason: 'unreachable',
+        message: 'The sign-in service did not answer. Check your connection and try again.',
+      },
+      transient: true,
+    };
+  }
+}
+
 async function call(body: { action: 'create' | 'reset'; email: string; password: string }): Promise<StaffAccountResult> {
   const client = getSupabase();
   if (!client) {
@@ -124,44 +221,13 @@ async function call(body: { action: 'create' | 'reset'; email: string; password:
     };
   }
 
-  let payload: FunctionReply | null = null;
-
-  try {
-    // The signed-in clinician's JWT is attached automatically by supabase-js, so
-    // the function learns who is calling from the token and not from the body.
-    const { data, error } = await client.functions.invoke('staff-accounts', { body });
-
-    if (error) {
-      // A non-2xx still carries the function's own explanation, and it is far
-      // more useful than the SDK's generic text, so the body is read back out.
-      const context = (error as { context?: unknown }).context;
-      if (context instanceof Response) {
-        try {
-          payload = (await context.clone().json()) as FunctionReply;
-        } catch {
-          payload = null;
-        }
-      }
-      if (payload) {
-        return classify(context instanceof Response ? context.status : undefined, payload.code, payload.message ?? '');
-      }
-      // No body at all. A relay or fetch error is overwhelmingly the function
-      // not being deployed, and saying so is the difference between a fixable
-      // message and a dead end.
-      if (error.name === 'FunctionsRelayError' || error.name === 'FunctionsFetchError') {
-        return classify(404, undefined, '');
-      }
-      return { ok: false, reason: 'unreachable', message: GENERIC };
-    }
-
-    payload = (data ?? null) as FunctionReply | null;
-    if (payload?.ok) return { ok: true, message: payload.message ?? 'Done.' };
-    return classify(500, payload?.code, payload?.message ?? '');
-  } catch (err) {
-    // A thrown error here is a network or DNS failure, not a refusal.
-    console.error('[staff-accounts] invocation threw:', err);
-    return { ok: false, reason: 'unreachable', message: GENERIC };
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    const { result, transient } = await invokeOnce(client, body);
+    if (!transient || attempt === MAX_ATTEMPTS) return result;
+    await new Promise((resolve) => setTimeout(resolve, RETRY_AFTER_MS));
   }
+
+  return { ok: false, reason: 'unreachable', message: GENERIC };
 }
 
 /**
