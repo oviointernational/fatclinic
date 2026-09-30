@@ -715,6 +715,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
                       {user.mustChangePassword && (
                         <span className="text-[10px] font-bold text-amber-600">Must change password on next sign-in</span>
                       )}
+                      {/* Read-only on purpose. The grant is a column in the
+                          staff register, set from the database, so the app
+                          reports what it is and cannot be the thing that changes
+                          it. `npm run staff:self-reset` writes it. */}
+                      {user.allowPasswordResetEmail && (
+                        <span className="text-[10px] font-bold text-emerald-600 dark:text-emerald-400">
+                          Can request their own reset link
+                        </span>
+                      )}
                     </div>
 
                     <div className="flex items-center space-x-1">
@@ -1821,32 +1830,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
                 </div>
               </div>
 
-              {/*
-                Self-service password reset.
-
-                The grant lives on the profile because the decision belongs to an
-                administrator and the person it is about cannot be signed in to
-                make it. It is written through the ordinary RLS-protected save
-                below like any other field; the staff-accounts function is what
-                actually enforces it, so a stale copy of this screen cannot grant
-                anything the server disagrees with.
-              */}
-              <div>
-                <label className="block font-bold mb-1">Forgotten Password — Send Them the Link:</label>
-                <select
-                  value={editingUser.allowPasswordResetEmail ? 'allow' : 'ask'}
-                  onChange={e => setEditingUser({ ...editingUser, allowPasswordResetEmail: e.target.value === 'allow' })}
-                  className="w-full px-3 py-2 rounded-xl border bg-slate-50 dark:bg-dark-surface font-bold"
-                >
-                  <option value="ask">No — Ask Me to Reset It</option>
-                  <option value="allow">Yes — They Can Reset It Themselves</option>
-                </select>
-                <p className="mt-1.5 text-[11px] font-semibold text-slate-500 dark:text-slate-400 leading-relaxed">
-                  {editingUser.allowPasswordResetEmail
-                    ? 'Typing this address on the "Forgot your password?" screen emails them a reset link. Only takes effect for an account that exists and is active.'
-                    : 'They are told to contact you, and no link is emailed. Administrators can always reset themselves this way regardless of this setting.'}
-                </p>
-              </div>
             </div>
 
             {accountError && (

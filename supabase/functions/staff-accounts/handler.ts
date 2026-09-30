@@ -529,6 +529,28 @@ const CHECK_THE_INBOX =
  * accompanying form carries no notice about who this route is for; the outcome
  * is the first and only place the rule is stated.
  */
+/**
+ * Is this profile allowed to be sent a reset link at all?
+ *
+ * Two ways to qualify, and both require an active profile:
+ *
+ *   - an administrator. They are the clinic's own escalation path and there is
+ *     nobody above them to ask, so asking them to phone an administrator is a
+ *     dead end.
+ *   - anyone else carrying `allow_password_reset_email`, which the database sets
+ *     through `npm run staff:self-reset`. Never without an account behind it: a
+ *     link to an account that does not exist is a mail that cannot be written,
+ *     and GoTrue would report it as sent.
+ *
+ * Split out as a named predicate with a non-null parameter rather than inlined as
+ * two `profile?.` booleans, because that is what lets the caller below narrow.
+ */
+function mayReceiveResetLink(profile: StaffProfile): boolean {
+  if (!profile.active) return false;
+  if (profile.role === 'ADMINISTRATOR') return true;
+  return Boolean(profile.allow_password_reset_email && profile.auth_user_id);
+}
+
 async function opForgot(env: HandlerEnv, body: ForgotBody) {
   const email = normaliseEmail(body.email);
   if (!email) {
@@ -537,17 +559,14 @@ async function opForgot(env: HandlerEnv, body: ForgotBody) {
 
   const profile = await findProfile(env, email);
 
-  // An active administrator is always eligible: they are the clinic's own
-  // escalation path and there is nobody above them to ask. Anyone else is
-  // eligible only where an administrator has granted self-service on their
-  // profile - and never without an account behind it, because a link to an
-  // account that does not exist is a mail that cannot be written.
-  const isAdministrator = Boolean(profile?.active) && profile?.role === 'ADMINISTRATOR';
-  const selfService = Boolean(
-    profile?.active && profile?.allow_password_reset_email && profile?.auth_user_id,
-  );
-
-  if (!isAdministrator && !selfService) {
+  // The `!profile ||` is written first and on its own purpose: it is the neutral
+  // stranger case, and it is also what narrows `profile` for the rest of this
+  // function. Folding the null into the eligibility test instead (which is the
+  // tidier-looking `!isAdministrator && !selfService`, with both derived from
+  // `profile?.`) reads well but leaves the compiler unable to tell that the two
+  // lines after the gate are only reached with a profile in hand - so every
+  // later use of `profile` needs an optional chain that cannot be satisfied.
+  if (!profile || !mayReceiveResetLink(profile)) {
     await audit(env, null, {
       action: 'SEND_PASSWORD_RESET_EMAIL',
       targetEmail: email,

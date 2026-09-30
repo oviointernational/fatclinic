@@ -36,6 +36,10 @@
  *   # Disable an account. Leaves the profile (and its audit history) intact.
  *   npm run staff:add -- --disable USR-003
  *
+ *   # Let a clinician recover their own password by email. A permission, so it
+ *   # is granted from the database and not from a screen - see --self-reset below.
+ *   npm run staff:self-reset -- --grant USR-003
+ *
  * FLAGS
  * -----
  *   --name        Full name and title. Required unless --link is given.
@@ -48,6 +52,15 @@
  *   --disable     Mark the profile inactive and revoke its auth account.
  *   --list        Show every profile and whether it can sign in.
  *   --dry-run     Report what would change. Touches nothing.
+ *
+ *   --self-reset  Read or change the self-service password-reset grant. Use this
+ *                 INSTEAD of any of the above: it stands alone, touches only
+ *                 `allow_password_reset_email`, and needs no password.
+ *                   npm run staff:self-reset                      show every profile
+ *                   npm run staff:self-reset -- --grant USR-003   let them reset it
+ *                   npm run staff:self-reset -- --revoke USR-003  take it back
+ *   --grant / --revoke  Take a public.users id, the way --link and --disable do.
+ *   --why         Explain the rule, including what the grant cannot do.
  */
 import { createClient } from '@supabase/supabase-js';
 import { randomBytes } from 'node:crypto';
@@ -96,7 +109,10 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) { out._.push(a); continue; }
     const key = a.slice(2);
-    if (key === 'list' || key === 'dry-run' || key === 'help') { out[key] = true; continue; }
+    if (key === 'list' || key === 'dry-run' || key === 'help' || key === 'why') {
+    out[key] = true;
+    continue;
+  }
     const next = argv[i + 1];
     if (next === undefined || next.startsWith('--')) die(`--${key} needs a value`);
     out[key] = next;
@@ -116,6 +132,35 @@ const usage = () =>
     .replace(/^\/\*\*?\n?/, '')
     .replace(/^ \* ?/gm, '')
     .trimEnd();
+
+if (args.why) {
+  say('');
+  say(`${C.bold}Why this is a command and not a screen${C.reset}`);
+  say('');
+  say('The grant is a permission, and it is a permission about an account the person');
+  say('it is about cannot currently reach. If it were set in the app, the person who');
+  say('benefits from it would be one screen away from granting it - either by being');
+  say('signed in on another device, or by having somebody else click it for them.');
+  say('');
+  say('So the column is omitted from every write the browser makes. A stale local copy');
+  say('of a staff profile cannot grant it, revoke it, or preserve it by accident; the');
+  say('only writer is this command, which needs the service_role key held by whoever');
+  say('administers the machine. The app still READS the column and shows who has it.');
+  say('');
+  say('What the grant does, and does not, permit:');
+  say('');
+  say('  - it lets that one person email themselves a reset link. Nothing else.');
+  say('  - it needs a sign-in account to exist and the profile to be active. This');
+  say('    command refuses to grant it where it could not be honoured.');
+  say('  - it does not bypass the sign-in screen, does not change a role, and does');
+  say('    not survive being disabled - a disabled profile is refused the link.');
+  say('  - an administrator can always email themselves a link, granted or not.');
+  say('');
+  say('Also, delivery is Supabase''s, not the clinic''s. Until SMTP is configured on');
+  say('the project the link is generated correctly and then goes nowhere.');
+  say('');
+  return;
+}
 
 if (args.help || (!args.link && !args.email && !args.list && !args.disable)) {
   say(usage());
@@ -166,6 +211,115 @@ const nextStaffId = async () => {
 };
 
 const isDryRun = Boolean(args['dry-run']);
+
+// --- self-service password reset ---------------------------------------------
+//
+// Placed after the environment checks and before anything else, because it stands
+// alone: it touches one column, needs no password, and must never fall through
+// into the create-or-link path below. `npm run staff:add -- --self-reset` would
+// otherwise read as "create an account called self-reset".
+if (args.selfReset) {
+  const grant = args.grant ? String(args.grant) : null;
+  const revoke = args.revoke ? String(args.revoke) : null;
+  if (grant && revoke) die('pass --grant or --revoke, not both.');
+
+  const { data: rows, error: readErr } = await db
+    .from('users')
+    .select('id,name,email,role,active,auth_user_id,allow_password_reset_email')
+    .order('id');
+  if (readErr) die(`could not read the staff register: ${readErr.message}`);
+  const staff = rows ?? [];
+
+  if (!grant && !revoke) {
+    say('');
+    say(`${C.bold}ID       NAME                     SELF-RESET LINK${C.reset}`);
+    for (const u of staff) {
+      // The whole rule rather than a bare yes/no, because "yes" on its own does
+      // not mean the person can reset their password: an active administrator can
+      // always, and a grant on a profile with no account or a disabled profile
+      // cannot be honoured at all.
+      let state;
+      if (u.role === 'ADMINISTRATOR' && u.active) {
+        state = `${C.cyan}yes (as an administrator)${C.reset}`;
+      } else if (u.allow_password_reset_email && u.active && u.auth_user_id) {
+        state = `${C.green}yes (granted)${C.reset}`;
+      } else if (u.allow_password_reset_email && !u.active) {
+        state = `${C.yellow}granted, but the profile is disabled${C.reset}`;
+      } else if (u.allow_password_reset_email && !u.auth_user_id) {
+        state = `${C.yellow}granted, but there is no sign-in account${C.reset}`;
+      } else {
+        state = `${C.dim}no - they are told to contact an administrator${C.reset}`;
+      }
+      say(`${u.id.padEnd(8)} ${String(u.name).slice(0, 24).padEnd(24)} ${state}`);
+    }
+    say('');
+    say('Grant it:  npm run staff:self-reset -- --grant USR-003');
+    say('Revoke it: npm run staff:self-reset -- --revoke USR-003');
+    say('Why it is not a screen: npm run staff:self-reset -- --why');
+    say('');
+    return;
+  }
+
+  const target = staff.find((u) => u.id === grant || u.id === revoke);
+  if (!target) {
+    die(`no staff profile with id ${grant || revoke}. Run without --grant to see the list.`);
+  }
+  const next = Boolean(grant);
+
+  // Refused where the grant could not be honoured, because the honest outcome is
+  // "still no" and a success message would leave the register claiming otherwise.
+  if (next && !target.active) {
+    die(`${target.name} is disabled, so a self-service link could not be sent. Enable the profile first.`);
+  }
+  if (next && !target.auth_user_id) {
+    die(
+      `${target.name} has no sign-in account, so there is nothing to reset.\n` +
+      `  Create one first:  npm run staff:add -- --link ${target.id} --password '...'`,
+    );
+  }
+  if (Boolean(target.allow_password_reset_email) === next) {
+    say(`\n${target.name} already has that. Nothing changed.\n`);
+    return;
+  }
+
+  if (isDryRun) {
+    say(`\n${C.bold}DRY RUN${C.reset} would set allow_password_reset_email = ${next} for ${target.name} (${target.id}).\n`);
+    return;
+  }
+
+  const { error: updErr } = await db
+    .from('users')
+    .update({ allow_password_reset_email: next })
+    .eq('id', target.id);
+  if (updErr) die(`could not change the grant for ${target.id}: ${updErr.message}`);
+
+  // Read back rather than trusting the update. This is a permission, and the
+  // whole point of the column being server-set is that what it says is what is
+  // true - a write that silently matched no row would leave an administrator
+  // believing a clinician can reset their password when they still cannot.
+  const { data: verified, error: verifyErr } = await db
+    .from('users')
+    .select('allow_password_reset_email')
+    .eq('id', target.id)
+    .maybeSingle();
+  if (verifyErr || !verified || Boolean(verified.allow_password_reset_email) !== next) {
+    die(`the grant did not take for ${target.id}. Nothing else was changed; re-run or check the column directly.`);
+  }
+
+  if (next) {
+    ok(`${target.name} can now request their own reset link from the sign-in screen.`);
+    say(`  They type ${target.email} on "Forgot your password?" and Supabase mails a link.`);
+    if (target.role === 'ADMINISTRATOR') {
+      say('  Note: an active administrator can already do this, so the grant changes nothing for them.');
+    }
+    warn('This only works if Supabase SMTP is configured. Without it the link is');
+    warn('generated but never arrives - dashboard -> Authentication -> SMTP.');
+  } else {
+    ok(`${target.name} can no longer request a reset link. They are told to contact an administrator.`);
+  }
+  say('');
+  return;
+}
 
 // --- list --------------------------------------------------------------------
 
