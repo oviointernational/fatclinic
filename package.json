@@ -37,7 +37,7 @@
     "db:check-api": "node scripts/check-api.mjs",
     "db:check-public-booking": "node scripts/check-public-booking.mjs",
     "db:purge-test-audit": "node scripts/purge-test-audit-rows.mjs",
-    "db:verify": "npm run db:lint && npm run db:sync:test && npm run db:check-rls && npm run db:check-orphan && npm run db:check-api && npm run db:check-public-booking && npm run db:crud && npm run db:crud-lab && npm run db:check-lab-catalogue && npm run db:probe-auth-admin && npm run db:check-forgot-password && npm run db:check-forced-password-change",
+    "db:verify": "npm run db:lint && npm run db:sync:test && npm run db:check-rls && npm run db:check-orphan && npm run db:check-api && npm run db:check-public-booking && npm run db:crud && npm run db:crud-lab && npm run db:check-lab-cleanup && npm run db:check-lab-catalogue && npm run db:probe-auth-admin && npm run db:check-forgot-password && npm run db:check-forced-password-change",
     "db:find-region": "node scripts/find-region.mjs",
     "db:fix-connection": "node scripts/find-region.mjs --write",
     "staff:list": "node scripts/provision-staff.mjs --list",
@@ -49,6 +49,7 @@
     "db:consultation:defects": "node scripts/consultation-defects.mjs",
     "db:crud": "node scripts/check-clinical-crud.mjs",
     "db:crud-lab": "node scripts/check-lab-workflow.mjs",
+  "db:check-lab-cleanup": "node scripts/check-lab-cleanup.mjs",
     "db:check-self-edit": "node scripts/check-self-edit.mjs",
     "db:purge-probe-data": "node scripts/purge-probe-data.mjs"
   },
