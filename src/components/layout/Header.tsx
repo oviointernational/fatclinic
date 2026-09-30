@@ -118,7 +118,7 @@ const ServerStatus: React.FC = () => {
     : state === 'offline'
     ? 'The clinic database is unreachable. Entries are being kept in this browser only and have NOT reached the server.'
     : state === 'local-only'
-    ? 'This build has no database connection configured. Entries are kept in this browser only and are not backed up anywhere.'
+    ? 'Entries are kept in this browser only — no clinic database is connected.'
     : 'Checking the clinic database…';
 
   // Unsaved work outranks connection state: a green light next to a pending
@@ -140,7 +140,7 @@ const ServerStatus: React.FC = () => {
     : tone === 'bad'
     ? 'Not saving'
     : state === 'connected'
-    ? 'Server DB'
+    ? 'Synced'
     : '…';
 
   const tones: Record<string, string> = {
@@ -225,7 +225,7 @@ export const Header: React.FC<HeaderProps> = ({
         <div className="flex flex-col">
           <div className="flex items-center space-x-1.5">
             <span className="text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white font-sans">
-              Fat<span className="text-emerald-500">Clinic</span>
+              Solace Medicare <span className="text-emerald-500">Consult</span>
             </span>
             <span className="px-2 py-0.5 text-[10px] font-bold tracking-widest uppercase rounded-full bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300">
               EHR
