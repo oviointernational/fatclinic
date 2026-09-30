@@ -11,11 +11,14 @@
  * --------------
  *   happy path     admin creates a sign-in account; that password really signs in
  *                  admin resets it; the old password dies, the new one works
+ *   drifted email  a profile address corrected through RLS alone still resolves to
+ *                  its sign-in account on reset, the account is moved onto it, and
+ *                  change_email moves both halves while a session is live
  *   state written  auth_user_id linked and must_change_password set on the profile
  *   audit          every privileged action is recorded
  *   refusals       no token, bad token, non-admin, disabled admin, weak password,
  *                  bad email, unknown action, no profile, account exists,
- *                  no account to reset
+ *                  no account to reset, create for a profile that already has one
  *   protocol       OPTIONS preflight, wrong method, unconfigured function
  *
  * Every account and profile it creates is removed afterwards, and it asserts
@@ -398,20 +401,123 @@ async function liveChecks(adminToken) {
   });
   check('reset succeeds', reset.status === 200 && reset.json?.ok === true,
     `${reset.status} ${reset.json?.message ?? ''}`);
+  check('and reports no address repair, because nothing had drifted',
+    reset.json?.data?.signInAddressRepaired === false,
+    String(reset.json?.data?.signInAddressRepaired));
 
   const withNew = await signIn(clinicianEmail, PW_2);
   check('the new password signs in', withNew.status === 200, `status ${withNew.status}`);
   const withOld = await signIn(clinicianEmail, PW_1);
   check('the old password is refused', withOld.status === 400, `status ${withOld.status}`);
 
+  // --- the bug this reset path exists to survive -----------------------------
+  //
+  // Reproduces the real failure: an administrator corrects a staff address in the
+  // dashboard, which writes `public.users.email` and nothing else, so the profile
+  // and GoTrue's own copy of the address disagree. Resetting used to look the
+  // account up BY ADDRESS and reported, for a person who had signed in for
+  // months, that they had no account at all.
+  console.log('\nAn address corrected on the profile without the sign-in account');
+  const corrected = `${clinicianEmail.replace('@', '.corrected@')}`;
+  const drifted = await api(`/rest/v1/users?id=eq.${encodeURIComponent(clinicianId)}`, {
+    method: 'PATCH',
+    token: adminToken,
+    body: { email: corrected },
+  });
+  check('the profile address can be written through RLS on its own', drifted.status < 300,
+    `status ${drifted.status}`);
+
+  // The state that follows: the account still answers to the OLD address, so
+  // RLS cannot resolve this person's session either.
+  const signInBefore = await signIn(corrected, PW_2);
+  check('before the repair the person cannot sign in with the new address',
+    signInBefore.status !== 200, `status ${signInBefore.status}`);
+
+  const resetAfterDrift = await invoke({
+    token: adminToken,
+    body: { action: 'reset', email: corrected, password: PW_2 },
+  });
+  check('a reset is found by the profile\'s link, not by the address that drifted',
+    resetAfterDrift.status === 200 && resetAfterDrift.json?.ok === true,
+    `${resetAfterDrift.status} ${resetAfterDrift.json?.code ?? ''} ${resetAfterDrift.json?.message ?? ''}`);
+  check('and it says the sign-in address was moved', resetAfterDrift.json?.data?.signInAddressRepaired === true,
+    String(resetAfterDrift.json?.data?.signInAddressRepaired));
+
+  const correctedSignIn = await signIn(corrected, PW_2);
+  check('the person signs in with the corrected address afterwards',
+    correctedSignIn.status === 200, `status ${correctedSignIn.status}`);
+  const oldAddressSignIn = await signIn(clinicianEmail, PW_2);
+  check('and no longer with the old one', oldAddressSignIn.status !== 200,
+    `status ${oldAddressSignIn.status}`);
+
+  // A live session on the OLD address is exactly the stranded person: their JWT
+  // says one address and their profile row says another, so every RLS predicate
+  // in the database misses. Held here to be repaired by the next change_email.
+  const driftedSession = await signIn(corrected, PW_2);
+
+  // `create` must not mint a second credential for this person either. Before
+  // the link was resolved first, the address lookup found nothing, so the button
+  // the UI suggests on a "no account" refusal produced a duplicate sign-in for
+  // one human - and only one of the two would be reachable through RLS.
+  const createOnDrift = await invoke({
+    token: adminToken,
+    body: { action: 'create', email: corrected, password: 'Str0ngPass!9' },
+  });
+  check('create is refused for a profile that already has a live account',
+    createOnDrift.status === 409 && createOnDrift.json?.code === 'account_exists',
+    `${createOnDrift.status} ${createOnDrift.json?.code}`);
+
+  // `change_email` closes the same gap at the front door, and must leave a live
+  // session working: this is the one that moves the address while somebody is
+  // signed in, so the old session is asserted still usable afterwards.
+  console.log('\nMoving a sign-in address through the function');
+  const movedTo = `${corrected.replace('@', '.moved@')}`;
+  const changeRes = await invoke({
+    token: adminToken,
+    body: { action: 'change_email', email: corrected, newEmail: movedTo },
+  });
+  check('change_email succeeds', changeRes.status === 200 && changeRes.json?.ok === true,
+    `${changeRes.status} ${changeRes.json?.code ?? ''} ${changeRes.json?.message ?? ''}`);
+
+  const movedProfile = await api(`/rest/v1/users?id=eq.${encodeURIComponent(clinicianId)}`, {
+    token: adminToken,
+    service: false,
+    extraHeaders: { Accept: 'application/vnd.pgrst.object+json' },
+  });
+  const moved = Array.isArray(movedProfile.json) ? movedProfile.json[0] : movedProfile.json;
+  check('the profile carries the new address', String(moved?.email) === movedTo, String(moved?.email));
+  check('and still points at the same sign-in account', moved?.auth_user_id === authId,
+    `${moved?.auth_user_id} vs ${authId}`);
+
+  const movedAccount = await api(`/auth/v1/admin/users/${authId}`, { service: true });
+  check('so does the sign-in account', String(movedAccount.json?.email) === movedTo,
+    String(movedAccount.json?.email));
+
+  const movedSignIn = await signIn(movedTo, PW_2);
+  check('and the new address signs in', movedSignIn.status === 200, `status ${movedSignIn.status}`);
+
+  // A session issued under the previous address keeps working, because RLS
+  // matches on the address in the token against the profile - so if this
+  // asserted 401, a clinician editing their own details would be signed out by
+  // an administrator's edit.
+  const stillValid = await api('/rest/v1/users?select=id', { token: driftedSession.token });
+  check('a session opened under the previous address still reads the staff register',
+    stillValid.status === 200, `status ${stillValid.status}`);
+
   // --- the audit trail -------------------------------------------------------
   console.log('\nAudit trail');
+  // CHANGE_STAFF_EMAIL is in the list because the drift repair above writes it,
+  // and an address that moved under an administrator's hand is the one change on
+  // this path with no other trace.
   const auditRows = await api(
-    `/rest/v1/audit_logs?action=in.(CREATE_STAFF_ACCOUNT,RESET_STAFF_PASSWORD)&select=id,action,user_id,user_name,details&id=like.SEC-*`,
+    `/rest/v1/audit_logs?action=in.(CREATE_STAFF_ACCOUNT,RESET_STAFF_PASSWORD,CHANGE_STAFF_EMAIL)&select=id,action,user_id,user_name,details&id=like.SEC-*`,
     { service: true },
   );
   const rows = Array.isArray(auditRows.json) ? auditRows.json : [];
-  check('the privileged writes were audited', rows.length >= 2, `${rows.length} row(s)`);
+  check('the privileged writes were audited', rows.length >= 4, `${rows.length} row(s)`);
+  check('the address repairs are recorded as their own action',
+    rows.some((r) => r.action === 'CHANGE_STAFF_EMAIL'),
+    rows.map((r) => r.action).join(', '));
   check('the audit names the acting administrator',
     rows.every((r) => r.user_id && r.user_name), JSON.stringify(rows.map((r) => r.user_name)));
   const containsCredential = rows.some((r) => JSON.stringify(r).includes(PW_1) || JSON.stringify(r).includes(PW_2));

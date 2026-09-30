@@ -157,6 +157,14 @@ CREATE TABLE IF NOT EXISTS role_permissions (
 --                        on a shared ward terminal.
 --   auth_user_id         Supabase Auth user this profile signs in as.
 --   must_change_password Advisory flag for the sign-in UI.
+--   allow_password_reset_email Whether this person may recover their own
+--                        password by email ("Forgot your password?"), without
+--                        phoning an administrator. FALSE for everybody by
+--                        default, including every administrator, so nobody gets
+--                        self-service by accident. Enforced server-side by the
+--                        staff-accounts Edge Function, which sends the link only
+--                        to an active profile with this set AND a linked
+--                        account; the column is the grant, not the enforcement.
 --
 -- There is intentionally no password column: passwords belong to Supabase Auth.
 -- See section 12 for how the two are linked.
@@ -174,6 +182,7 @@ CREATE TABLE IF NOT EXISTS users (
   pin                  TEXT NOT NULL DEFAULT '1234' CHECK (pin ~ '^[0-9]{4}$'),
   custom_role_id       TEXT REFERENCES custom_roles(id) ON DELETE SET NULL,
   must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
+  allow_password_reset_email BOOLEAN NOT NULL DEFAULT FALSE,
   active               BOOLEAN NOT NULL DEFAULT TRUE,
   auth_user_id         UUID,
   created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),

@@ -353,6 +353,10 @@ export const TABLES: TableMap[] = [
       // from one that does not; `omit` below keeps it out of every write, so
       // nothing in the browser can re-point a profile at another account.
       authUserId: optText(r.auth_user_id),
+      // Read as a plain boolean, never as `undefined`, because the server is the
+      // only place this rule is actually enforced and a missing field there must
+      // read as "not granted" rather than as "ask again".
+      allowPasswordResetEmail: Boolean(r.allow_password_reset_email),
       active: Boolean(r.active),
     }),
     modelToRow: (m: User) => ({
@@ -375,6 +379,11 @@ export const TABLES: TableMap[] = [
       pin: m.pin || '1234',
       custom_role_id: orNull(m.customRoleId),
       must_change_password: Boolean(m.mustChangePassword),
+      // Writable, unlike `auth_user_id`: granting self-service password reset is
+      // an ordinary administrative decision about a staff member, made by an
+      // administrator through the RLS-protected write like any other field. The
+      // server still decides what the grant actually permits.
+      allow_password_reset_email: Boolean(m.allowPasswordResetEmail),
       active: m.active !== false,
     }),
   },

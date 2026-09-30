@@ -49,6 +49,7 @@ interface StaffProfile {
   active: boolean;
   auth_user_id: string | null;
   must_change_password: boolean;
+  allow_password_reset_email: boolean;
 }
 
 interface AuthUser {
@@ -237,6 +238,15 @@ async function readJson(res: Response): Promise<any> {
 // --- Authorisation ----------------------------------------------------------
 
 /**
+ * The columns this function reads off a staff profile.
+ *
+ * Listed once so the two lookups cannot drift apart: `findProfile` decides who
+ * may be sent a reset link, and if that select were ever missing the flag it
+ * reads, every profile would silently look like it had not been granted one.
+ */
+const PROFILE_COLUMNS = 'id,name,email,role,active,auth_user_id,must_change_password,allow_password_reset_email';
+
+/**
  * Resolve the caller and prove they are allowed to do this.
  *
  * Two independent things are established. First the bearer token is exchanged
@@ -262,7 +272,7 @@ async function requireAdmin(
 
   const res = await restAsAdmin(
     env,
-    `users?email=ilike.${encodeURIComponent(email)}&select=id,name,email,role,active,auth_user_id,must_change_password&limit=5`,
+    `users?email=ilike.${encodeURIComponent(email)}&select=${PROFILE_COLUMNS}&limit=5`,
   );
   if (!res.ok) {
     throw new HttpError(502, 'upstream_failure', 'Could not reach the staff register. Try again.');
@@ -288,7 +298,7 @@ async function requireAdmin(
 async function findProfile(env: HandlerEnv, email: string): Promise<StaffProfile | null> {
   const res = await restAsAdmin(
     env,
-    `users?email=ilike.${encodeURIComponent(email)}&select=id,name,email,role,active,auth_user_id,must_change_password&limit=5`,
+    `users?email=ilike.${encodeURIComponent(email)}&select=${PROFILE_COLUMNS}&limit=5`,
   );
   if (!res.ok) return null;
   const rows: StaffProfile[] = await readJson(res);
@@ -317,6 +327,27 @@ async function findAuthUser(env: HandlerEnv, email: string): Promise<AuthUser | 
     if (users.length < PER_PAGE) return null;
   }
   return null;
+}
+
+/**
+ * Find a sign-in account by its own id.
+ *
+ * Preferred over the email lookup everywhere a profile already carries
+ * `auth_user_id`, because that link is the one binding in this system that
+ * cannot quietly drift. An address is a column any administrator can type over
+ * through RLS, and GoTrue keeps its own copy behind the privileged key - so an
+ * address can name a different account from the profile it belongs to, or none
+ * at all. The id cannot: only `create` and `reset` write it.
+ */
+async function findAuthUserById(env: HandlerEnv, id: string): Promise<AuthUser | null> {
+  const res = await gotrueAsAdmin(env, `/admin/users/${encodeURIComponent(id)}`);
+  // A 404 here means the account is genuinely gone, which is different from the
+  // endpoint being unreachable and must not be reported as an outage.
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    throw new HttpError(502, 'upstream_failure', 'Could not reach the sign-in service. Try again.');
+  }
+  return await readJson(res);
 }
 
 // --- Audit ------------------------------------------------------------------
@@ -423,7 +454,8 @@ const CHECK_THE_INBOX =
   'A password reset link is on its way to that address. Check the inbox, including the spam folder.';
 
 /**
- * Email a password-reset link, but only to a clinic administrator.
+ * Email a password-reset link, to an administrator or to staff who have been
+ * granted self-service.
  *
  * WHAT THIS IS, AND WHY IT IS HERE RATHER THAN IN THE BROWSER
  * ----------------------------------------------------------
@@ -432,8 +464,21 @@ const CHECK_THE_INBOX =
  * wrong for this clinic, and precisely because it is too generous: GoTrue will
  * mail a reset link to ANY registered address, so a clinician who types their own
  * email gets a working reset and is never routed to their administrator. The
- * stated rule is that only administrators reset themselves by email, and
- * everyone else is pointed at the person who can do it for them.
+ * rule is therefore NOT "signed in or not" but "named or not": the link goes to
+ * an active administrator, and to any other member of staff whose profile
+ * carries `allow_password_reset_email`.
+ *
+ * THE FLAG, AND WHAT IT BUYS
+ * -------------------------
+ * `users.allow_password_reset_email` is the clinic saying "this person recovers
+ * their own password, no phone call required". It is a column rather than a
+ * setting on the sign-in screen because the decision is the administrator's,
+ * made once, in the staff register - and because the person it is about cannot
+ * be signed in to grant it to themselves.
+ *
+ * It defaults to FALSE for everyone, including every administrator, and the
+ * default is the point: a clinician is pointed at their administrator until
+ * somebody deliberately says otherwise.
  *
  * Deciding that requires reading `public.users`, and while signed out RLS refuses
  * every read of it - `app_is_staff()` is false without a session, and the column
@@ -454,10 +499,22 @@ const CHECK_THE_INBOX =
  * Two things are still hidden, and both matter more:
  *
  *  - An address with no staff profile gets the SAME reply as an existing
- *    clinician, so the endpoint cannot be used to discover who works here.
- *  - Nothing is revealed about the sign-in account itself, because the decision
- *    is made on the staff profile, not on whether GoTrue happens to have a
- *    matching auth user.
+ *    clinician who has not been granted self-service, so the endpoint cannot be
+ *    used to discover who works here.
+ *  - A clinician who HAS been granted it is not told whether the address is even
+ *    in the register. If the profile exists, is active and has an account, the
+ *    mail is sent; if any of those three is missing, the answer is the neutral
+ *    one. In particular a profile flagged for self-service that has no account
+ *    yet gets the neutral reply rather than "there is no account", because a
+ *    cheerful "sent" for a mail that can never be written is how a locked-out
+ *    clinician gets stranded.
+ *
+ * The one thing this does give up: a member of staff who has been granted
+ * self-service is distinguishable from an address that is not in the register,
+ * because only they are told to check their inbox. That is inherent to sending
+ * the link at all - there is no way to deliver it and answer identically to
+ * nobody - and the exposure is one address per attempt, to whoever already
+ * knows that address.
  *
  * THE REPLY IS DELIBERATELY NOT `ok: false`
  * -----------------------------------------
@@ -479,9 +536,18 @@ async function opForgot(env: HandlerEnv, body: ForgotBody) {
   }
 
   const profile = await findProfile(env, email);
-  const isAdministrator = Boolean(profile?.active) && profile?.role === 'ADMINISTRATOR';
 
-  if (!isAdministrator || !profile) {
+  // An active administrator is always eligible: they are the clinic's own
+  // escalation path and there is nobody above them to ask. Anyone else is
+  // eligible only where an administrator has granted self-service on their
+  // profile - and never without an account behind it, because a link to an
+  // account that does not exist is a mail that cannot be written.
+  const isAdministrator = Boolean(profile?.active) && profile?.role === 'ADMINISTRATOR';
+  const selfService = Boolean(
+    profile?.active && profile?.allow_password_reset_email && profile?.auth_user_id,
+  );
+
+  if (!isAdministrator && !selfService) {
     await audit(env, null, {
       action: 'SEND_PASSWORD_RESET_EMAIL',
       targetEmail: email,
@@ -489,14 +555,23 @@ async function opForgot(env: HandlerEnv, body: ForgotBody) {
       // caller, so this stays a server-side log line and costs the response
       // nothing: both branches return the same two fields.
       targetId: profile?.id ?? null,
-      outcome: 'refused:not_administrator',
+      // `not_allowed` rather than `not_administrator`: administrators are no
+      // longer the whole rule, and a log that names the old one would misstate
+      // why a clinician was turned away.
+      outcome: 'refused:not_allowed',
     });
     return { status: 200, body: { ok: true, sent: false, message: ASK_THE_ADMINISTRATOR } };
   }
 
-  // An administrator profile with no sign-in account. There is nothing to reset,
-  // and asking GoTrue anyway would produce a cheerful "sent" for a mail that can
-  // never be written, which is how a locked-out administrator gets stranded.
+  // Reachable by an administrator only - a flagged clinician without an account
+  // was already turned away above, and would have got the neutral reply above
+  // rather than this one. There is nothing to reset, and asking GoTrue anyway
+  // would produce a cheerful "sent" for a mail that can never be written, which
+  // is how a locked-out administrator gets stranded.
+  //
+  // Saying so is safe precisely BECAUSE the gate already turned every other
+  // caller away: reaching this line means the address belongs to an
+  // administrator, which the caller has just been distinguished for anyway.
   if (!profile.auth_user_id) {
     await audit(env, null, {
       action: 'SEND_PASSWORD_RESET_EMAIL',
@@ -584,6 +659,22 @@ async function opCreate(env: HandlerEnv, body: CreateBody, actor: StaffProfile) 
     );
   }
 
+  // The address says no, but this profile may still point at a live account
+  // under an older one - which is precisely the state an administrator creates
+  // by correcting an address in the dashboard. Creating here would mint a SECOND
+  // credential for one person, and only the first of the two would be reachable
+  // through RLS, because identity resolves on the profile's address.
+  if (profile.auth_user_id) {
+    const linked = await findAuthUserById(env, profile.auth_user_id);
+    if (linked) {
+      throw new HttpError(
+        409,
+        'account_exists',
+        'This person already has a sign-in account. Reset their password instead of creating a second one.',
+      );
+    }
+  }
+
   // `email_confirm: true` because there is no working mail relay on this
   // project: a confirmation requirement would leave the account unable to sign
   // in and no way for the person to resolve it. The credential is delivered out
@@ -668,24 +759,84 @@ async function opReset(env: HandlerEnv, body: ResetBody, actor: StaffProfile) {
   const weak = checkPassword(body.password, email, profile.name);
   if (weak) throw new HttpError(400, 'weak_password', weak);
 
-  const authUser = await findAuthUser(env, email);
-  if (!authUser) {
-    throw new HttpError(
-      404,
-      'no_auth_account',
-      'That person has no sign-in account yet. Create one instead of resetting it.',
-    );
+  // Resolve the account through the profile's own link FIRST.
+  //
+  // This used to look the account up by the address typed into the form, which
+  // was wrong in a way that produced a confidently incorrect answer. An
+  // administrator who corrects a staff address through the dashboard writes
+  // `public.users.email` and nothing else - GoTrue's copy needs the privileged
+  // key - so the two disagree until something moves one of them. Looking up by
+  // address then found no account for a person who had one for months, and said
+  // "That person has no sign-in account yet."
+  //
+  // `auth_user_id` is the only binding here that cannot drift: only `create` and
+  // `reset` ever write it, and both write it from the account they just touched.
+  let authUser: AuthUser | null = null;
+  if (profile.auth_user_id) {
+    authUser = await findAuthUserById(env, profile.auth_user_id);
+    if (!authUser) {
+      // The link names an account that no longer exists. Falling back to the
+      // address here would be a way to set an unrelated person's password, so
+      // this stops and says what is actually true.
+      throw new HttpError(
+        404,
+        'no_auth_account',
+        'The sign-in account this profile was linked to no longer exists. Create a new account for them instead.',
+      );
+    }
+  } else {
+    // A profile from before accounts were linked. The address is all there is to
+    // go on, and if nothing answers it there genuinely is no account.
+    authUser = await findAuthUser(env, email);
+    if (!authUser) {
+      throw new HttpError(
+        404,
+        'no_auth_account',
+        'That person has no sign-in account yet. Create one instead of resetting it.',
+      );
+    }
+  }
+
+  // Heal the drift in the same write that changes the password.
+  //
+  // The profile's address is the clinic's record of who this person is, and
+  // every RLS predicate in the database resolves a session against
+  // `lower(users.email) = lower(auth.jwt() ->> 'email')`. So while the account
+  // still carries the old address they cannot sign in with the new one, and
+  // their live session does not match their own profile row. Repairing it here
+  // means the reset an administrator asked for also undoes the lockout the
+  // drift caused, rather than leaving a second job behind.
+  const wantedEmail = normaliseEmail(profile.email) ?? email;
+  const drifted = normaliseEmail(authUser.email) !== wantedEmail;
+  if (drifted) {
+    const taken = await findAuthUser(env, wantedEmail);
+    if (taken && taken.id !== authUser.id) {
+      throw new HttpError(409, 'email_taken', 'Another sign-in account already uses that email address.');
+    }
   }
 
   // PUT is the only verb this project routes for an admin user update; PATCH
   // answers 405. Confirmed by scripts/probe-auth-admin.mjs.
+  //
+  // `email_confirm: true` alongside the new address, for the reason create
+  // passes it: this project has no mail relay, so an address left awaiting a
+  // confirmation would be one nobody could sign in with.
+  const update: Record<string, unknown> = { password: body.password };
+  if (drifted) {
+    update.email = wantedEmail;
+    update.email_confirm = true;
+  }
+
   const updated = await gotrueAsAdmin(env, `/admin/users/${encodeURIComponent(authUser.id)}`, {
     method: 'PUT',
-    body: JSON.stringify({ password: body.password }),
+    body: JSON.stringify(update),
   });
   if (!updated.ok) {
     const detail = await readJson(updated);
     console.error('[staff-accounts] reset failed', { email, status: updated.status, detail });
+    if (updated.status === 422) {
+      throw new HttpError(409, 'email_taken', 'Another sign-in account already uses that email address.');
+    }
     throw new HttpError(502, 'upstream_failure', 'The password could not be changed. Try again.');
   }
 
@@ -704,13 +855,33 @@ async function opReset(env: HandlerEnv, body: ResetBody, actor: StaffProfile) {
     outcome: 'ok',
   });
 
+  // Filed separately from the reset because it is a different fact with a
+  // different answer to "who changed this person's sign-in address?", and
+  // because it is the one write here that was not asked for.
+  if (drifted) {
+    await audit(env, actor, {
+      action: 'CHANGE_STAFF_EMAIL',
+      targetEmail: wantedEmail,
+      targetId: profile.id,
+      outcome: 'ok',
+    });
+  }
+
   return {
     status: 200,
     body: {
       ok: true,
       code: 'reset',
-      message: 'Password changed. This person must choose their own password at next sign-in, and any existing session has been ended.',
-      data: { email, profileId: profile.id, authUserId: authUser.id, mustChangePassword: true },
+      message: drifted
+        ? 'Password changed, and their sign-in account was moved to the address on their profile. They sign in with that address from now on, and must choose their own password at next sign-in.'
+        : 'Password changed. This person must choose their own password at next sign-in, and any existing session has been ended.',
+      data: {
+        email,
+        profileId: profile.id,
+        authUserId: authUser.id,
+        mustChangePassword: true,
+        signInAddressRepaired: drifted,
+      },
     },
   };
 }
@@ -753,7 +924,7 @@ async function opChangeEmail(env: HandlerEnv, body: ChangeEmailBody, actor: Staf
 
   const res = await restAsAdmin(
     env,
-    `users?id=eq.${encodeURIComponent(userId)}&select=id,name,email,role,active,auth_user_id,must_change_password&limit=1`,
+    `users?id=eq.${encodeURIComponent(userId)}&select=${PROFILE_COLUMNS}&limit=1`,
   );
   if (!res.ok) {
     throw new HttpError(502, 'upstream_failure', 'Could not reach the staff register. Try again.');

@@ -52,6 +52,20 @@ export interface User {
    * valid JWT is still required, and that is resolved by email in SQL.
    */
   authUserId?: string;
+  /**
+   * May this person recover their own password by email?
+   *
+   * An administrator can always do this. A clinician cannot, unless an
+   * administrator has turned this on for them, which is the clinic saying they
+   * do not have to phone anyone for a new password. Default false, including for
+   * administrators, so nobody gets self-service by accident.
+   *
+   * The grant is deliberately a column in the staff register and not something
+   * the sign-in screen can decide: the person it is about cannot be signed in to
+   * grant it to themselves, and the whole rule is decided server-side by the
+   * `staff-accounts` function regardless of what this says.
+   */
+  allowPasswordResetEmail?: boolean;
   active: boolean;
 }
 
