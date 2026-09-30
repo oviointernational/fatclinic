@@ -1,5 +1,40 @@
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
+import { execSync } from 'node:child_process';
+
+/**
+ * The commit this bundle was built from, baked into it.
+ *
+ * WHY
+ * ---
+ * This project is deployed by hand (`npm run deploy`). Nothing rebuilds it on a
+ * push, and there is no CI to do it. The result is the failure that cost a
+ * morning on 2026-09-30: a laboratory fix was committed, pushed and verified
+ * against the live database, and the live site kept serving the previous bundle,
+ * so the fix was never in front of a clinician and the bug it fixed was still
+ * there. Every layer below was green. Only the deployed bytes were old.
+ *
+ * The marker makes that a question with an answer. `npm run deploy:check` fetches
+ * the live site and compares this commit against the repository's HEAD, so "is the
+ * site running the current code?" stops being something to be confident about.
+ * It is shown on the sign-in screen too, so the answer is available to whoever is
+ * looking at the screen that is actually wrong.
+ *
+ * Falls back to 'unknown' where git is not available, rather than failing the
+ * build: a bundle without a marker is worse, but a bundle that cannot be built at
+ * all is worse still, and the check script reports 'unknown' rather than passing.
+ */
+function buildCommit(): string {
+  try {
+    return execSync('git rev-parse HEAD', {
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
+    }).trim();
+  } catch {
+    return 'unknown';
+  }
+}
 
 // https://vitejs.dev/config/
 //
@@ -61,6 +96,13 @@ export default defineConfig(({ command, mode }) => {
 
   return {
     plugins: [react()],
+    // Replaced at build time by the literal string above. `define` rather than an
+    // import.meta.env variable, because the value has to survive minification into
+    // the bundle - an env lookup would be a property access on a runtime object,
+    // which is both tree-shakeable away and absent in a static deployment.
+    define: {
+      __BUILD_COMMIT__: JSON.stringify(buildCommit()),
+    },
     server: {
       port: 5173,
       host: true

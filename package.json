@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "deploy": "npm run build && wrangler deploy",
     "deploy:dry": "wrangler deploy --dry-run",
+    "deploy:check": "node scripts/check-live-build.mjs",
     "db:lint": "node scripts/lint-schema.mjs",
     "db:lint:test": "node scripts/lint-selftest.mjs",
     "db:config:test": "node scripts/db-config-selftest.mjs",

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { X, LogIn, ShieldCheck, Lock, Mail } from 'lucide-react';
+import { BUILD_LABEL } from '../../buildInfo';
 
 interface AuthModalProps {
   isOpen: boolean;
@@ -128,6 +129,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onOpenPas
               <span>{isSubmitting ? 'Signing in…' : 'Sign In to Workstation'}</span>
             </button>
           </form>
+
+          {/* Which build this is. Deployment here is manual, so the screen a
+              clinician is looking at is the only place that can answer "are you
+              running the code we think you are?" - and it is the question worth
+              asking before believing any report that the code says cannot happen. */}
+          <p className="mt-4 text-center text-[9px] font-mono text-slate-400 dark:text-slate-600">
+            {BUILD_LABEL}
+          </p>
 
           {/* Separate from the form rather than a fourth field on it. A person who
               has forgotten their password cannot be asked to type one, and a link
