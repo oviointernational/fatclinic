@@ -77,7 +77,7 @@ const {
 const {
   CLINICAL_FLOW_GROUPS, RANGED_FLOW_GROUPS, WARD_CENSUS_GROUP_ID,
   clinicalGroupPatientIds, clinicalGroupCounts, admittedByWard,
-  countUnreadableVisitDates, visitInGroup, findFlowGroup,
+  visitInGroup, findFlowGroup,
 } = await import('../src/services/clinicalFlow.ts');
 
 // ---------------------------------------------------------------------------
@@ -1084,12 +1084,13 @@ const broken = [
 check('an encounter with an unreadable date is counted in no range',
   clinicalGroupCounts(broken, today).doctor === 1,
   `doctor=${clinicalGroupCounts(broken, today).doctor}`);
-check('...and the screen is told how many it dropped',
-  countUnreadableVisitDates(broken) === 2, `${countUnreadableVisitDates(broken)}`);
-check('...while a clean list reports none',
-  countUnreadableVisitDates(FLOW_VISITS) === 0);
-check('a date that does not exist is unreadable, not rolled into March',
-  countUnreadableVisitDates([V('b4', 'x', '2026-02-31', 'With Doctor')]) === 1);
+// The screen used to report how many dates it had dropped. That note was asked to
+// be removed, so there is no tally in the component any more - but the refusal is
+// the part that matters and it is still asserted here, so it cannot be quietly
+// relaxed into a guess.
+check('...and "all time", which imposes no restriction, still shows them',
+  clinicalGroupCounts(broken, null).doctor === 3,
+  `doctor=${clinicalGroupCounts(broken, null).doctor}`);
 
 // A group id nobody defined gives nobody, not everybody.
 check('an unknown group id counts nobody',
@@ -1149,13 +1150,24 @@ check('the list under the cards is filtered by the same window',
   'the page must pass the window, not fall back to today');
 check('the list names its range too, so a short list is not read as a bug',
   clinicalPageSrc.includes('describeWindow(window)'));
-check('when the range is not today, the screen says the census ignores it',
-  /wardCensusIgnoresRange[\s\S]{0,400}NOT limited by this range/.test(clinicalCode),
-  'no wording that the ward census is not date-limited');
-check('and says a status is where an encounter is now, not where it has been',
-  /where an encounter is now/.test(clinicalCode));
 check('the number of wards in flow adds up to something the range can change',
   clinicalCode.includes('RANGED_FLOW_GROUPS'), 'flowTotal must exclude the census');
+
+/*
+ * The explanatory note under the date filter was asked to be removed. Two facts it
+ * carried therefore have to survive in a shorter form, or a person is left
+ * guessing: which range the cards count, and that the ward census ignores it.
+ *
+ * These checks do not require prose - they require the signal. The cards caption
+ * themselves, and the census carries its own badge. If someone strips those
+ * instead, the counts stop saying what they are and these fail.
+ */
+check('every flow card says which range it counted, without being told in prose',
+  clinicalCode.includes('"Today\'s flow"') && clinicalCode.includes("? 'Any date'")
+  && clinicalCode.includes(": 'Dated in range'"));
+check('the ward census still declares that it is not limited by the range',
+  clinicalCode.includes('wardCensusIgnoresRange') && clinicalCode.includes('all dates'),
+  'the census exemption needs a signal on screen, not only a comment');
 
 /*
  * "All time" builds to a NULL window - no restriction at all. So asking the
@@ -1170,12 +1182,8 @@ check('the wording is keyed on the chosen range, not on the window being absent'
   clinicalCode.includes('const showingToday = mode ===')
   && clinicalCode.includes('const showingAllTime = mode ==='),
   'a null window must not be read as today');
-check('"all time" says there is no date restriction, rather than claiming today',
-  clinicalCode.includes("'No date restriction: every encounter, on any date.'")
-  && !/Encounters dated today\./.test(clinicalCode),
-  'all-time must not be captioned as today');
-check('"all time" is captioned on the cards as any date, not as today\'s flow',
-  clinicalCode.includes("? 'Any date'"));
+check('"all time" is captioned as any date rather than today\'s flow',
+  clinicalCode.includes("? 'Any date'") && !/"Any date"[^\n]*\n\s*: "Today's flow"/.test(clinicalCode));
 
 
 // A bare date means that whole day, in the viewer's own timezone. Comparing the

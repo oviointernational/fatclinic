@@ -127,9 +127,20 @@ const DEFECTS = [
   },
   {
     file: 'clinicalDashboard',
-    name: 'the screen stops saying that the ward census ignores the range',
-    from: "{wardCensusIgnoresRange && ' Ward census below is NOT limited by this range — it shows everyone in a ward now, on any date.'}",
-    to: "{false && ' Ward census below is NOT limited by this range.'}",
+    name: 'the cards stop saying which range they counted',
+    // The note that explained this in prose was asked to be removed, so the
+    // caption under each card is now the only thing saying it. Losing the caption
+    // leaves numbers with no range attached, which is the fault this whole module
+    // was written to prevent.
+    from: "            : showingToday\n              ? \"Today's flow\"\n              : showingAllTime\n                ? 'Any date'\n                : 'Dated in range';",
+    to: "            : '';",
+    count: 1,
+  },
+  {
+    file: 'clinicalDashboard',
+    name: 'the ward census loses the signal that it ignores the range',
+    from: "                all dates\n",
+    to: "                \n",
     count: 1,
   },
   {

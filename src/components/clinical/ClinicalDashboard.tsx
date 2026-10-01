@@ -8,7 +8,6 @@ import {
   WARD_CENSUS_GROUP_ID,
   admittedByWard,
   clinicalGroupCounts,
-  countUnreadableVisitDates,
   type ClinicalFlowGroup,
 } from '../../services/clinicalFlow';
 import {
@@ -163,11 +162,10 @@ export const ClinicalDashboard: React.FC<ClinicalDashboardProps> = ({
 
   // One pass over the encounters, so every card on the screen agrees about what
   // is in range. `db.getVisits()` is read once for the same reason.
-  const { counts, wards, flowTotal, unreadable } = useMemo<{
+  const { counts, wards, flowTotal } = useMemo<{
     counts: Record<string, number>;
     wards: Array<{ ward: string; count: number }>;
     flowTotal: number;
-    unreadable: number;
   }>(() => {
     const visits = db.getVisits();
     const c = clinicalGroupCounts(visits, win);
@@ -176,7 +174,6 @@ export const ClinicalDashboard: React.FC<ClinicalDashboardProps> = ({
       wards: admittedByWard(visits),
       // Built from `c`, not from a name being defined in this same object.
       flowTotal: RANGED_FLOW_GROUPS.reduce((s, g) => s + (c[g.id] || 0), 0),
-      unreadable: countUnreadableVisitDates(visits),
     };
   }, [win]);
 
@@ -309,26 +306,12 @@ export const ClinicalDashboard: React.FC<ClinicalDashboardProps> = ({
           <p className="text-[11px] font-semibold text-amber-700 dark:text-amber-400 px-1">{error}</p>
         )}
 
-        {/* The three things a person would otherwise have to guess. Each is stated
-            on the screen rather than in a comment, because each changes what the
-            numbers mean. */}
-        <div className="space-y-1 px-1">
-          <p className="text-[10px] text-slate-500 dark:text-slate-400">
-            {showingAllTime
-              ? 'No date restriction: every encounter, on any date.'
-              : `Encounters dated ${describeWindow(win)}.`}
-            {wardCensusIgnoresRange && ' Ward census below is NOT limited by this range — it shows everyone in a ward now, on any date.'}
-            {' '}
-            {unreadable > 0
-              ? `${unreadable} encounter(s) have a date that could not be read and are counted in none of these totals.`
-              : 'Every encounter has a readable date.'}
-          </p>
-          <p className="text-[10px] text-slate-400 dark:text-slate-500">
-            A status is where an encounter is now, not a record of where it has been, so a
-            wider range counts encounters that have stayed in that state since — not patients
-            who passed through it.
-          </p>
-        </div>
+        {/* The note that used to sit here explained what the cards count and that
+            the ward census ignores the range. It was asked to be removed, and the
+            two facts it carried are still on the screen in a shorter form: every
+            card says "Today's flow" / "Dated in range" / "Any date", the header
+            names the range, and the ward census keeps its own "all dates" badge.
+            Nothing here is load-bearing. */}
       </div>
 
       {/* Flow cards */}

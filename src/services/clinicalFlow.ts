@@ -38,11 +38,19 @@
  * date range: filtering "who is in a ward now" down to visits dated today would
  * report an empty ward while patients are lying in it. Anyone believing that
  * number could stop looking for them. It therefore ignores the range, and the
- * screen says so in words rather than letting the count quietly disagree with
- * the filter above it.
+ * ward census carries its own "all dates" badge to say so on screen.
+ *
+ * A NOTE ON WHAT IS NOT COUNTED HERE
+ * ----------------------------------
+ * An encounter whose `visitDate` cannot be parsed falls out of every range,
+ * because `withinWindow` refuses a date it cannot read. Guessing one would put a
+ * patient in the wrong day's flow, so refusing is right. This module does not
+ * report how many were dropped - the note that did was asked to be removed - but
+ * the refusal itself is asserted in `access-selftest.mjs`, under the date-range
+ * section, so the behaviour is still covered even though the tally is not shown.
  */
 import type { Visit } from '../types';
-import { parseStoredDate, withinWindow, type DateWindow } from './dateRange';
+import { withinWindow, type DateWindow } from './dateRange';
 
 export interface ClinicalFlowGroup {
   id: string;
@@ -148,16 +156,4 @@ export function admittedByWard(visits: Visit[]): Array<{ ward: string; count: nu
   return [...map.entries()]
     .map(([ward, count]) => ({ ward, count }))
     .sort((a, b) => b.count - a.count);
-}
-
-/**
- * Encounters whose date cannot be read, so a count can admit what it dropped.
- *
- * `withinWindow` refuses a date it cannot parse, so a visit saved with a broken
- * date falls out of every range silently. That is the right default - guessing a
- * date puts a patient in the wrong day's flow - but the number is reported
- * rather than swallowed.
- */
-export function countUnreadableVisitDates(visits: Visit[]): number {
-  return visits.filter(v => parseStoredDate(v.visitDate) === null).length;
 }
