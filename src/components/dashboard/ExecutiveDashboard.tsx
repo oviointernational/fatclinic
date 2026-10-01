@@ -391,7 +391,12 @@ export const ExecutiveDashboard: React.FC<ExecutiveDashboardProps> = ({
         </div>
       </div>
 
-      {/* Clinical Flow Dashboard — jumps into Clinical Dashboard filtered */}
+      {/* Clinical Flow Dashboard — jumps into Clinical Dashboard filtered.
+
+          It keeps its own window state rather than sharing the page's: this copy
+          is read-only navigation, the dashboard it opens is a different screen,
+          and lifting the state up here would put a date filter on the Executive
+          Overview that changes nothing else on it. */}
       <ClinicalDashboard
         selectedGroup={null}
         onSelect={(g, w) => {

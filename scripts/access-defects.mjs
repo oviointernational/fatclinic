@@ -24,6 +24,9 @@ const TARGETS = {
   navModel: path.join(ROOT, 'src', 'components', 'layout', 'navModel.ts'),
   permissions: path.join(ROOT, 'src', 'services', 'permissions.ts'),
   dateRange: path.join(ROOT, 'src', 'services', 'dateRange.ts'),
+  clinicalFlow: path.join(ROOT, 'src', 'services', 'clinicalFlow.ts'),
+  clinicalDashboard: path.join(ROOT, 'src', 'components', 'clinical', 'ClinicalDashboard.tsx'),
+  clinicalDashboardPage: path.join(ROOT, 'src', 'components', 'clinical', 'ClinicalDashboardPage.tsx'),
   searchRank: path.join(ROOT, 'src', 'services', 'searchRank.ts'),
   useAccess: path.join(ROOT, 'src', 'hooks', 'useAccess.ts'),
   mainContainer: path.join(ROOT, 'src', 'components', 'layout', 'MainContainer.tsx'),
@@ -36,6 +39,9 @@ const PATHS = {
   navModel: ['components', 'layout', 'navModel.ts'],
   permissions: ['services', 'permissions.ts'],
   dateRange: ['services', 'dateRange.ts'],
+  clinicalFlow: ['services', 'clinicalFlow.ts'],
+  clinicalDashboard: ['components', 'clinical', 'ClinicalDashboard.tsx'],
+  clinicalDashboardPage: ['components', 'clinical', 'ClinicalDashboardPage.tsx'],
   searchRank: ['services', 'searchRank.ts'],
   useAccess: ['hooks', 'useAccess.ts'],
   mainContainer: ['components', 'layout', 'MainContainer.tsx'],
@@ -59,6 +65,81 @@ const norm = (s) => s.replaceAll('\r\n', '\n');
 const TZ = { lagos: { TZ: 'Africa/Lagos' }, la: { TZ: 'America/Los_Angeles' } };
 
 const DEFECTS = [
+  {
+    file: 'clinicalFlow',
+    name: 'the date range is ignored, so the cards always show today whatever you pick',
+    // The defining failure of a date filter: it is on screen and changes nothing.
+    from: '  if (group.followsRange && !withinWindow(visit.visitDate, window)) return false;',
+    to: '  if (false && group.followsRange && !withinWindow(visit.visitDate, window)) return false;',
+    count: 1,
+  },
+  {
+    file: 'clinicalFlow',
+    name: 'the ward census is narrowed by the range, so an occupied ward can read as empty',
+    // The dangerous one. A patient admitted on Tuesday is still in a bed today, so
+    // filtering the census by date can report nobody in the ward while somebody is
+    // lying in it - and the person reading believes it.
+    from: "  { id: 'admitted', label: 'Admitted / In Ward', statuses: ['Admitted'], followsRange: false },",
+    to: "  { id: 'admitted', label: 'Admitted / In Ward', statuses: ['Admitted'], followsRange: true },",
+    count: 1,
+  },
+  {
+    file: 'clinicalFlow',
+    name: 'the ward filter is applied to the queues, so the doctor queue empties out',
+    // A doctor-queue visit carries no ward, so filtering by ward hides all of them.
+    from: '  if (group.id === WARD_CENSUS_GROUP_ID && ward && visit.ward !== ward) return false;',
+    to: '  if (ward && visit.ward !== ward) return false;',
+    count: 1,
+  },
+  {
+    file: 'clinicalFlow',
+    name: 'a patient with no ward vanishes from the census instead of appearing as UNSPECIFIED',
+    from: "    const w = v.ward || 'UNSPECIFIED';\n    map.set(w, (map.get(w) || 0) + 1);",
+    to: "    if (!v.ward) continue;\n    map.set(v.ward, (map.get(v.ward) || 0) + 1);",
+    count: 1,
+  },
+  {
+    file: 'clinicalFlow',
+    name: 'encounters are counted twice when one patient has two in the same state',
+    // Still a Set, still deduplicating — of the wrong thing. Keying by encounter
+    // id is the realistic version of this mistake: two encounters for one patient
+    // in the same state then read as two patients on one card.
+    from: '    if (visitInGroup(v, group, window, ward)) ids.add(v.patientId);',
+    to: '    if (visitInGroup(v, group, window, ward)) ids.add(v.id);',
+    count: 1,
+  },
+  {
+    file: 'clinicalDashboard',
+    name: 'the header says today whatever range is chosen',
+    from: '              Doctor &amp; Nursing flow • {describeWindow(win)}',
+    to: '              Doctor &amp; Nursing flow • Today',
+    count: 1,
+  },
+  {
+    file: 'clinicalDashboard',
+    name: 'a null window is read as "today", so All time is captioned as today',
+    // "All time" builds to no window at all. Testing the window for "is this
+    // today?" therefore says yes, and every card gets captioned "Today's flow"
+    // over all-time numbers - the exact fault dateRange.ts was written to stop.
+    from: "  const showingToday = mode === 'today';\n  const showingAllTime = mode === 'all';",
+    to: "  const showingToday = !win || win.mode === 'today';\n  const showingAllTime = mode === 'all';",
+    count: 1,
+  },
+  {
+    file: 'clinicalDashboard',
+    name: 'the screen stops saying that the ward census ignores the range',
+    from: "{wardCensusIgnoresRange && ' Ward census below is NOT limited by this range — it shows everyone in a ward now, on any date.'}",
+    to: "{false && ' Ward census below is NOT limited by this range.'}",
+    count: 1,
+  },
+  {
+    file: 'clinicalDashboardPage',
+    name: 'the patient list falls back to today while the cards use the chosen range',
+    // A card reading 12 above a list of 3, with nothing on screen to explain it.
+    from: 'clinicalGroupPatientIds(visits, groupDef.id, window, ward)',
+    to: "clinicalGroupPatientIds(visits, groupDef.id, buildWindow({ mode: 'today' }).window, ward)",
+    count: 1,
+  },
   {
     file: 'navModel',
     name: 'Billing goes back to being a column of its own, duplicating the Front Desk',
@@ -487,17 +568,29 @@ if (!baseline.ok) {
     const key = defect.file;
     const original = readOriginal(key);
 
-    if (original.split(defect.from).length - 1 !== defect.count) {
+    // `parts` injects several snippets in one file, which is how a defect that
+    // needs a signature changed as well as a line changed is written. One part is
+    // the normal case and is not written as an array.
+    const parts = defect.parts ?? [{ from: defect.from, to: defect.to, count: defect.count }];
+    let injected = original;
+    let miss = null;
+
+    for (const p of parts) {
+      if (injected.split(p.from).length - 1 !== p.count) {
+        miss = `${p.count} expected match(es) for a snippet in ${key}`;
+        break;
+      }
+      injected = injected.replace(p.from, p.to);
+    }
+
+    if (miss) {
       console.log(`  ${defect.name}`);
-      console.log(`      NOT INJECTED - ${defect.count} expected match(es) for the snippet in ${key}.`);
+      console.log(`      NOT INJECTED - ${miss}.`);
       survived++;
       continue;
     }
 
-    fs.writeFileSync(
-      path.join(ROOT, 'src', ...PATHS[key]),
-      original.replace(defect.from, defect.to),
-    );
+    fs.writeFileSync(path.join(ROOT, 'src', ...PATHS[key]), injected);
 
     const result = run(defect.env);
     const failing = result.out

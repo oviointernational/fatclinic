@@ -74,6 +74,12 @@ const {
   filterAndRank, rankMatch, matchSpan, rankOptions,
 } = await import('../src/services/searchRank.ts');
 
+const {
+  CLINICAL_FLOW_GROUPS, RANGED_FLOW_GROUPS, WARD_CENSUS_GROUP_ID,
+  clinicalGroupPatientIds, clinicalGroupCounts, admittedByWard,
+  countUnreadableVisitDates, visitInGroup, findFlowGroup,
+} = await import('../src/services/clinicalFlow.ts');
+
 // ---------------------------------------------------------------------------
 
 let checks = 0;
@@ -919,6 +925,258 @@ check('29 February of a common year is rejected (2026 is not)',
   parseStoredDate('2026-02-29') === null);
 check('unreadable dates are counted so the report can say so',
   countUnreadable(['2026-10-01', 'oops', '', null, undefined, '2026-09-30']) === 4);
+
+// ---------------------------------------------------------------------------
+// The clinical dashboard counts what its own label claims
+// ---------------------------------------------------------------------------
+
+section('the clinical dashboard counts the dates it says it counts');
+
+/*
+ * The Clinical Dashboard was hard-wired to today: every group was
+ * `visitDate === today`, in a UTC string comparison, so at 00:30 local it showed
+ * yesterday's flow while the header said today. It gained a date range, and the
+ * arithmetic behind the cards moved into `clinicalFlow.ts` so it could be asked
+ * about a specific day rather than only the day the suite happens to run.
+ *
+ * The trap these checks exist for is the obvious one: a filter that is displayed
+ * and then not applied. So the assertions are about what is COUNTED under a
+ * chosen range, not about whether a date box is present.
+ */
+
+// A small clinic, on known dates, with known states.
+const V = (id, patientId, visitDate, status, extra = {}) => ({
+  id, patientId, visitDate, visitTime: '09:00', visitType: 'Routine', status, ...extra,
+});
+
+const FLOW_VISITS = [
+  V('v1', 'p1', '2026-09-28', 'Admitted', { ward: 'MALE' }),
+  V('v2', 'p2', '2026-09-29', 'Admitted', { ward: 'FEMALE' }),
+  V('v3', 'p3', '2026-09-30', 'Admitted', { ward: 'MALE' }),
+  V('v4', 'p4', '2026-10-01', 'With Doctor'),
+  V('v5', 'p5', '2026-10-01', 'Awaiting Vitals'),
+  V('v6', 'p6', '2026-10-01', 'Awaiting Lab'),
+  V('v7', 'p7', '2026-09-25', 'Discharged'),
+  V('v8', 'p8', '2026-10-01', 'Discharged'),
+];
+
+const todayCounts = clinicalGroupCounts(FLOW_VISITS, today);
+check('today excludes an encounter from yesterday', todayCounts.discharged === 1,
+  `discharged=${todayCounts.discharged}`);
+check('today includes an encounter from today', todayCounts.doctor === 1,
+  `doctor=${todayCounts.doctor}`);
+check('today counts the three separate queues correctly',
+  todayCounts.triage === 1 && todayCounts.lab === 1, JSON.stringify(todayCounts));
+
+// September. The queue cards must move; that is the whole point of the control.
+const september = buildWindow({ mode: 'custom', from: '2026-09-01', to: '2026-09-30' }).window;
+const septCounts = clinicalGroupCounts(FLOW_VISITS, september);
+check('a September range excludes today\'s encounters', septCounts.doctor === 0,
+  `doctor=${septCounts.doctor}`);
+check('a September range includes September\'s encounters', septCounts.discharged === 1,
+  `discharged=${septCounts.discharged}`);
+
+// The month-to-date preset must agree with what a person means by it.
+const octCounts = clinicalGroupCounts(FLOW_VISITS, month);
+check('"this month" agrees with an explicit October range',
+  JSON.stringify(octCounts) === JSON.stringify(
+    clinicalGroupCounts(FLOW_VISITS, buildWindow({ mode: 'custom', from: '2026-10-01', to: '2026-10-01' }).window),
+  ), JSON.stringify(octCounts));
+
+// A range covering both months includes both, and is not the sum of nothing.
+const both = buildWindow({ mode: 'custom', from: '2026-09-25', to: '2026-10-01' }).window;
+check('a range spanning the month boundary includes encounters from both sides',
+  clinicalGroupCounts(FLOW_VISITS, both).discharged === 2,
+  JSON.stringify(clinicalGroupCounts(FLOW_VISITS, both)));
+
+// All time is the widest thing on offer, and it is genuinely wider than a year.
+const allTimeCounts = clinicalGroupCounts(FLOW_VISITS, null);
+check('all time includes every encounter, on any date', allTimeCounts.discharged === 2);
+check('...and it is wider than this month',
+  allTimeCounts.discharged > octCounts.discharged);
+
+// ---------------------------------------------------------------------------
+// The ward census ignores the range, and that is deliberate
+// ---------------------------------------------------------------------------
+
+/*
+ * A patient admitted on Tuesday is still in a bed on Thursday. Narrowing the ward
+ * census by a date range would report an empty ward while patients are lying in
+ * it, and anyone believing that number could stop looking for them. So the census
+ * is exempt, and the exemption is asserted here rather than trusted to a comment.
+ */
+
+check('the ward census counts everyone in a ward on any date, whatever the range',
+  todayCounts.admitted === 3 && septCounts.admitted === 3 && allTimeCounts.admitted === 3,
+  `today=${todayCounts.admitted} sept=${septCounts.admitted} all=${allTimeCounts.admitted}`);
+check('the census is the only group exempt from the range',
+  CLINICAL_FLOW_GROUPS.filter(g => !g.followsRange).map(g => g.id).join(',') === WARD_CENSUS_GROUP_ID,
+  CLINICAL_FLOW_GROUPS.filter(g => !g.followsRange).map(g => g.id).join(','));
+check('every other group does follow the range',
+  RANGED_FLOW_GROUPS.length === CLINICAL_FLOW_GROUPS.length - 1);
+
+// Ward narrowing must still work, and must not leak into the queues.
+check('narrowing the census to a ward gives that ward only',
+  clinicalGroupPatientIds(FLOW_VISITS, 'admitted', september, 'MALE').size === 2);
+check('narrowing the census to a ward keeps ignoring the date range',
+  clinicalGroupPatientIds(FLOW_VISITS, 'admitted', today, 'MALE').size === 2,
+  'a ward must not empty out because the range is today');
+check('a ward name that is not there gives nobody, not everybody',
+  clinicalGroupPatientIds(FLOW_VISITS, 'admitted', null, 'PAEDIATRIC').size === 0);
+
+// A patient with no ward is counted, under UNSPECIFIED, rather than vanishing.
+// A census that does not add up to the admitted count is worse than no census.
+const noWard = [...FLOW_VISITS, V('v9', 'p9', '2026-10-01', 'Admitted')];
+check('an admitted patient with no ward is still counted',
+  clinicalGroupCounts(noWard, null).admitted === 4);
+check('...and appears in the census as UNSPECIFIED',
+  admittedByWard(noWard).some(w => w.ward === 'UNSPECIFIED' && w.count === 1),
+  JSON.stringify(admittedByWard(noWard)));
+
+// The ward breakdown must add up to the admitted card. If these two ever
+// disagree, one of them is lying about how many people are in the building.
+const censusSum = admittedByWard(FLOW_VISITS).reduce((s, w) => s + w.count, 0);
+check('the ward breakdown adds up to the admitted count',
+  censusSum === clinicalGroupCounts(FLOW_VISITS, null).admitted,
+  `${censusSum} vs ${clinicalGroupCounts(FLOW_VISITS, null).admitted}`);
+
+// Ward narrowing applies to the census only. A doctor-queue visit has no ward, so
+// applying it there would hide every one of them.
+const doctorGroup = findFlowGroup('doctor');
+check('a ward filter does not hide the doctor queue',
+  FLOW_VISITS.filter(v => visitInGroup(v, doctorGroup, today, 'MALE')).length === 1);
+
+// ---------------------------------------------------------------------------
+// Counting patients, not rows
+// ---------------------------------------------------------------------------
+
+// One patient with two encounters in the same state is one card, not two.
+const dupes = [
+  V('d1', 'same', '2026-10-01', 'With Doctor'),
+  V('d2', 'same', '2026-10-01', 'With Doctor'),
+  V('d3', 'other', '2026-10-01', 'With Doctor'),
+];
+check('one patient with two encounters in a state counts once',
+  clinicalGroupCounts(dupes, today).doctor === 2,
+  `doctor=${clinicalGroupCounts(dupes, today).doctor}`);
+
+// The three terminal statuses are one question, not three.
+check('treated, discharged and completed all count as discharged',
+  clinicalGroupCounts([
+    V('t1', 'a', '2026-10-01', 'Treated'),
+    V('t2', 'b', '2026-10-01', 'Discharged'),
+    V('t3', 'c', '2026-10-01', 'Completed'),
+  ], today).discharged === 3);
+
+// 'Awaiting Physician' and 'With Doctor' are both the doctor queue.
+check('awaiting physician and with doctor are one queue',
+  clinicalGroupCounts([
+    V('w1', 'a', '2026-10-01', 'Awaiting Physician'),
+    V('w2', 'b', '2026-10-01', 'With Doctor'),
+  ], today).doctor === 2);
+
+// An unreadable date falls out of every range rather than being guessed into one.
+const broken = [
+  V('b1', 'good', '2026-10-01', 'With Doctor'),
+  V('b2', 'bad', 'not-a-date', 'With Doctor'),
+  V('b3', 'bad2', '', 'With Doctor'),
+];
+check('an encounter with an unreadable date is counted in no range',
+  clinicalGroupCounts(broken, today).doctor === 1,
+  `doctor=${clinicalGroupCounts(broken, today).doctor}`);
+check('...and the screen is told how many it dropped',
+  countUnreadableVisitDates(broken) === 2, `${countUnreadableVisitDates(broken)}`);
+check('...while a clean list reports none',
+  countUnreadableVisitDates(FLOW_VISITS) === 0);
+check('a date that does not exist is unreadable, not rolled into March',
+  countUnreadableVisitDates([V('b4', 'x', '2026-02-31', 'With Doctor')]) === 1);
+
+// A group id nobody defined gives nobody, not everybody.
+check('an unknown group id counts nobody',
+  clinicalGroupPatientIds(FLOW_VISITS, 'no-such-group', null).size === 0);
+
+// The local-time boundary. `visitDate` is a bare date, so a UTC comparison would
+// misplace an early-morning encounter the day a timezone changes.
+check('a bare encounter date is read in local time, not UTC',
+  withinWindow('2026-10-01', buildWindow({ mode: 'custom', from: '2026-10-01', to: '2026-10-01', now: NOW }).window));
+
+// A range that ends on a day includes that whole day for the cards too.
+const oneDay = buildWindow({ mode: 'custom', from: '2026-10-01', to: '2026-10-01' }).window;
+check('a single-day range still counts that day\'s queue',
+  clinicalGroupCounts(FLOW_VISITS, oneDay).doctor === 1);
+check('...and does not reach back into the month before',
+  clinicalGroupCounts(FLOW_VISITS, oneDay).discharged === 1);
+
+// The card and the list below it must be computed from ONE window. Both call the
+// same function; this asserts they agree for a range that is not today, which is
+// the case that would expose a page still defaulting to today.
+const cardCount = clinicalGroupCounts(FLOW_VISITS, september).discharged;
+const listCount = clinicalGroupPatientIds(FLOW_VISITS, 'discharged', september).size;
+check('a card and the list under it agree for a range that is not today',
+  cardCount === listCount, `${cardCount} vs ${listCount}`);
+
+// ---------------------------------------------------------------------------
+// The screen names what it counted
+// ---------------------------------------------------------------------------
+
+const clinicalDashboardSrc = readSrc('src', 'components', 'clinical', 'ClinicalDashboard.tsx');
+const clinicalPageSrc = readSrc('src', 'components', 'clinical', 'ClinicalDashboardPage.tsx');
+const clinicalCode = clinicalDashboardSrc.replace(/\/\*[\s\S]*?\*\//g, ' ');
+
+/*
+ * A number without a range beside it is the bug this whole module exists to
+ * avoid, so the words are checked too. Not the styling - whether the date boxes
+ * are on screen is a browser's question. But whether the header names the range
+ * is a fact about the source, and it is the fact that stops "This month" becoming
+ * a caption on top of all-time numbers.
+ */
+/*
+ * Matched on the header line itself, not on `describeWindow` appearing somewhere
+ * in the file. A looser check passed while the header read a hardcoded "Today",
+ * because the range bar underneath still called describeWindow - which is exactly
+ * the shape of this bug: the word is present, and it is on the wrong element.
+ */
+check('the header names the range rather than always saying today',
+  clinicalCode.includes('Doctor &amp; Nursing flow • {describeWindow(win)}')
+  && !clinicalCode.includes('const todayLabel'));
+check('the dashboard does not compute its own notion of today',
+  !/toISOString\(\)\.split\('T'\)\[0\]/.test(clinicalDashboardSrc),
+  'a UTC string comparison would misplace an early-morning encounter');
+check('the date range is offered as presets and as a picked range',
+  clinicalCode.includes("RANGE_PRESETS") && clinicalCode.includes('type="date"'));
+check('the list under the cards is filtered by the same window',
+  clinicalPageSrc.includes('clinicalGroupPatientIds(visits, groupDef.id, window, ward)'),
+  'the page must pass the window, not fall back to today');
+check('the list names its range too, so a short list is not read as a bug',
+  clinicalPageSrc.includes('describeWindow(window)'));
+check('when the range is not today, the screen says the census ignores it',
+  /wardCensusIgnoresRange[\s\S]{0,400}NOT limited by this range/.test(clinicalCode),
+  'no wording that the ward census is not date-limited');
+check('and says a status is where an encounter is now, not where it has been',
+  /where an encounter is now/.test(clinicalCode));
+check('the number of wards in flow adds up to something the range can change',
+  clinicalCode.includes('RANGED_FLOW_GROUPS'), 'flowTotal must exclude the census');
+
+/*
+ * "All time" builds to a NULL window - no restriction at all. So asking the
+ * window "is this today?" answers YES for All time, and the screen said
+ * "Encounters dated today" with "Today's flow" under every card while counting
+ * every encounter ever saved. That is exactly the caption-over-all-time-numbers
+ * fault `dateRange.ts` exists to prevent, reintroduced by reading "no window" as
+ * "a window for one day". So the wording is keyed on the chosen mode, not the
+ * window.
+ */
+check('the wording is keyed on the chosen range, not on the window being absent',
+  clinicalCode.includes('const showingToday = mode ===')
+  && clinicalCode.includes('const showingAllTime = mode ==='),
+  'a null window must not be read as today');
+check('"all time" says there is no date restriction, rather than claiming today',
+  clinicalCode.includes("'No date restriction: every encounter, on any date.'")
+  && !/Encounters dated today\./.test(clinicalCode),
+  'all-time must not be captioned as today');
+check('"all time" is captioned on the cards as any date, not as today\'s flow',
+  clinicalCode.includes("? 'Any date'"));
+
 
 // A bare date means that whole day, in the viewer's own timezone. Comparing the
 // raw string would move a morning's clinic into yesterday for anybody west of UTC.

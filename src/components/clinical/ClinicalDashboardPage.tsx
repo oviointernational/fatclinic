@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Patient, Visit, wardName } from '../../types';
 import { db } from '../../services/db';
 import { useSyncDb } from '../../hooks/useSyncDb';
-import { ClinicalDashboard, CLINICAL_GROUPS, getClinicalGroupPatientIds } from './ClinicalDashboard';
+import { ClinicalDashboard } from './ClinicalDashboard';
+import { clinicalGroupPatientIds, findFlowGroup, WARD_CENSUS_GROUP_ID } from '../../services/clinicalFlow';
+import { buildWindow, describeWindow, type DateWindow } from '../../services/dateRange';
 import { User, Stethoscope, Activity, X } from 'lucide-react';
 
 interface ClinicalDashboardPageProps {
@@ -13,7 +15,15 @@ interface ClinicalDashboardPageProps {
   onNavigateNursing?: () => void;
   initialGroup?: string | null;
   initialWard?: string | null;
+  /**
+   * The window the cards are counting in, held here so the list below is built
+   * from the same one. Defaults to today, which is what the dashboard showed
+   * before a range could be chosen.
+   */
+  initialWindow?: DateWindow | null;
 }
+
+const TODAY_WINDOW = buildWindow({ mode: 'today' }).window;
 
 /**
  * Standalone Clinical Dashboard (Clinical Care & Triage → Clinical Dashboard).
@@ -28,10 +38,14 @@ export const ClinicalDashboardPage: React.FC<ClinicalDashboardPageProps> = ({
   onNavigateNursing,
   initialGroup,
   initialWard,
+  initialWindow,
 }) => {
   useSyncDb();
   const [group, setGroup] = useState<string | null>(initialGroup || null);
   const [ward, setWard] = useState<string | null>(initialWard || null);
+  const [window, setWindow] = useState<DateWindow | null>(
+    initialWindow !== undefined ? initialWindow : TODAY_WINDOW,
+  );
 
   // Preset from Executive Overview (or elsewhere) — apply when it changes.
   React.useEffect(() => {
@@ -39,8 +53,13 @@ export const ClinicalDashboardPage: React.FC<ClinicalDashboardPageProps> = ({
     if (initialWard !== undefined) setWard(initialWard);
   }, [initialGroup, initialWard]);
 
-  const groupDef = group ? CLINICAL_GROUPS.find(g => g.id === group) : null;
-  const ids = groupDef ? getClinicalGroupPatientIds(groupDef.id, ward) : new Set<string>();
+  const groupDef = group ? findFlowGroup(group) : null;
+  const visits = useMemo(() => db.getVisits(), [window]);
+
+  // The SAME window as the cards. If this were left out and defaulted to today
+  // instead, a card could read 12 and the list below it show 3 people, with
+  // nothing on screen to explain the difference.
+  const ids = groupDef ? clinicalGroupPatientIds(visits, groupDef.id, window, ward) : new Set<string>();
   const patients: Patient[] = [...ids]
     .map(id => db.getPatientById(id))
     .filter((p): p is Patient => !!p);
@@ -68,13 +87,21 @@ export const ClinicalDashboardPage: React.FC<ClinicalDashboardPageProps> = ({
           selectedGroup={group}
           selectedWard={ward}
           onSelect={(g, w) => { setGroup(g); setWard(w || null); }}
+          window={window}
+          onWindowChange={setWindow}
         />
 
         {groupDef && (
           <div className="rounded-2xl bg-white dark:bg-dark-card border border-light-border dark:border-dark-border shadow-sm overflow-hidden flex-shrink-0">
             <div className="px-4 py-2.5 border-b border-light-border dark:border-dark-border bg-slate-50 dark:bg-dark-surface/60 flex items-center justify-between">
               <span className="text-xs font-extrabold text-slate-700 dark:text-slate-200">
-                {groupDef.label}{ward ? ` — ${ward}` : ''} ({patients.length} patient{patients.length === 1 ? '' : 's'})
+                {groupDef.label}{ward ? ` — ${wardName(ward)}` : ''} ({patients.length} patient{patients.length === 1 ? '' : 's'})
+              </span>
+              {/* The list is filtered by the range chosen above, so it names the
+                  range too. Without this, a list of 3 under a card reading 12
+                  looks like a bug rather than a filter. */}
+              <span className="text-[11px] font-semibold text-slate-400 dark:text-slate-500">
+                {group === WARD_CENSUS_GROUP_ID ? 'All dates' : describeWindow(window)}
               </span>
               <button
                 onClick={() => { setGroup(null); setWard(null); }}
@@ -84,7 +111,12 @@ export const ClinicalDashboardPage: React.FC<ClinicalDashboardPageProps> = ({
               </button>
             </div>
             {patients.length === 0 ? (
-              <div className="p-8 text-center text-xs text-slate-400">No patients in this group.</div>
+              <div className="p-8 text-center text-xs text-slate-400">
+                No patients in this group{group === WARD_CENSUS_GROUP_ID ? '' : ` for ${describeWindow(window)}`}.
+                {group === WARD_CENSUS_GROUP_ID
+                  ? ' The ward census shows everyone in a ward now, on any date.'
+                  : ' Try a wider range above — a status is where an encounter is now, so a wider range counts encounters that stayed in this state since.'}
+              </div>
             ) : (
               <div className="divide-y divide-light-border/60 dark:divide-dark-border/60 max-h-[46vh] overflow-y-auto">
                 {patients.map(p => {

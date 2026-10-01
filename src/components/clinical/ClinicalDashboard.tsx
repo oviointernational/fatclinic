@@ -1,7 +1,22 @@
-import React from 'react';
+import React, { useMemo, useState } from 'react';
 import { db } from '../../services/db';
 import { useSyncDb } from '../../hooks/useSyncDb';
-import { Visit, wardName } from '../../types';
+import { wardName } from '../../types';
+import {
+  CLINICAL_FLOW_GROUPS,
+  RANGED_FLOW_GROUPS,
+  WARD_CENSUS_GROUP_ID,
+  admittedByWard,
+  clinicalGroupCounts,
+  countUnreadableVisitDates,
+  type ClinicalFlowGroup,
+} from '../../services/clinicalFlow';
+import {
+  buildWindow,
+  describeWindow,
+  type DateRangeMode,
+  type DateWindow,
+} from '../../services/dateRange';
 import {
   Clock,
   Activity,
@@ -14,85 +29,170 @@ import {
   CheckCircle2,
   LayoutGrid,
   X,
+  CalendarRange,
 } from 'lucide-react';
 
-export interface ClinicalGroup {
-  id: string;
-  label: string;
-  statuses: Visit['status'][];
-  todayOnly: boolean;
+/**
+ * The presentation of each group: colour and icon.
+ *
+ * Kept apart from `clinicalFlow.ts` so that module stays free of React and of
+ * `lucide-react`, which is what lets the self-test import it and check the
+ * counting arithmetic. Adding an icon here cannot break the tests; adding one
+ * there would have made the menu-style problem worse.
+ */
+interface GroupSkin {
   accent: string;
   tile: string;
   icon: React.ReactNode;
 }
 
-export const CLINICAL_GROUPS: ClinicalGroup[] = [
-  { id: 'triage', label: 'Awaiting Triage', statuses: ['Awaiting Vitals'], todayOnly: true, accent: 'bg-amber-500', tile: 'bg-amber-100 text-amber-600 dark:bg-amber-950/60 dark:text-amber-400', icon: <Clock className="w-5 h-5" /> },
-  { id: 'nursing', label: 'With Nurse', statuses: ['With Nurse'], todayOnly: true, accent: 'bg-teal-500', tile: 'bg-teal-100 text-teal-600 dark:bg-teal-950/60 dark:text-teal-400', icon: <Activity className="w-5 h-5" /> },
-  { id: 'doctor', label: 'With Doctor', statuses: ['With Doctor', 'Awaiting Physician'], todayOnly: true, accent: 'bg-violet-500', tile: 'bg-violet-100 text-violet-600 dark:bg-violet-950/60 dark:text-violet-300', icon: <Stethoscope className="w-5 h-5" /> },
-  { id: 'consulting', label: 'In Consultation', statuses: ['In Consultation'], todayOnly: true, accent: 'bg-blue-500', tile: 'bg-blue-100 text-blue-600 dark:bg-blue-950/60 dark:text-blue-400', icon: <Syringe className="w-5 h-5" /> },
-  { id: 'lab', label: 'Awaiting Lab', statuses: ['Awaiting Lab'], todayOnly: true, accent: 'bg-amber-500', tile: 'bg-amber-100 text-amber-600 dark:bg-amber-950/60 dark:text-amber-400', icon: <FlaskConical className="w-5 h-5" /> },
-  { id: 'pharmacy', label: 'Awaiting Pharmacy', statuses: ['Awaiting Pharmacy'], todayOnly: true, accent: 'bg-purple-500', tile: 'bg-purple-100 text-purple-600 dark:bg-purple-950/60 dark:text-purple-400', icon: <Pill className="w-5 h-5" /> },
-  { id: 'payment', label: 'Awaiting Payment', statuses: ['Awaiting Payment'], todayOnly: true, accent: 'bg-rose-500', tile: 'bg-rose-100 text-rose-600 dark:bg-rose-950/60 dark:text-rose-400', icon: <Wallet className="w-5 h-5" /> },
-  { id: 'admitted', label: 'Admitted / In Ward', statuses: ['Admitted'], todayOnly: false, accent: 'bg-indigo-500', tile: 'bg-indigo-100 text-indigo-600 dark:bg-indigo-950/60 dark:text-indigo-400', icon: <BedDouble className="w-5 h-5" /> },
-  { id: 'discharged', label: 'Discharged / Treated', statuses: ['Discharged', 'Treated', 'Completed'], todayOnly: true, accent: 'bg-emerald-500', tile: 'bg-emerald-100 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400', icon: <CheckCircle2 className="w-5 h-5" /> },
-];
+const SKINS: Record<string, GroupSkin> = {
+  triage: { accent: 'bg-amber-500', tile: 'bg-amber-100 text-amber-600 dark:bg-amber-950/60 dark:text-amber-400', icon: <Clock className="w-5 h-5" /> },
+  nursing: { accent: 'bg-teal-500', tile: 'bg-teal-100 text-teal-600 dark:bg-teal-950/60 dark:text-teal-400', icon: <Activity className="w-5 h-5" /> },
+  doctor: { accent: 'bg-violet-500', tile: 'bg-violet-100 text-violet-600 dark:bg-violet-950/60 dark:text-violet-300', icon: <Stethoscope className="w-5 h-5" /> },
+  consulting: { accent: 'bg-blue-500', tile: 'bg-blue-100 text-blue-600 dark:bg-blue-950/60 dark:text-blue-400', icon: <Syringe className="w-5 h-5" /> },
+  lab: { accent: 'bg-amber-500', tile: 'bg-amber-100 text-amber-600 dark:bg-amber-950/60 dark:text-amber-400', icon: <FlaskConical className="w-5 h-5" /> },
+  pharmacy: { accent: 'bg-purple-500', tile: 'bg-purple-100 text-purple-600 dark:bg-purple-950/60 dark:text-purple-400', icon: <Pill className="w-5 h-5" /> },
+  payment: { accent: 'bg-rose-500', tile: 'bg-rose-100 text-rose-600 dark:bg-rose-950/60 dark:text-rose-400', icon: <Wallet className="w-5 h-5" /> },
+  admitted: { accent: 'bg-indigo-500', tile: 'bg-indigo-100 text-indigo-600 dark:bg-indigo-950/60 dark:text-indigo-400', icon: <BedDouble className="w-5 h-5" /> },
+  discharged: { accent: 'bg-emerald-500', tile: 'bg-emerald-100 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400', icon: <CheckCircle2 className="w-5 h-5" /> },
+};
 
-const todayStr = () => new Date().toISOString().split('T')[0];
-
-/** Patient ids in a group (optionally narrowed to one ward for admitted). */
-export function getClinicalGroupPatientIds(groupId: string, ward?: string | null): Set<string> {
-  const group = CLINICAL_GROUPS.find(g => g.id === groupId);
-  const ids = new Set<string>();
-  if (!group) return ids;
-  const today = todayStr();
-  db.getVisits().forEach(v => {
-    if (!group.statuses.includes(v.status)) return;
-    if (group.todayOnly && v.visitDate !== today) return;
-    if (groupId === 'admitted' && ward && v.ward !== ward) return;
-    ids.add(v.patientId);
-  });
-  return ids;
+export interface ClinicalGroup extends ClinicalFlowGroup {
+  accent: string;
+  tile: string;
+  icon: React.ReactNode;
 }
 
-export function getClinicalGroupCounts(): Record<string, number> {
-  const out: Record<string, number> = {};
-  CLINICAL_GROUPS.forEach(g => {
-    out[g.id] = getClinicalGroupPatientIds(g.id).size;
-  });
-  return out;
-}
+/**
+ * The groups with their presentation attached.
+ *
+ * Re-exported because callers used to import this name from here, and a rename
+ * would have touched every consumer for no gain. The counting lives in
+ * `clinicalFlow.ts`; this is that list plus what it looks like.
+ */
+export const CLINICAL_GROUPS: ClinicalGroup[] = CLINICAL_FLOW_GROUPS.map(g => ({
+  ...g,
+  accent: SKINS[g.id]?.accent ?? 'bg-slate-400',
+  tile: SKINS[g.id]?.tile ?? 'bg-slate-100 text-slate-600',
+  icon: SKINS[g.id]?.icon ?? <Activity className="w-5 h-5" />,
+}));
 
-export function getAdmittedByWard(): Array<{ ward: string; count: number }> {
-  const map = new Map<string, number>();
-  db.getVisits().forEach(v => {
-    if (v.status !== 'Admitted') return;
-    // Keyed by ward CODE (what is stored); the label is resolved at render time.
-    const w = v.ward || 'UNSPECIFIED';
-    map.set(w, (map.get(w) || 0) + 1);
-  });
-  return [...map.entries()]
-    .map(([ward, count]) => ({ ward, count }))
-    .sort((a, b) => b.count - a.count);
-}
-
-interface ClinicalDashboardProps {
+export interface ClinicalDashboardProps {
   selectedGroup: string | null;
   selectedWard?: string | null;
   onSelect: (groupId: string | null, ward?: string | null) => void;
+  /**
+   * The window to count in. Omitted means this component's own choice is used.
+   *
+   * Held by the page rather than by this component so that the card numbers and
+   * the patient list underneath are computed from one window. If each kept its
+   * own, the count on a card and the names below it could disagree - and the
+   * person would have no way to tell which was right.
+   *
+   * Only the finished window crosses that boundary, never the raw from/to
+   * strings. Passing those would mean two copies of the inputs to keep in step,
+   * and the classic result is a date box showing one range beside numbers
+   * computed from another.
+   */
+  window?: DateWindow | null;
+  onWindowChange?: (window: DateWindow | null) => void;
 }
+
+const RANGE_PRESETS: Array<{ id: Exclude<DateRangeMode, 'custom'>; label: string }> = [
+  { id: 'today', label: 'Today' },
+  { id: 'week', label: 'This week' },
+  { id: 'month', label: 'This month' },
+  { id: 'year', label: 'This year' },
+  { id: 'all', label: 'All time' },
+];
 
 /**
  * Clinical command dashboard: everything in the Doctor and Nursing sections
  * (triage, nursing, doctor, consulting, lab/pharmacy/payment queues, admitted
  * by ward, discharged). Click a card to list those patients below.
+ *
+ * The date range is chosen here and applies to every flow card. The ward census
+ * is the exception, and it says so: see `clinicalFlow.ts` for why narrowing it
+ * would be dangerous.
  */
-export const ClinicalDashboard: React.FC<ClinicalDashboardProps> = ({ selectedGroup, selectedWard, onSelect }) => {
+export const ClinicalDashboard: React.FC<ClinicalDashboardProps> = ({
+  selectedGroup,
+  selectedWard,
+  onSelect,
+  window,
+  onWindowChange,
+}) => {
   useSyncDb();
-  const counts = getClinicalGroupCounts();
-  const wards = getAdmittedByWard();
-  const flowTotal = CLINICAL_GROUPS.filter(g => g.todayOnly).reduce((s, g) => s + (counts[g.id] || 0), 0);
-  const todayLabel = new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+
+  // The date inputs live here and only here. The page receives the finished
+  // window so that its patient list counts the same way the cards do, and does
+  // not keep its own copy of what was typed.
+  const [mode, setMode] = useState<DateRangeMode>('today');
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+
+  const built = useMemo(
+    () => buildWindow({ mode, from, to }),
+    [mode, from, to],
+  );
+  const { window: ownWindow, error } = built;
+
+  // A parent holding a window is authoritative; otherwise this component's own.
+  const win = window !== undefined ? window : ownWindow;
+
+  // Report upwards only when this component is the one that chose, or the page
+  // can never learn the range.
+  const report = (next: DateWindow | null) => { if (onWindowChange) onWindowChange(next); };
+
+  const choosePreset = (preset: Exclude<DateRangeMode, 'custom'>) => {
+    setMode(preset);
+    setFrom('');
+    setTo('');
+    report(buildWindow({ mode: preset }).window);
+  };
+
+  const setCustom = (nextFrom: string, nextTo: string) => {
+    setMode('custom');
+    setFrom(nextFrom);
+    setTo(nextTo);
+    // Reported from the built result, so an unfinished range reports an error
+    // rather than a window that quietly covers something else.
+    report(buildWindow({ mode: 'custom', from: nextFrom, to: nextTo }).window);
+  };
+
+  // One pass over the encounters, so every card on the screen agrees about what
+  // is in range. `db.getVisits()` is read once for the same reason.
+  const { counts, wards, flowTotal, unreadable } = useMemo<{
+    counts: Record<string, number>;
+    wards: Array<{ ward: string; count: number }>;
+    flowTotal: number;
+    unreadable: number;
+  }>(() => {
+    const visits = db.getVisits();
+    const c = clinicalGroupCounts(visits, win);
+    return {
+      counts: c,
+      wards: admittedByWard(visits),
+      // Built from `c`, not from a name being defined in this same object.
+      flowTotal: RANGED_FLOW_GROUPS.reduce((s, g) => s + (c[g.id] || 0), 0),
+      unreadable: countUnreadableVisitDates(visits),
+    };
+  }, [win]);
+
+  /*
+   * Keyed on the chosen `mode`, not on the window.
+   *
+   * "All time" builds to a NULL window - no restriction at all - so testing the
+   * window for "is this today?" answers yes for All time, and the screen said
+   * "Encounters dated today" with "Today's flow" under every card while counting
+   * every encounter ever saved. That is precisely the caption-over-all-time-numbers
+   * mistake `dateRange.ts` was written to stop, reintroduced through the back door
+   * by treating "no window" as "a window for one day".
+   */
+  const showingToday = mode === 'today';
+  const showingAllTime = mode === 'all';
+  const wardCensusIgnoresRange = !showingToday && !showingAllTime;
 
   return (
     <div className="rounded-3xl bg-white dark:bg-dark-card border border-light-border dark:border-dark-border shadow-sm p-5 md:p-6 space-y-5 flex-shrink-0">
@@ -107,7 +207,7 @@ export const ClinicalDashboard: React.FC<ClinicalDashboardProps> = ({ selectedGr
               Clinical Dashboard
             </h3>
             <p className="text-[11px] text-slate-500 dark:text-slate-400">
-              Doctor & Nursing flow • {todayLabel}
+              Doctor &amp; Nursing flow • {describeWindow(win)}
             </p>
           </div>
         </div>
@@ -117,7 +217,7 @@ export const ClinicalDashboard: React.FC<ClinicalDashboardProps> = ({ selectedGr
             <span>LIVE</span>
           </span>
           <span className="px-3 py-1.5 rounded-full bg-slate-100 dark:bg-dark-surface border border-light-border dark:border-dark-border text-[11px] font-extrabold text-slate-700 dark:text-slate-200">
-            {flowTotal} in flow today{counts.admitted > 0 ? ` • ${counts.admitted} admitted` : ''}
+            {flowTotal} in flow{counts.admitted > 0 ? ` • ${counts.admitted} admitted` : ''}
           </span>
           {selectedGroup && (
             <button
@@ -130,10 +230,118 @@ export const ClinicalDashboard: React.FC<ClinicalDashboardProps> = ({ selectedGr
         </div>
       </div>
 
+      {/* The date range. Every flow card above and the patient list below are
+          filtered by it, which is why the chosen range is named in the header
+          rather than left as a caption. */}
+      <div className="rounded-2xl bg-slate-50/70 dark:bg-dark-surface/40 border border-light-border dark:border-dark-border px-3 py-2.5 space-y-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400 px-1 flex items-center gap-1.5">
+            <CalendarRange className="w-3.5 h-3.5" />
+            Encounter dates • {describeWindow(win)}
+          </span>
+
+          <div className="flex items-center space-x-1 bg-slate-100 dark:bg-dark-surface p-1 rounded-xl text-xs font-bold overflow-x-auto">
+            {RANGE_PRESETS.map(preset => (
+              <button
+                key={preset.id}
+                onClick={() => choosePreset(preset.id)}
+                aria-pressed={mode === preset.id}
+                className={`px-3 py-1.5 rounded-xl whitespace-nowrap transition-all ${
+                  mode === preset.id
+                    ? 'bg-emerald-600 text-white shadow-sm'
+                    : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+                }`}
+              >
+                {preset.label}
+              </button>
+            ))}
+            <button
+              onClick={() => { setMode('custom'); setFrom(''); setTo(''); report(null); }}
+              aria-pressed={mode === 'custom'}
+              className={`px-3 py-1.5 rounded-xl whitespace-nowrap transition-all ${
+                mode === 'custom'
+                  ? 'bg-emerald-600 text-white shadow-sm'
+                  : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+              }`}
+            >
+              Pick dates
+            </button>
+          </div>
+        </div>
+
+        {/* Keyed on the chosen mode, not on `win`: an unfinished custom range
+            builds to a null window, and keying on the window would make the date
+            boxes vanish the moment a person cleared one of them. */}
+        {mode === 'custom' && (
+          <div className="flex flex-wrap items-end gap-2 px-1 pb-0.5">
+            <label className="flex flex-col gap-0.5">
+              <span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">From</span>
+              <input
+                type="date"
+                value={from}
+                max={to || undefined}
+                onChange={e => setCustom(e.target.value, to)}
+                className="px-2 py-1.5 text-[11px] rounded-lg border border-light-border dark:border-dark-border bg-white dark:bg-dark-card text-slate-700 dark:text-slate-200"
+              />
+            </label>
+            <label className="flex flex-col gap-0.5">
+              <span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">To</span>
+              <input
+                type="date"
+                value={to}
+                min={from || undefined}
+                onChange={e => setCustom(from, e.target.value)}
+                className="px-2 py-1.5 text-[11px] rounded-lg border border-light-border dark:border-dark-border bg-white dark:bg-dark-card text-slate-700 dark:text-slate-200"
+              />
+            </label>
+            {(from || to) && (
+              <button
+                onClick={() => setCustom('', '')}
+                className="px-2.5 py-1.5 text-[11px] font-bold text-slate-500 hover:text-slate-700 dark:hover:text-slate-200 rounded-lg border border-light-border dark:border-dark-border"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
+
+        {error && (
+          <p className="text-[11px] font-semibold text-amber-700 dark:text-amber-400 px-1">{error}</p>
+        )}
+
+        {/* The three things a person would otherwise have to guess. Each is stated
+            on the screen rather than in a comment, because each changes what the
+            numbers mean. */}
+        <div className="space-y-1 px-1">
+          <p className="text-[10px] text-slate-500 dark:text-slate-400">
+            {showingAllTime
+              ? 'No date restriction: every encounter, on any date.'
+              : `Encounters dated ${describeWindow(win)}.`}
+            {wardCensusIgnoresRange && ' Ward census below is NOT limited by this range — it shows everyone in a ward now, on any date.'}
+            {' '}
+            {unreadable > 0
+              ? `${unreadable} encounter(s) have a date that could not be read and are counted in none of these totals.`
+              : 'Every encounter has a readable date.'}
+          </p>
+          <p className="text-[10px] text-slate-400 dark:text-slate-500">
+            A status is where an encounter is now, not a record of where it has been, so a
+            wider range counts encounters that have stayed in that state since — not patients
+            who passed through it.
+          </p>
+        </div>
+      </div>
+
       {/* Flow cards */}
       <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-3">
         {CLINICAL_GROUPS.map(g => {
-          const active = selectedGroup === g.id && (g.id !== 'admitted' || !selectedWard);
+          const active = selectedGroup === g.id && (g.id !== WARD_CENSUS_GROUP_ID || !selectedWard);
+          const caption = g.id === WARD_CENSUS_GROUP_ID
+            ? 'In a ward now'
+            : showingToday
+              ? "Today's flow"
+              : showingAllTime
+                ? 'Any date'
+                : 'Dated in range';
           return (
             <button
               key={g.id}
@@ -155,7 +363,7 @@ export const ClinicalDashboard: React.FC<ClinicalDashboardProps> = ({ selectedGr
               </div>
               <div className="text-[13px] font-extrabold mt-2.5 pl-1.5 text-slate-800 dark:text-slate-100">{g.label}</div>
               <div className="text-[10px] font-semibold text-slate-400 dark:text-slate-500 pl-1.5 mt-0.5">
-                {g.todayOnly ? "Today's flow" : 'Currently in ward'}
+                {caption}
               </div>
             </button>
           );
@@ -170,14 +378,19 @@ export const ClinicalDashboard: React.FC<ClinicalDashboardProps> = ({ selectedGr
             <span className="text-[11px] font-extrabold uppercase tracking-wider text-indigo-700 dark:text-indigo-300">
               Patients in ward by ward
             </span>
+            {wardCensusIgnoresRange && (
+              <span className="px-2 py-0.5 rounded-full bg-indigo-100 dark:bg-indigo-950 text-[10px] font-bold text-indigo-700 dark:text-indigo-300">
+                all dates
+              </span>
+            )}
           </div>
           <div className="flex flex-wrap gap-2">
-            {wards.map(w => {
-              const active = selectedGroup === 'admitted' && selectedWard === w.ward;
+            {wards.map((w: { ward: string; count: number }) => {
+              const active = selectedGroup === WARD_CENSUS_GROUP_ID && selectedWard === w.ward;
               return (
                 <button
                   key={w.ward}
-                  onClick={() => onSelect(active ? null : 'admitted', active ? null : w.ward)}
+                  onClick={() => onSelect(active ? null : WARD_CENSUS_GROUP_ID, active ? null : w.ward)}
                   className={`flex items-center space-x-2 px-3.5 py-2 rounded-xl text-xs font-bold border transition-all hover:-translate-y-0.5 ${
                     active
                       ? 'bg-indigo-600 text-white border-indigo-600 shadow-md'
