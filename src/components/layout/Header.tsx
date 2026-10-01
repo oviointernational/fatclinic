@@ -11,7 +11,9 @@ import {
   LogIn, 
   Sparkles,
   ShieldAlert,
-  CalendarPlus
+  CalendarPlus,
+  PanelLeft,
+  X
 } from 'lucide-react';
 import { db } from '../../services/db';
 import { getSupabase, isSupabaseConfigured } from '../../services/supabase';
@@ -175,13 +177,18 @@ interface HeaderProps {
   onOpenSignInModal: () => void;
   onOpenAuditLogs: () => void;
   onNavigateHome: () => void;
+  /** Phone only. True while the menu and submenu are showing as a drawer. */
+  isMobileNavOpen?: boolean;
+  onToggleMobileNav?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   onSelectPatient,
   onOpenSignInModal,
   onOpenAuditLogs,
-  onNavigateHome
+  onNavigateHome,
+  isMobileNavOpen,
+  onToggleMobileNav
 }) => {
   const { isAuthenticated, putToSleep, signOut } = useAuth();
   const currentUser = useCurrentUser();
@@ -216,15 +223,36 @@ export const Header: React.FC<HeaderProps> = ({
   };
 
   return (
-    <header className="w-full h-14 px-4 sm:px-6 flex items-center justify-between select-text bg-light-bg dark:bg-dark-bg text-light-text dark:text-dark-text transition-colors duration-200">
-      {/* Upper Left: Finely Crafted Name */}
-      <div className="flex items-center space-x-3 cursor-pointer group" onClick={onNavigateHome}>
-        <div className="w-10 h-10 rounded-full bg-gradient-to-tr from-emerald-600 via-teal-500 to-emerald-400 flex items-center justify-center text-white shadow-md group-hover:scale-105 transition-transform">
-          <Activity className="w-5 h-5 text-white animate-pulse" />
+    <header className="w-full h-14 px-2 sm:px-6 flex items-center justify-between select-text bg-light-bg dark:bg-dark-bg text-light-text dark:text-dark-text transition-colors duration-200 flex-shrink-0">
+      {/* Upper Left: the drawer toggle and the clinic name.
+          The toggle is phone-only: on a desk the menu is always on screen, so a
+          control that hides it would have nothing to restore it with. It sits
+          BEFORE the name, as asked, and it is a real button with a label rather
+          than an unlabelled glyph, because a person who cannot name the control
+          will not use it. */}
+      <div className="flex items-center space-x-2 sm:space-x-3 cursor-pointer group" onClick={onNavigateHome}>
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onToggleMobileNav?.(); }}
+          aria-label={isMobileNavOpen ? 'Hide the menu' : 'Show the menu'}
+          aria-expanded={!!isMobileNavOpen}
+          aria-controls="fatclinic-nav-drawer"
+          className="md:hidden w-9 h-9 flex-shrink-0 rounded-xl border border-light-border dark:border-dark-border bg-white dark:bg-dark-card text-slate-600 dark:text-slate-300 flex items-center justify-center active:scale-95 transition-transform"
+        >
+          {isMobileNavOpen ? <X className="w-4 h-4" /> : <PanelLeft className="w-4 h-4" />}
+        </button>
+
+        <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-gradient-to-tr from-emerald-600 via-teal-500 to-emerald-400 flex items-center justify-center text-white shadow-md group-hover:scale-105 transition-transform flex-shrink-0">
+          <Activity className="w-4 h-4 sm:w-5 sm:h-5 text-white animate-pulse" />
         </div>
-        <div className="flex flex-col leading-tight">
-          <span className="text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white font-sans">
-            Solace Medicare <span className="text-emerald-500">Consult</span>
+        <div className="flex flex-col leading-tight min-w-0">
+          {/* The full name needs about 240px. A 360px phone cannot hold that, the
+              search field and the avatar at once, so it becomes an abbreviation
+              rather than wrapping to two lines and pushing the header taller than
+              the drawer expects. */}
+          <span className="text-lg sm:text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white font-sans truncate">
+            <span className="sm:hidden">SMC</span>
+            <span className="hidden sm:inline">Solace Medicare <span className="text-emerald-500">Consult</span></span>
           </span>
           <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 hidden sm:inline">
             Precision Clinical & Hospital Information System

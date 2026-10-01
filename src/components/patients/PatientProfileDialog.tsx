@@ -3,6 +3,7 @@ import { Patient, Visit, Vitals, Consultation, LabRequest, Prescription, Invoice
 import { db } from '../../services/db';
 import { pdfService } from '../../services/pdfService';
 import { isFinalReport, reportedStatus } from '../../services/labResults';
+import { useAccess } from '../../hooks/useAccess';
 import { 
   X, 
   Download, 
@@ -37,6 +38,13 @@ export const PatientProfileDialog: React.FC<PatientProfileDialogProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<ProfileTab>('overview');
   const [selectedVisitId, setSelectedVisitId] = useState<string>('');
+
+  // Money on a patient's chart is the account, and the account is limited to the
+  // roles that handle it. `maySeeBilling` and `showMoney` are the same question
+  // asked twice - once for a whole tab, once for a figure inside a tab that is
+  // otherwise clinical - so there is one answer and it is asked in both places.
+  const maySeeBilling = useAccess().canSeeRevenue();
+  const showMoney = maySeeBilling;
 
   // keep hooks unconditional — sync selected visit when patient changes
   React.useEffect(() => {
@@ -76,7 +84,11 @@ export const PatientProfileDialog: React.FC<PatientProfileDialogProps> = ({
     { id: 'lab', label: 'Laboratory', icon: <FlaskConical className="w-5 h-5" /> },
     { id: 'pharmacy', label: 'Pharmacy', icon: <Pill className="w-5 h-5" /> },
     { id: 'nursing', label: 'Nursing', icon: <Stethoscope className="w-5 h-5" /> },
-    { id: 'billing', label: 'Billing', icon: <Receipt className="w-5 h-5" /> },
+    // What a patient owes is the account, and the account belongs to the roles
+    // that handle money. A clinician reading a patient's chart has no reason to
+    // see the balance, so the tab is not offered to them at all - not offered and
+    // then refused on click, which would be a dead button in a clinical workflow.
+    ...(maySeeBilling ? [{ id: 'billing' as ProfileTab, label: 'Billing', icon: <Receipt className="w-5 h-5" /> }] : []),
     { id: 'documents', label: 'Documents', icon: <FileText className="w-5 h-5" /> }
   ];
 
@@ -565,9 +577,11 @@ export const PatientProfileDialog: React.FC<PatientProfileDialogProps> = ({
                               }`}>
                                 {item.dispenseStatus} ({item.quantityDispensed}/{item.quantityPrescribed})
                               </span>
-                              <div className="text-[11px] font-bold text-slate-700 dark:text-slate-300 mt-1">
-                                {settings.currency}{item.totalPrice.toLocaleString()}
-                              </div>
+                              {showMoney && (
+                                <div className="text-[11px] font-bold text-slate-700 dark:text-slate-300 mt-1">
+                                  {settings.currency}{item.totalPrice.toLocaleString()}
+                                </div>
+                              )}
                             </div>
                           </div>
                         ))}

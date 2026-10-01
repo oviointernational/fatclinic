@@ -1,4 +1,8 @@
-import { CustomRole, User, UserRole } from '../types';
+// `import type`, not a plain import: these are erased at build time, and saying so
+// keeps the module loadable by a plain Node script. Node strips types but does not
+// know a named import was only ever a type, so a plain import of an interface
+// fails at link time and makes this module untestable outside the bundler.
+import type { CustomRole, User, UserRole } from '../types';
 
 export interface PermissionNode {
   key: string;
@@ -156,6 +160,19 @@ export const PERMISSION_TREE: PermissionNode[] = [
     ],
   },
   {
+    // Added with the navigation gate. The tree had no AI node at all, which is
+    // precisely why every role could see the AI Assistant menu: with no
+    // permission to test, there was nothing to refuse. Clinical roles are granted
+    // it below; Front Desk and Billing Officer are not, because neither is a
+    // clinician and the tool asks for clinical records.
+    key: 'AI', label: 'Clinical AI Assistant',
+    children: [
+      { key: 'AI.QUERY', label: 'Natural language query' },
+      { key: 'AI.SUMMARIZE', label: 'Patient summarizer' },
+      { key: 'AI.SAFEGUARDS', label: 'Clinical AI safeguards' },
+    ],
+  },
+  {
     key: 'ADMIN', label: 'Administration',
     children: [
       {
@@ -300,21 +317,39 @@ export function totalPermissionCount(): number {
 
 // ---------- evaluation ----------
 
+/**
+ * The grants an Administrator holds, in one place.
+ *
+ * It was written out twice - once here as `BASE_ROLE_PERMISSIONS.ADMINISTRATOR`
+ * and again inside `effectivePermissions`, which returned it directly and
+ * ignoring the table. Two copies of an administrator's access is one too many:
+ * a new top-level permission has to be added in both places or an administrator
+ * silently loses it. `effectivePermissions` now reads this constant.
+ */
+export const ADMINISTRATOR_PERMISSIONS: string[] = [
+  'DASHBOARD', 'PATIENTS', 'CLINICAL', 'LABORATORY', 'PHARMACY', 'RADIOLOGY',
+  'PHYSIOTHERAPY', 'BILLING', 'AI', 'ADMIN',
+];
+
 /** Default grants per base role (used when a user has no custom role assigned). */
 export const BASE_ROLE_PERMISSIONS: Record<UserRole, string[]> = {
-  ADMINISTRATOR: ['DASHBOARD', 'PATIENTS', 'CLINICAL', 'LABORATORY', 'PHARMACY', 'RADIOLOGY', 'PHYSIOTHERAPY', 'BILLING', 'ADMIN'],
-  PHYSICIAN: ['DASHBOARD.VIEW', 'PATIENTS.VIEW', 'CLINICAL.PHYSICIAN', 'CLINICAL.ALERTS.VIEW', 'BILLING.INVOICES'],
-  NURSE: ['DASHBOARD.VIEW', 'PATIENTS.VIEW', 'CLINICAL.NURSING', 'CLINICAL.ALERTS.VIEW'],
-  LAB_SCIENTIST: ['DASHBOARD.VIEW', 'CLINICAL.ALERTS.VIEW', 'LABORATORY.HEMATOLOGY', 'LABORATORY.MICROBIOLOGY', 'LABORATORY.CHEMICAL_PATHOLOGY', 'LABORATORY.HISTOPATHOLOGY', 'LABORATORY.MOLECULAR', 'LABORATORY.INVENTORY.VIEW'],
-  PHARMACIST: ['DASHBOARD.VIEW', 'PHARMACY', 'CLINICAL.ALERTS.VIEW'],
-  RADIOLOGIST: ['DASHBOARD.VIEW', 'RADIOLOGY', 'CLINICAL.ALERTS.VIEW'],
-  PHYSIOTHERAPIST: ['DASHBOARD.VIEW', 'PHYSIOTHERAPY', 'CLINICAL.ALERTS.VIEW'],
+  ADMINISTRATOR: ADMINISTRATOR_PERMISSIONS,
+  // A doctor holds BILLING.INVOICES so that invoice numbers on their own orders
+  // resolve, and CLINICAL.ALERTS.VIEW to see released results. They are still
+  // refused every revenue figure and every cashier screen: `canSeeRevenue` is a
+  // question about the role, not about this list.
+  PHYSICIAN: ['DASHBOARD.VIEW', 'PATIENTS.VIEW', 'CLINICAL.PHYSICIAN', 'CLINICAL.ALERTS.VIEW', 'BILLING.INVOICES', 'AI'],
+  NURSE: ['DASHBOARD.VIEW', 'PATIENTS.VIEW', 'CLINICAL.NURSING', 'CLINICAL.ALERTS.VIEW', 'AI'],
+  LAB_SCIENTIST: ['DASHBOARD.VIEW', 'CLINICAL.ALERTS.VIEW', 'LABORATORY.HEMATOLOGY', 'LABORATORY.MICROBIOLOGY', 'LABORATORY.CHEMICAL_PATHOLOGY', 'LABORATORY.HISTOPATHOLOGY', 'LABORATORY.MOLECULAR', 'LABORATORY.INVENTORY.VIEW', 'AI'],
+  PHARMACIST: ['DASHBOARD.VIEW', 'PHARMACY', 'CLINICAL.ALERTS.VIEW', 'AI'],
+  RADIOLOGIST: ['DASHBOARD.VIEW', 'RADIOLOGY', 'CLINICAL.ALERTS.VIEW', 'AI'],
+  PHYSIOTHERAPIST: ['DASHBOARD.VIEW', 'PHYSIOTHERAPY', 'CLINICAL.ALERTS.VIEW', 'AI'],
   FRONT_DESK: ['DASHBOARD.VIEW', 'PATIENTS.VIEW', 'PATIENTS.REGISTER', 'PATIENTS.EDIT', 'PATIENTS.BOOKINGS', 'BILLING'],
   BILLING_OFFICER: ['DASHBOARD.VIEW', 'PATIENTS.VIEW', 'BILLING', 'BILLING.PRICE_SCHEDULE'],
 };
 
 export function effectivePermissions(user: User, customRole?: CustomRole): string[] {
-  if (user.role === 'ADMINISTRATOR') return ['DASHBOARD', 'PATIENTS', 'CLINICAL', 'LABORATORY', 'PHARMACY', 'RADIOLOGY', 'PHYSIOTHERAPY', 'BILLING', 'ADMIN'];
+  if (user.role === 'ADMINISTRATOR') return ADMINISTRATOR_PERMISSIONS;
   if (customRole) return customRole.permissions;
   return BASE_ROLE_PERMISSIONS[user.role] || [];
 }

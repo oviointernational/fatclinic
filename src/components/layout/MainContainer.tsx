@@ -25,7 +25,8 @@ import { SectionConsumablesPanel } from '../common/SectionConsumablesPanel';
 import { ClinicalDashboardPage } from '../clinical/ClinicalDashboardPage';
 import { RadiologyOverview } from '../radiology/RadiologyOverview';
 import { PhysiotherapyOverview } from '../physiotherapy/PhysiotherapyOverview';
-import { Maximize2, Minimize2, User, Clock } from 'lucide-react';
+import { Maximize2, Minimize2, User, Clock, ShieldAlert } from 'lucide-react';
+import { useAccess } from '../../hooks/useAccess';
 
 interface MainContainerProps {
   activeNav: MainNavId;
@@ -62,6 +63,7 @@ export const MainContainer: React.FC<MainContainerProps> = ({
   isWideMode = false,
   onToggleWideMode
 }) => {
+  const access = useAccess();
   // NOTE: no auto-selected patient — Physician/Nurse queue views show the
   // filtered patient list first; details open only after a patient is clicked.
 
@@ -135,7 +137,31 @@ export const MainContainer: React.FC<MainContainerProps> = ({
     );
   }
 
-  const renderContent = () => {
+  /**
+ * The last line of defence, and the only one that covers a path nobody has
+ * written yet.
+ *
+ * The menu is filtered and `goTo` refuses a destination this person may not open,
+ * so in normal use this never fires. It exists because those two checks protect
+ * against a person choosing the wrong thing; this protects against the code
+ * choosing the wrong thing. A screen reached by a route that has not been
+ * thought about - a future deep link, a stale tab, a new call site of
+ * `onNavigate` - renders nothing and says why, rather than putting a department's
+ * data in front of somebody who has no business seeing it.
+ */
+const AccessDenied: React.FC<{ nav: MainNavId; sub: SubNavId; reason: string }> = ({ reason }) => (
+  <div className="h-full flex flex-col items-center justify-center text-center px-6 gap-2">
+    <ShieldAlert className="w-9 h-9 text-amber-500" />
+    <p className="text-sm font-extrabold text-slate-700 dark:text-slate-200">This screen is not available to you</p>
+    <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md leading-relaxed">{reason}</p>
+  </div>
+);
+
+const renderContent = () => {
+    if (!access.canOpenMainNav(activeNav) || !access.canOpenSubNav(activeNav, activeSubNav)) {
+      return <AccessDenied nav={activeNav} sub={activeSubNav} reason={access.deniedReason(activeNav, activeSubNav)} />;
+    }
+
     switch (activeNav) {
       case 'dashboard':
         if (activeSubNav === 'analytics') {
@@ -151,7 +177,7 @@ export const MainContainer: React.FC<MainContainerProps> = ({
               onNavigatePharmacy={() => onNavigate('pharmacy', 'rx_queue')}
               onNavigateRadiology={() => onNavigate('radiology', 'radiology_all')}
               onNavigatePhysiotherapy={() => onNavigate('physiotherapy', 'physio_all')}
-              onNavigateBilling={() => onNavigate('patients', 'central_billing')}
+              onNavigateBilling={() => onNavigate('billing', 'all_invoices')}
               onOpenClinicalGroup={handleOpenClinicalGroup}
               onSelectPatient={(p) => {
                 onSelectPatient(p);
@@ -170,7 +196,7 @@ export const MainContainer: React.FC<MainContainerProps> = ({
               onNavigatePharmacy={() => onNavigate('pharmacy', 'rx_queue')}
               onNavigateRadiology={() => onNavigate('radiology', 'radiology_all')}
               onNavigatePhysiotherapy={() => onNavigate('physiotherapy', 'physio_all')}
-              onNavigateBilling={() => onNavigate('patients', 'central_billing')}
+              onNavigateBilling={() => onNavigate('billing', 'all_invoices')}
               onOpenClinicalGroup={handleOpenClinicalGroup}
               onSelectPatient={(p) => {
                 onSelectPatient(p);
@@ -187,7 +213,7 @@ export const MainContainer: React.FC<MainContainerProps> = ({
             onNavigatePharmacy={() => onNavigate('pharmacy', 'rx_queue')}
             onNavigateRadiology={() => onNavigate('radiology', 'radiology_all')}
             onNavigatePhysiotherapy={() => onNavigate('physiotherapy', 'physio_all')}
-            onNavigateBilling={() => onNavigate('patients', 'central_billing')}
+            onNavigateBilling={() => onNavigate('billing', 'all_invoices')}
             onOpenClinicalGroup={handleOpenClinicalGroup}
             onSelectPatient={(p) => {
               onSelectPatient(p);
@@ -444,7 +470,7 @@ export const MainContainer: React.FC<MainContainerProps> = ({
             onNavigatePharmacy={() => onNavigate('pharmacy', 'rx_queue')}
             onNavigateRadiology={() => onNavigate('radiology', 'radiology_all')}
             onNavigatePhysiotherapy={() => onNavigate('physiotherapy', 'physio_all')}
-            onNavigateBilling={() => onNavigate('patients', 'central_billing')}
+            onNavigateBilling={() => onNavigate('billing', 'all_invoices')}
             onOpenClinicalGroup={handleOpenClinicalGroup}
             onSelectPatient={onOpenPatientProfile}
           />

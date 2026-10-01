@@ -14,7 +14,8 @@ import { Patient, Visit } from './types';
 import { db } from './services/db';
 import { hasResetLink } from './services/passwordReset';
 import { useAuth } from './context/AuthContext';
-import { LogIn } from 'lucide-react';
+import { useAccess } from './hooks/useAccess';
+import { LogIn, ShieldAlert } from 'lucide-react';
 
 export const App: React.FC = () => {
   // Navigation State
@@ -32,12 +33,55 @@ export const App: React.FC = () => {
   const [isRegistrationOpen, setIsRegistrationOpen] = useState<boolean>(false);
   const [isPasswordResetOpen, setIsPasswordResetOpen] = useState<boolean>(false);
 
+  // Mobile navigation drawer. False means the menu and submenu are off screen and
+  // the workspace has the whole display, which is the default: on a phone, two
+  // columns of navigation leave the content unreadable.
+  const [isMobileNavOpen, setIsMobileNavOpen] = useState<boolean>(false);
+
   // Read once, at mount. A reset link arrives in the URL fragment and the
   // fragment is cleared the moment the new password is accepted, so this has to
   // be a snapshot rather than a value recomputed on every render.
   const [arrivedByResetLink] = useState<boolean>(() => hasResetLink());
 
   const { isAuthenticated, isResolvingSession, currentUser, signOut } = useAuth();
+  const access = useAccess();
+
+  // Why the last navigation was refused, shown once at the top of the workspace.
+  // A refusal that lands somewhere silently reads as a broken application; a
+  // refusal that says "that is not part of your role" reads as the system working.
+  const [routeNotice, setRouteNotice] = useState<string | null>(null);
+
+  /**
+   * The only way to change where the application is looking.
+   *
+   * Every navigation goes through here - the menu, a button on another screen,
+   * `onNavigate` passed into a dashboard. Each is asked whether the destination is
+   * one this person may open, and if not, the person is moved to the first thing
+   * they may see and told why. Not rendering a menu item is not enough on its
+   * own, because `onNavigate` can be called by any screen at any time.
+   */
+  const goTo = (navId: MainNavId, subNavId: SubNavId) => {
+    const decision = access.resolveRoute(navId, subNavId);
+
+    if (!decision.nav || !decision.sub) {
+      setRouteNotice(
+        'This account has no screens assigned to it. An administrator can grant access under Administration → Roles & Permissions.',
+      );
+      return;
+    }
+
+    setRouteNotice(decision.refused);
+    setActiveNav(decision.nav);
+    setActiveSubNav(decision.sub);
+    setIsViewingVisitTabs(false);
+
+    // Entering the Physician/Nurse workspace shows the patient list first rather
+    // than whatever was open, so a stale selection is never acted on by mistake.
+    if (decision.nav === 'clinical') {
+      setSelectedPatient(null);
+      setSelectedVisit(null);
+    }
+  };
 
   // Audit Log Modal State
   const [auditLogModalOpen, setAuditLogModalOpen] = useState<boolean>(false);
@@ -46,35 +90,19 @@ export const App: React.FC = () => {
 
   // When clicking a main navigation item in Sidebar 1
   const handleSelectNav = (navId: MainNavId) => {
-    setActiveNav(navId);
-    setIsViewingVisitTabs(false);
-    // Entering Physician/Nurse workspace: show the patient list first
-    if (navId === 'clinical') {
-      setSelectedPatient(null);
-      setSelectedVisit(null);
-    }
-
-    // Set sensible default sub-navigation
-    switch (navId) {
-      case 'dashboard': setActiveSubNav('overview'); break;
-      case 'patients': setActiveSubNav('all_patients'); break;
-      case 'clinical': setActiveSubNav('consultations'); break;
-      case 'laboratory': setActiveSubNav('lab_all'); break;
-      case 'pharmacy': setActiveSubNav('rx_queue'); break;
-      case 'radiology': setActiveSubNav('radiology_all'); break;
-      case 'physiotherapy': setActiveSubNav('physio_all'); break;
-      case 'billing': setActiveSubNav('all_invoices'); break;
-      case 'analytics': setActiveSubNav('patient_stats'); break;
-      case 'ai': setActiveSubNav('nl_query'); break;
-      case 'admin': setActiveSubNav('users_mgmt'); break;
-      default: setActiveSubNav('overview');
-    }
+    // Entering a department lands on the first screen in it this person may open,
+    // not on a hard-coded default that may not be theirs.
+    const first = access.permittedSubNavs(navId)[0]?.id ?? '';
+    goTo(navId, first);
   };
 
   // When clicking a sub-navigation item in Sidebar 2
   const handleSelectSubNav = (subNavId: SubNavId) => {
-    setActiveSubNav(subNavId);
-    setIsViewingVisitTabs(false);
+    // Picking a screen on a phone finishes the journey: the drawer closes so the
+    // content the person chose is actually visible.
+    setIsMobileNavOpen(false);
+    goTo(activeNav, subNavId);
+
     // Entering a Physician/Nurse queue (All / Awaiting / Consulted / Incoming):
     // clear selection so the filtered patient list shows first
     if (
@@ -218,32 +246,70 @@ export const App: React.FC = () => {
       
       {/* Seamless Header - identical color to body, NO border or elevation */}
       <Header
-        onNavigateHome={() => handleSelectNav('dashboard')}
+        onNavigateHome={() => goTo('dashboard', 'overview')}
         onOpenSignInModal={() => setIsAuthModalOpen(true)}
         onOpenAuditLogs={() => handleOpenAuditLog()}
         onSelectPatient={(patient) => {
           setSelectedPatient(patient);
           handleOpenPatientProfile(patient);
         }}
+        isMobileNavOpen={isMobileNavOpen}
+        onToggleMobileNav={() => setIsMobileNavOpen(prev => !prev)}
       />
+
+      {/* Why the last navigation was refused. Dismissible, and never left over a
+          screen the person did choose. */}
+      {routeNotice && (
+        <div className="flex items-start gap-2 px-4 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-900 text-[11px] text-amber-800 dark:text-amber-300 flex-shrink-0">
+          <ShieldAlert className="w-4 h-4 flex-shrink-0 mt-px" />
+          <span className="flex-1">{routeNotice}</span>
+          <button
+            onClick={() => setRouteNotice(null)}
+            className="font-bold underline flex-shrink-0"
+            aria-label="Dismiss"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Workstation Workspace (Normal 10% - 20% - 70% or Broad View 100%) */}
       <div className="flex-1 flex overflow-hidden">
-        
-        {/* Sidebar 1 & 2 (Hidden in Wide/Broad View) */}
-        {!isWideMode && (
-          <>
+
+        {/* Tapping outside the drawer closes it. Below the header only, so the
+            header's own toggle stays reachable. */}
+        {isMobileNavOpen && (
+          <div
+            className="fixed inset-x-0 bottom-0 top-14 z-30 bg-slate-900/50 md:hidden"
+            onClick={() => setIsMobileNavOpen(false)}
+          />
+        )}
+
+        {/* The menu and submenu are one drawer on a phone and two columns on a
+            desk. `md:` is where the layout changes, so a phone gets the whole
+            workspace by default and the drawer slides over it. */}
+        {(!isWideMode || isMobileNavOpen) && (
+          <div
+            id="fatclinic-nav-drawer"
+            className={`${
+              isMobileNavOpen
+                ? 'fixed top-14 bottom-0 left-0 z-40 flex shadow-2xl'
+                : 'hidden md:flex'
+            } flex-shrink-0`}
+          >
             <Sidebar1
               activeNav={activeNav}
               onSelectNav={handleSelectNav}
+              asDrawer={isMobileNavOpen}
             />
 
             <Sidebar2
               activeNav={activeNav}
               activeSubNav={activeSubNav}
               onSelectSubNav={handleSelectSubNav}
+              asDrawer={isMobileNavOpen}
             />
-          </>
+          </div>
         )}
 
         {/* Main Container */}
@@ -260,15 +326,7 @@ export const App: React.FC = () => {
           isViewingVisitTabs={isViewingVisitTabs}
           onOpenAuditLog={handleOpenAuditLog}
           onOpenRegistration={() => setIsRegistrationOpen(true)}
-          onNavigate={(nav, sub) => {
-            setActiveNav(nav);
-            setActiveSubNav(sub);
-            setIsViewingVisitTabs(false);
-            if (nav === 'clinical') {
-              setSelectedPatient(null);
-              setSelectedVisit(null);
-            }
-          }}
+          onNavigate={(nav, sub) => goTo(nav, sub)}
           isWideMode={isWideMode}
           onToggleWideMode={() => setIsWideMode(prev => !prev)}
         />

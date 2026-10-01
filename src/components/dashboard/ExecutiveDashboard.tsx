@@ -13,9 +13,11 @@ import {
   HeartPulse,
   Receipt,
   Clock,
-  ArrowUpRight
+  ArrowUpRight,
+  CheckCircle2
 } from 'lucide-react';
 import { ClinicalDashboard } from '../clinical/ClinicalDashboard';
+import { useAccess } from '../../hooks/useAccess';
 
 interface ExecutiveDashboardProps {
   onNavigatePatients: () => void;
@@ -42,6 +44,8 @@ export const ExecutiveDashboard: React.FC<ExecutiveDashboardProps> = ({
 }) => {
   const currentUser = useCurrentUser();
   useSyncDb();
+  const access = useAccess();
+  const maySeeRevenue = access.canSeeRevenue();
 
   const patients = db.getPatients();
   const visits = db.getVisits();
@@ -61,6 +65,8 @@ export const ExecutiveDashboard: React.FC<ExecutiveDashboardProps> = ({
 
   const today = new Date().toISOString().split('T')[0];
   const todayVisits = visits.filter(v => v.visitDate === today);
+  const completedToday = todayVisits.filter(v =>
+    ['Completed', 'Discharged', 'Treated'].includes(v.status)).length;
 
   // Department stats
   const docAwait = todayVisits.filter(v => ['With Doctor', 'Awaiting Physician'].includes(v.status)).length;
@@ -150,24 +156,47 @@ export const ExecutiveDashboard: React.FC<ExecutiveDashboardProps> = ({
           </div>
         </div>
 
-        {/* Hospital Revenue */}
-        <div 
-          onClick={onNavigateBilling}
-          className="p-4 rounded-2xl bg-white dark:bg-dark-card border border-light-border dark:border-dark-border shadow-sm hover:border-emerald-500/50 cursor-pointer transition-all"
-        >
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400">Collected Revenue</span>
-            <div className="w-8 h-8 rounded-xl bg-emerald-100 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
-              <Receipt className="w-4 h-4" />
+        {/* Hospital Revenue — money. For a clinical role the fourth card is not
+            replaced with a blank or a padlock, because a lock icon on a KPI row
+            reads as a bug. It becomes the closest clinical fact of the same
+            shape, so the grid still has four things in it. */}
+        {maySeeRevenue ? (
+          <div
+            onClick={onNavigateBilling}
+            className="p-4 rounded-2xl bg-white dark:bg-dark-card border border-light-border dark:border-dark-border shadow-sm hover:border-emerald-500/50 cursor-pointer transition-all"
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400">Collected Revenue</span>
+              <div className="w-8 h-8 rounded-xl bg-emerald-100 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                <Receipt className="w-4 h-4" />
+              </div>
+            </div>
+            <div className="text-2xl font-extrabold text-slate-900 dark:text-white mt-1">
+              {settings.currency}{totalRevenue.toLocaleString()}
+            </div>
+            <div className="flex items-center space-x-1 text-[11px] text-emerald-600 mt-1 font-semibold">
+              <span>Paid hospital invoices</span>
             </div>
           </div>
-          <div className="text-2xl font-extrabold text-slate-900 dark:text-white mt-1">
-            {settings.currency}{totalRevenue.toLocaleString()}
+        ) : (
+          <div
+            onClick={onNavigateClinical}
+            className="p-4 rounded-2xl bg-white dark:bg-dark-card border border-light-border dark:border-dark-border shadow-sm hover:border-emerald-500/50 cursor-pointer transition-all"
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400">Completed Today</span>
+              <div className="w-8 h-8 rounded-xl bg-emerald-100 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                <CheckCircle2 className="w-4 h-4" />
+              </div>
+            </div>
+            <div className="text-2xl font-extrabold text-slate-900 dark:text-white mt-1">
+              {completedToday}
+            </div>
+            <div className="flex items-center space-x-1 text-[11px] text-emerald-600 mt-1 font-semibold">
+              <span>Encounters seen today</span>
+            </div>
           </div>
-          <div className="flex items-center space-x-1 text-[11px] text-emerald-600 mt-1 font-semibold">
-            <span>Paid hospital invoices</span>
-          </div>
-        </div>
+        )}
       </div>
 
       {/* Hospital Departments Overview — every department visualized */}
@@ -313,26 +342,31 @@ export const ExecutiveDashboard: React.FC<ExecutiveDashboardProps> = ({
             </div>
           </div>
 
-          {/* Billing */}
-          <div
-            onClick={onNavigateBilling}
-            className="p-4 rounded-2xl bg-white dark:bg-dark-card border border-light-border dark:border-dark-border shadow-sm hover:shadow-md hover:-translate-y-0.5 cursor-pointer transition-all"
-          >
-            <div className="flex items-center justify-between">
-              <div className="w-9 h-9 rounded-xl bg-emerald-100 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
-                <Receipt className="w-4 h-4" />
+          {/* Billing. Omitted, not blanked, for anyone who may not see money: a
+              Billing card that shows nothing is a broken widget, and a Billing
+              card that shows only a count still tells a clinician that billing
+              exists on their dashboard and where to click it. */}
+          {maySeeRevenue && (
+            <div
+              onClick={onNavigateBilling}
+              className="p-4 rounded-2xl bg-white dark:bg-dark-card border border-light-border dark:border-dark-border shadow-sm hover:shadow-md hover:-translate-y-0.5 cursor-pointer transition-all"
+            >
+              <div className="flex items-center justify-between">
+                <div className="w-9 h-9 rounded-xl bg-emerald-100 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                  <Receipt className="w-4 h-4" />
+                </div>
+                <span className="text-2xl font-black text-slate-900 dark:text-white">{invoices.length}</span>
               </div>
-              <span className="text-2xl font-black text-slate-900 dark:text-white">{invoices.length}</span>
-            </div>
-            <div className="text-xs font-extrabold mt-2 text-slate-800 dark:text-slate-100">Billing — Invoices</div>
-            <div className="mt-2 space-y-1.5 text-[11px] font-semibold text-slate-500">
-              <div className="flex justify-between"><span>Collected</span><strong className="text-emerald-600">{settings.currency}{totalRevenue.toLocaleString()}</strong></div>
-              <div className="h-1.5 rounded-full bg-slate-100 dark:bg-dark-surface overflow-hidden">
-                <div style={{ width: `${pct(totalRevenue, totalRevenue + outstanding)}%` }} className="h-full bg-emerald-500 rounded-full" />
+              <div className="text-xs font-extrabold mt-2 text-slate-800 dark:text-slate-100">Billing — Invoices</div>
+              <div className="mt-2 space-y-1.5 text-[11px] font-semibold text-slate-500">
+                <div className="flex justify-between"><span>Collected</span><strong className="text-emerald-600">{settings.currency}{totalRevenue.toLocaleString()}</strong></div>
+                <div className="h-1.5 rounded-full bg-slate-100 dark:bg-dark-surface overflow-hidden">
+                  <div style={{ width: `${pct(totalRevenue, totalRevenue + outstanding)}%` }} className="h-full bg-emerald-500 rounded-full" />
+                </div>
+                <div className="flex justify-between"><span>Outstanding</span><strong className="text-rose-600">{settings.currency}{outstanding.toLocaleString()}</strong></div>
               </div>
-              <div className="flex justify-between"><span>Outstanding</span><strong className="text-rose-600">{settings.currency}{outstanding.toLocaleString()}</strong></div>
             </div>
-          </div>
+          )}
 
           {/* Front Desk */}
           <div

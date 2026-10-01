@@ -1,0 +1,744 @@
+/**
+ * Does the navigation gate actually hold?
+ *
+ * WHY THIS IS A SEPARATE SUITE
+ * ----------------------------
+ * `sync-selftest.mjs` guards what the application writes to the database. This
+ * guards what it shows. The defect being guarded against is specific and was
+ * real: a `roles?: string[]` field on every menu item, typed and formatted and
+ * read by nobody, so every staff member saw every department. A suite that only
+ * round-trips data would have passed while that was true, and it did.
+ *
+ * THE CENTRAL CLAIM
+ * -----------------
+ * "A user must not be able to navigate to a department they do not have, no
+ * matter how they manoeuvre their way." That is not satisfied by hiding a menu
+ * item, so the suite does not settle for that. It takes the statement literally
+ * and brute-forces it: every role, against every main destination, against every
+ * submenu id in the entire application, including ids nobody links to. Whatever
+ * `resolveRoute` answers, the suite checks that the person could legitimately
+ * have opened that place. One counter-example fails the run.
+ *
+ * The same is checked for the revenue gate against every money-flagged item.
+ */
+import { registerHooks } from 'node:module';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.join(__dirname, '..');
+
+// Same shim `sync-selftest.mjs` uses: the sources are TypeScript with
+// extensionless relative imports. Node strips the types; this supplies the
+// extension so the suite exercises the real modules, not copies of them.
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier.startsWith('.') && !/\.[cm]?[jt]sx?$/.test(specifier)) {
+      const fromDir = context.parentURL
+        ? path.dirname(fileURLToPath(context.parentURL))
+        : ROOT;
+      if (fs.existsSync(path.join(fromDir, specifier, 'index.ts'))) {
+        return nextResolve(`${specifier}/index.ts`, context);
+      }
+      try {
+        return nextResolve(`${specifier}.ts`, context);
+      } catch {
+        // Not a .ts file; fall through.
+      }
+    }
+    return nextResolve(specifier, context);
+  },
+});
+
+const {
+  MAIN_NAV, SUB_NAV, allSubNavItems,
+} = await import('../src/components/layout/navModel.ts');
+
+const {
+  PERMISSION_TREE, allDescendants, isEffectivelyGranted, BASE_ROLE_PERMISSIONS,
+} = await import('../src/services/permissions.ts');
+
+const {
+  canSeeRevenue, canOpenMainNav, canOpenSubNav, permittedMainNavs, permittedSubNavs,
+  firstPermittedNav, firstPermittedSub, resolveRoute, deniedReason,
+} = await import('../src/services/accessControl.ts');
+
+const {
+  buildWindow, withinWindow, parseStoredDate, countUnreadable, describeWindow,
+} = await import('../src/services/dateRange.ts');
+
+const {
+  filterAndRank, rankMatch, matchSpan, rankOptions,
+} = await import('../src/services/searchRank.ts');
+
+// ---------------------------------------------------------------------------
+
+let checks = 0;
+let failures = 0;
+let lastSection = '';
+
+function check(name, ok, detail) {
+  checks++;
+  if (!ok) {
+    failures++;
+    console.log(`  FAIL  ${name}${detail ? ` — ${detail}` : ''}`);
+  }
+}
+
+function section(title) {
+  lastSection = title;
+  console.log(`\n${title}`);
+}
+
+const user = (role) => ({ id: `u-${role}`, name: `Test ${role}`, role });
+const asUser = (role, customRoleId) => ({ ...user(role), customRoleId });
+const customRole = (name, permissions) => ({
+  id: `cr-${name}`, name, description: '', permissions, isSystem: false,
+});
+
+const ROLES = Object.keys(BASE_ROLE_PERMISSIONS);
+
+// ---------------------------------------------------------------------------
+// The menu itself is well formed
+// ---------------------------------------------------------------------------
+
+section('the menu is well formed');
+
+// Every permission the menu cites must exist in the tree. This is the check that
+// catches a typo such as `LABORATORY.MOLYMARKET.VIEW`: such a key is never
+// granted to anybody, so the item would silently disappear for every role,
+// including the administrator who wrote it. A mistyped key fails closed, which is
+// safe, but it is still a bug that reads as "the administrator cannot see their
+// own menu".
+const allPermissionKeys = new Set();
+for (const node of PERMISSION_TREE) {
+  allPermissionKeys.add(node.key);
+  for (const d of allDescendants(node.key)) allPermissionKeys.add(d);
+}
+
+const mainNavKeys = MAIN_NAV.flatMap(n => n.anyOf);
+const subNavKeys = Object.values(SUB_NAV).flatMap(g =>
+  allSubNavItemsFor(g).flatMap(i => i.anyOf));
+
+check('the permission tree has nodes to check against', allPermissionKeys.size > 50, `${allPermissionKeys.size} keys`);
+check('every main navigation permission exists in the tree',
+  mainNavKeys.every(k => allPermissionKeys.has(k)),
+  mainNavKeys.filter(k => !allPermissionKeys.has(k)).join(', '));
+check('every submenu permission exists in the tree',
+  subNavKeys.every(k => allPermissionKeys.has(k)),
+  subNavKeys.filter(k => !allPermissionKeys.has(k)).join(', '));
+
+// Every item needs a permission, and a non-empty list of them. The type requires
+// it; this asserts the value is not an empty array, which the type cannot.
+const everyItem = [
+  ...MAIN_NAV.map(n => ({ id: `main:${n.id}`, anyOf: n.anyOf })),
+  ...Object.entries(SUB_NAV).flatMap(([nav, g]) =>
+    allSubNavItemsFor(g).map(i => ({ id: `sub:${nav}/${i.id}`, anyOf: i.anyOf }))),
+];
+check('no menu item has an empty permission list',
+  everyItem.every(i => Array.isArray(i.anyOf) && i.anyOf.length > 0),
+  everyItem.filter(i => !i.anyOf || i.anyOf.length === 0).map(i => i.id).join(', '));
+
+// Every submenu item must be openable by somebody who can open its own parent.
+// Checking only "at least one child is reachable" is too weak: a department whose
+// Stock screen needs `LABORATORY.HEMATOLOGY.LOG_USAGE` while the department door
+// only admits `.VIEW` passes that loose test and still locks a stock clerk out of
+// the room their job is in.
+for (const nav of MAIN_NAV) {
+  const group = SUB_NAV[nav.id];
+  if (!group) continue;
+  const orphans = allSubNavItemsFor(group)
+    .filter(s => !s.anyOf.some(k => nav.anyOf.includes(k)))
+    .map(s => `${s.id} needs [${s.anyOf.join('|')}]`);
+  check(`every screen under "${nav.label}" is reachable by someone its own door admits`,
+    orphans.length === 0, orphans.join('; '));
+}
+
+function allSubNavItemsFor(group) {
+  const out = [];
+  const walk = (items) => {
+    for (const i of items) {
+      out.push(i);
+      if (i.subItems) walk(i.subItems);
+    }
+  };
+  walk(group.items);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// The reported defect: a role must not see, or reach, a department it lacks
+// ---------------------------------------------------------------------------
+
+section('a role cannot see or reach a department it does not have');
+
+// The scenario as described: Medical Lab, not Pharmacy.
+const labUser = user('LAB_SCIENTIST');
+check('a laboratory scientist cannot open the Pharmacy menu',
+  !permittedMainNavs(labUser).some(n => n.id === 'pharmacy'));
+check('a laboratory scientist cannot open Radiology',
+  !canOpenMainNav(labUser, 'radiology'));
+check('a laboratory scientist cannot open Physiotherapy',
+  !canOpenMainNav(labUser, 'physiotherapy'));
+check('a laboratory scientist cannot open Billing',
+  !canOpenMainNav(labUser, 'billing'));
+check('a laboratory scientist cannot open Administration',
+  !canOpenMainNav(labUser, 'admin'));
+check('a laboratory scientist CAN open Laboratory',
+  canOpenMainNav(labUser, 'laboratory'));
+check('a laboratory scientist CAN open the dashboard they land on',
+  canOpenMainNav(labUser, 'dashboard'));
+
+// Navigating there anyway must be refused, not merely unlisted.
+const labAttempt = resolveRoute(labUser, undefined, 'pharmacy', 'rx_queue');
+check('navigating to Pharmacy is refused even when asked for by name',
+  labAttempt.nav !== 'pharmacy' && labAttempt.nav !== null,
+  `landed on ${labAttempt.nav}/${labAttempt.sub}`);
+check('and it lands somewhere the laboratory scientist may actually open',
+  canOpenMainNav(labUser, labAttempt.nav) && canOpenSubNav(labUser, labAttempt.nav, labAttempt.sub));
+check('and it explains itself in words',
+  typeof labAttempt.refused === 'string' && labAttempt.refused.length > 20,
+  String(labAttempt.refused));
+
+// The Pharmacy submenu must be empty for them, not merely greyed out.
+check('the Pharmacy submenu is empty for a laboratory scientist',
+  permittedSubNavs(labUser, 'pharmacy').length === 0);
+
+// A laboratory scientist holding every department by default: this is the second
+// half of the same complaint, and it is why custom roles exist.
+check('a laboratory scientist with no custom role has all five departments',
+  ['hematology', 'microbiology', 'chemical_pathology', 'histopathology', 'molecular']
+    .every(d => canOpenSubNav(labUser, 'laboratory', d)),
+  'so the base role must be narrowed by a custom role, which is tested next');
+
+// Hematology only, as described: histopathology must disappear unless granted.
+const hemOnly = customRole('Hem only', [
+  'DASHBOARD.VIEW', 'LABORATORY.HEMATOLOGY', 'LABORATORY.INVENTORY.VIEW',
+]);
+const hemUser = asUser('LAB_SCIENTIST', 'cr-Hem only');
+const hemSubs = permittedSubNavs(hemUser, 'laboratory', hemOnly).map(s => s.id);
+
+check('a haematology-only scientist CAN open Hematology',
+  hemSubs.includes('hematology'), hemSubs.join(', '));
+check('and CANNOT open Histopathology',
+  !hemSubs.includes('histopathology'), hemSubs.join(', '));
+check('and CANNOT open Microbiology',
+  !hemSubs.includes('microbiology'), hemSubs.join(', '));
+check('and CANNOT open Molecular',
+  !hemSubs.includes('molecular'), hemSubs.join(', '));
+check('and CANNOT open Chemical Pathology',
+  !hemSubs.includes('chemical_pathology'), hemSubs.join(', '));
+check('and can still open Test Inventory, which was granted',
+  hemSubs.includes('lab_inventory'), hemSubs.join(', '));
+check('and cannot open Pharmacy either, since no pharmacy key was granted',
+  !canOpenMainNav(hemUser, 'pharmacy', hemOnly));
+
+// A parent whose every child is hidden must go too. "All Departments" and
+// "Released Reports" are gated on any department, so one granted department is
+// enough to keep them — but a scientist granted only stock handling has no
+// department at all, and both must disappear rather than open an empty screen.
+const stockOnly = customRole('Stock only', ['DASHBOARD.VIEW', 'LABORATORY.HEMATOLOGY.LOG_USAGE']);
+const stockSubs = permittedSubNavs(asUser('LAB_SCIENTIST', 'cr-Stock only'), 'laboratory', stockOnly).map(s => s.id);
+check('a scientist with only stock handling has no All Departments row',
+  !stockSubs.includes('lab_all'), stockSubs.join(', '));
+check('...and no Released Reports row either',
+  !stockSubs.includes('lab_released'), stockSubs.join(', '));
+check('...but does have Stock',
+  stockSubs.includes('lab_stock'), stockSubs.join(', '));
+
+// "unless granted view/add" — grant exactly the view and it appears.
+const grantedCustom = customRole('Hem + histopath view', [
+  'DASHBOARD.VIEW', 'LABORATORY.HEMATOLOGY', 'LABORATORY.HISTOPATHOLOGY',
+]);
+const grantedUser = asUser('LAB_SCIENTIST', 'granted');
+check('granting the view permission makes Histopathology appear',
+  canOpenSubNav(grantedUser, 'laboratory', 'histopathology', grantedCustom));
+check('and it is reachable, not merely listed',
+  resolveRoute(grantedUser, grantedCustom, 'laboratory', 'histopathology').nav === 'laboratory');
+
+// The whole point of custom roles: the same base role, a different department.
+check('the same base role with only Haematology still cannot reach Histopathology',
+  !canOpenSubNav(hemUser, 'laboratory', 'histopathology', hemOnly));
+
+// ---------------------------------------------------------------------------
+// Revenue: Administrator, Front Desk and Billing Officer only
+// ---------------------------------------------------------------------------
+
+section('revenue is limited to Administrator, Front Desk and Billing Officer');
+
+const REVENUE_ROLES = ['ADMINISTRATOR', 'FRONT_DESK', 'BILLING_OFFICER'];
+const NO_REVENUE_ROLES = ROLES.filter(r => !REVENUE_ROLES.includes(r));
+
+for (const role of REVENUE_ROLES) {
+  check(`${role} may see revenue`, canSeeRevenue(user(role)));
+}
+for (const role of NO_REVENUE_ROLES) {
+  check(`${role} may NOT see revenue`, !canSeeRevenue(user(role)));
+}
+
+// The money screens themselves.
+const MONEY_SUBS = [
+  ['patients', 'pay_bills'], ['patients', 'central_billing'], ['patients', 'front_desk_billing'],
+  ['patients', 'price_schedule'], ['billing', 'all_invoices'], ['billing', 'process_payment'],
+  ['analytics', 'financial_stats'], ['radiology', 'radiology_pricing'],
+  ['physiotherapy', 'physio_pricing'],
+];
+
+for (const role of NO_REVENUE_ROLES) {
+  const visible = MONEY_SUBS.filter(([nav, sub]) => canOpenSubNav(user(role), nav, sub));
+  check(`${role} cannot open any billing or revenue screen`,
+    visible.length === 0, visible.map(([n, s]) => `${n}/${s}`).join(', '));
+  check(`${role} cannot open the Billing menu`,
+    !canOpenMainNav(user(role), 'billing'));
+}
+
+for (const role of REVENUE_ROLES) {
+  const reachable = MONEY_SUBS.filter(([nav, sub]) => canOpenSubNav(user(role), nav, sub));
+  check(`${role} can open at least one billing screen`, reachable.length > 0);
+}
+
+// The physician is the sharp case: the base role grants BILLING.INVOICES so the
+// invoice numbers on their own orders resolve, and they must still see no money.
+const physician = user('PHYSICIAN');
+check('a doctor holds BILLING.INVOICES in the base role',
+  isEffectivelyGranted(BASE_ROLE_PERMISSIONS.PHYSICIAN, 'BILLING.INVOICES'));
+check('and is still refused revenue despite holding it',
+  !canSeeRevenue(physician));
+check('and cannot open Central Billing despite holding BILLING.INVOICES',
+  !canOpenSubNav(physician, 'patients', 'central_billing'));
+check('and cannot open Pay Bill / Cashier',
+  !canOpenSubNav(physician, 'patients', 'pay_bills'));
+check('and cannot open the Master Price Schedule',
+  !canOpenSubNav(physician, 'patients', 'price_schedule'));
+check('and cannot open the Billing menu',
+  !canOpenMainNav(physician, 'billing'));
+check('but CAN still see Diagnostic Alerts, which is a clinical screen',
+  canOpenSubNav(physician, 'clinical', 'lab_alerts'));
+check('and CAN still open the Patient Directory, which is clinical too',
+  canOpenSubNav(physician, 'patients', 'all_patients'));
+
+// A custom role that grants billing decides its role handles money. Judging by the
+// base role instead would show it the invoices and hide the revenue card.
+const billingCustom = customRole('Some billing clerk', [
+  'DASHBOARD.VIEW', 'PATIENTS.VIEW', 'BILLING.INVOICES',
+]);
+check('a custom role granted BILLING.INVOICES may see revenue',
+  canSeeRevenue(asUser('NURSE', 'billing'), billingCustom));
+check('because it cannot be shown the invoices and not the revenue they produce',
+  canOpenSubNav(asUser('NURSE', 'billing'), 'patients', 'central_billing', billingCustom));
+
+const noBillingCustom = customRole('Vitals only', ['DASHBOARD.VIEW', 'CLINICAL.NURSING']);
+check('a clinical custom role is refused revenue', !canSeeRevenue(asUser('NURSE', 'vitals'), noBillingCustom));
+check('and refused Central Billing',
+  !canOpenSubNav(asUser('NURSE', 'vitals'), 'patients', 'central_billing', noBillingCustom));
+
+// Narrowing by custom role, then editing that role, is how access is taken away
+// in practice. Both directions are checked, and the second one matters most: a
+// role edited down to nothing must leave the account with nothing, not quietly
+// restore everything the base role granted. Getting that backwards makes revoking
+// access impossible — the administrator removes every permission, saves, and the
+// clerk keeps the money.
+const narrowedClerk = customRole('Reception, no money', [
+  'DASHBOARD.VIEW', 'PATIENTS.VIEW', 'PATIENTS.REGISTER', 'PATIENTS.BOOKINGS',
+]);
+const clerkUser = asUser('FRONT_DESK', 'reception');
+check('a Front Desk clerk narrowed to reception loses revenue',
+  !canSeeRevenue(clerkUser, narrowedClerk));
+check('...and keeps the screens they were left with',
+  canOpenSubNav(clerkUser, 'patients', 'all_patients', narrowedClerk)
+  && canOpenSubNav(clerkUser, 'patients', 'register_patient', narrowedClerk));
+
+const emptiedRole = customRole('Reception, nothing left', []);
+check('emptying that role removes revenue rather than restoring it',
+  !canSeeRevenue(clerkUser, emptiedRole),
+  'a Front Desk clerk with an empty custom role must not fall back to the base role');
+check('...and empties the menu rather than falling back to it',
+  permittedMainNavs(clerkUser, emptiedRole).length === 0,
+  permittedMainNavs(clerkUser, emptiedRole).map(n => n.id).join(', '));
+
+// ---------------------------------------------------------------------------
+// Every destination has a rule, and an unknown id is refused
+// ---------------------------------------------------------------------------
+
+section('no destination is reachable by accident');
+
+for (const nav of MAIN_NAV) {
+  const subs = allSubNavItems(nav.id);
+  for (const sub of subs) {
+    const rule = allSubNavItems(nav.id).find(i => i.id === sub.id);
+    check(`submenu "${nav.id}/${sub.id}" has a permission rule`, !!rule && rule.anyOf.length > 0);
+  }
+}
+
+// An id that is not in the menu is refused, not treated as permitted. Failing
+// open here would make a typo in a future call site a way in.
+for (const role of ROLES) {
+  const invented = resolveRoute(user(role), undefined, 'dashboard', 'no_such_screen');
+  check(`${role} landing after asking for an unknown screen can still open where they land`,
+    invented.nav && canOpenMainNav(user(role), invented.nav)
+      && canOpenSubNav(user(role), invented.nav, invented.sub),
+    `landed on ${invented.nav}/${invented.sub}`);
+  check(`${role} is told the screen does not exist rather than being shown one`,
+    /no screen called|not part of/i.test(invented.refused ?? ''), String(invented.refused));
+}
+
+// ---------------------------------------------------------------------------
+// The central claim, brute-forced
+// ---------------------------------------------------------------------------
+
+section('no role can land anywhere it may not open (every role x every screen)');
+
+// This is the check that matches the request. For every role, for every main
+// destination in the application, and for every submenu id in the application,
+// ask `resolveRoute` and then verify the answer. No id is excluded as
+// "unreachable" or "not linked from anywhere" — the point is that a person should
+// not be able to get there by any means at all, so no route is assumed innocent.
+const allSubIds = Object.keys(SUB_NAV).flatMap(nav => allSubNavItems(nav).map(s => s.id));
+const nonsenseIds = ['', 'undefined', 'null', '../admin', '__proto__', 'ADMIN', 'toString'];
+
+let counterExamples = [];
+let routesChecked = 0;
+
+for (const role of ROLES) {
+  const u = user(role);
+  for (const nav of MAIN_NAV) {
+    for (const sub of [...allSubIds, ...nonsenseIds]) {
+      routesChecked++;
+      const d = resolveRoute(u, undefined, nav, sub);
+      if (!d.nav || !d.sub) {
+        counterExamples.push(`${role} -> ${nav}/${sub} produced nothing to open`);
+        continue;
+      }
+      if (!canOpenMainNav(u, d.nav)) {
+        counterExamples.push(`${role} -> ${nav}/${sub} landed on main nav ${d.nav}, which they may not open`);
+      }
+      if (!canOpenSubNav(u, d.nav, d.sub)) {
+        counterExamples.push(`${role} -> ${nav}/${sub} landed on ${d.nav}/${d.sub}, which they may not open`);
+      }
+      if (d.nav !== nav) {
+        // Being moved is fine. Being moved without being told is not, because a
+        // silent redirect reads as a broken application.
+        if (!d.refused) {
+          counterExamples.push(`${role} -> ${nav}/${sub} was redirected to ${d.nav}/${d.sub} without saying so`);
+        }
+      }
+    }
+  }
+}
+
+check(`every one of ${routesChecked} navigation attempts lands somewhere openable`,
+  counterExamples.length === 0,
+  counterExamples.slice(0, 5).join(' | ') + (counterExamples.length > 5 ? ` (+${counterExamples.length - 5} more)` : ''));
+
+// The same sweep with a custom role, since a custom role is what a real
+// deployment uses to narrow somebody's access.
+let customCounterExamples = [];
+const narrowCustoms = [
+  customRole('nothing at all', []),
+  customRole('dashboard only', ['DASHBOARD.VIEW']),
+  customRole('one lab dept', ['LABORATORY.HEMATOLOGY']),
+  customRole('billing clerk', ['BILLING.INVOICES', 'PATIENTS.VIEW']),
+  customRole('everything but admin', ['DASHBOARD', 'PATIENTS', 'CLINICAL', 'LABORATORY', 'PHARMACY', 'RADIOLOGY', 'PHYSIOTHERAPY', 'BILLING', 'AI']),
+];
+
+for (const cr of narrowCustoms.filter(r => r.permissions.length > 0)) {
+  const u = asUser('PHYSICIAN', cr.id);
+  for (const nav of MAIN_NAV) {
+    for (const sub of allSubIds) {
+      const d = resolveRoute(u, cr, nav.id, sub);
+      if (!d.nav || !d.sub) { customCounterExamples.push(`${cr.name} -> ${nav.id}/${sub} produced nothing`); continue; }
+      if (!canOpenMainNav(u, d.nav, cr)) customCounterExamples.push(`${cr.name} -> ${nav.id}/${sub} landed on ${d.nav}`);
+      if (!canOpenSubNav(u, d.nav, d.sub, cr)) customCounterExamples.push(`${cr.name} -> ${nav.id}/${sub} landed on ${d.nav}/${d.sub}`);
+      // Nobody who has an openable screen should ever be told they cannot open it.
+      if (d.nav === nav.id && canOpenSubNav(u, nav.id, sub, cr) && d.refused) {
+        customCounterExamples.push(`${cr.name} was refused ${nav.id}/${sub} which it may open`);
+      }
+    }
+  }
+}
+// A role with no permissions at all genuinely has nowhere to go, and "nowhere" is
+// the honest answer rather than a fallback somewhere else. It is checked apart
+// above, because asserting it lands somewhere would assert a lie.
+check('the same holds for every custom role shape',
+  customCounterExamples.length === 0,
+  customCounterExamples.slice(0, 5).join(' | '));
+
+// ---------------------------------------------------------------------------
+// Administrator sees everything, and nobody is left with nothing
+// ---------------------------------------------------------------------------
+
+section('no account is stranded');
+
+for (const role of ROLES) {
+  const first = firstPermittedNav(user(role));
+  check(`${role} has somewhere to land`, first !== null);
+  if (first) {
+    check(`${role} lands on a screen they may open`,
+      canOpenSubNav(user(role), first, firstPermittedSub(user(role), first)),
+      `${first}/${firstPermittedSub(user(role), first)}`);
+  }
+}
+
+check('an empty custom role is stranded on purpose, not by accident',
+  firstPermittedNav(asUser('PHYSICIAN', 'cr-nothing at all'), narrowCustoms[0]) === null);
+
+const stranded = resolveRoute(asUser('PHYSICIAN', 'cr-nothing at all'), narrowCustoms[0], 'dashboard', 'overview');
+check('an account with nothing granted is told to ask an administrator',
+  stranded.nav === null && stranded.sub === null);
+
+// An account with nothing must not be able to see a single menu item.
+const nothingUser = asUser('PHYSICIAN', 'cr-nothing at all');
+check('an account with no grants sees no menus at all',
+  permittedMainNavs(nothingUser, narrowCustoms[0]).length === 0);
+
+// Administrator: the one role that must not be locked out of its own system.
+const admin = user('ADMINISTRATOR');
+const adminHidden = MAIN_NAV.filter(n => !canOpenMainNav(admin, n.id));
+check('the administrator can open every main destination', adminHidden.length === 0,
+  adminHidden.map(n => n.id).join(', '));
+let adminHiddenSubs = [];
+for (const nav of MAIN_NAV) {
+  for (const s of allSubNavItems(nav.id)) {
+    if (!canOpenSubNav(admin, nav.id, s.id)) adminHiddenSubs.push(`${nav.id}/${s.id}`);
+  }
+}
+check('the administrator can open every screen', adminHiddenSubs.length === 0, adminHiddenSubs.join(', '));
+
+// ---------------------------------------------------------------------------
+// Refusals say something true
+// ---------------------------------------------------------------------------
+
+section('a refusal explains itself');
+
+const r1 = deniedReason(user('PHYSICIAN'), 'patients', 'central_billing');
+check('a revenue refusal names the roles that may see it',
+  /Administrator, Front Desk and Billing Officer/.test(r1), r1);
+check('a revenue refusal names the person\'s own role',
+  /Doctor/.test(r1), r1);
+check('a revenue refusal does not say "access denied" and nothing else',
+  r1.length > 80, `${r1.length} chars`);
+
+const r2 = deniedReason(hemUser, 'laboratory', 'histopathology');
+check('a permission refusal says who can grant it',
+  /Roles & Permissions/.test(r2), r2);
+check('a permission refusal names the person\'s role',
+  /Laboratory Scientist/.test(r2), r2);
+
+// ---------------------------------------------------------------------------
+// The AI menu, which had no permission at all
+// ---------------------------------------------------------------------------
+
+section('the AI menu is no longer visible to everybody');
+
+check('the permission tree now has an AI node',
+  PERMISSION_TREE.some(n => n.key === 'AI'));
+for (const role of ['PHYSICIAN', 'NURSE', 'LAB_SCIENTIST']) {
+  check(`${role} may use the AI assistant`, canOpenSubNav(user(role), 'ai', 'nl_query'));
+}
+for (const role of ['FRONT_DESK', 'BILLING_OFFICER']) {
+  check(`${role} may NOT use the AI assistant`,
+    !canOpenSubNav(user(role), 'ai', 'nl_query'));
+  check(`${role} does not see the AI menu`,
+    !canOpenMainNav(user(role), 'ai'));
+}
+
+// ---------------------------------------------------------------------------
+// Date ranges actually cover the days a person asked for
+// ---------------------------------------------------------------------------
+
+section('a date range covers exactly the days that were asked for');
+
+// A fixed "now" so the suite does not fail at midnight on the first of the month.
+// 2026-10-01 is a Thursday.
+const NOW = new Date(2026, 9, 1, 14, 30, 0);
+const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+// "Today" must include a record saved at 00:01 this morning. Comparing against a
+// window that ends at midnight would exclude it, and the total would be zero for
+// a day in which work was done.
+const today = buildWindow({ mode: 'today', now: NOW }).window;
+check('Today includes a record saved at one minute past midnight this morning',
+  withinWindow(`${iso(NOW)}T00:01:00.000Z`, today));
+check('Today excludes yesterday evening',
+  !withinWindow(`${iso(new Date(2026, 8, 30))}T23:00:00`, today));
+check('Today excludes a bare date for yesterday',
+  !withinWindow('2026-09-30', today));
+check('Today includes a bare date for today',
+  withinWindow('2026-10-01', today));
+
+// A custom range ending on a day must include that whole day, not stop at its
+// midnight - the mistake that drops everything the person asked to see.
+const custom = buildWindow({ mode: 'custom', from: '2026-09-01', to: '2026-09-30' });
+check('a custom range is accepted', custom.error === null, custom.error);
+check('...and includes the first morning of the first day',
+  withinWindow('2026-09-01T00:30:00', custom.window));
+check('...and the last evening of the last day',
+  withinWindow('2026-09-30T23:59:00', custom.window));
+check('...and excludes the day before the start',
+  !withinWindow('2026-08-31T23:59:00', custom.window));
+check('...and excludes the day after the end',
+  !withinWindow('2026-10-01T00:30:00', custom.window));
+
+// One day is one day, not an empty range.
+const single = buildWindow({ mode: 'custom', from: '2026-09-15', to: '2026-09-15' });
+check('a range whose start equals its end is one day, not none',
+  single.error === null && withinWindow('2026-09-15T14:00:00', single.window),
+  single.error);
+
+// Reversed ranges are refused out loud rather than silently showing nothing.
+const reversed = buildWindow({ mode: 'custom', from: '2026-09-30', to: '2026-09-01' });
+check('a reversed range is refused', reversed.window === null);
+check('...and says what to do about it',
+  /end date is before the start date/.test(reversed.error ?? ''), reversed.error);
+
+const halfFilled = buildWindow({ mode: 'custom', from: '2026-09-01' });
+check('a half-filled range is refused', halfFilled.window === null && !!halfFilled.error);
+
+// This week starts on Monday. 2026-10-01 is a Thursday, so the week began the 28th
+// of September. A window starting Sunday would drop two days of clinic.
+const week = buildWindow({ mode: 'week', now: NOW }).window;
+check('the week starts on Monday the 28th, not Sunday the 27th',
+  iso(week.from) === '2026-09-28', iso(week.from));
+check('the week includes Monday itself',
+  withinWindow('2026-09-28T09:00:00', week));
+check('the week excludes the Sunday before it',
+  !withinWindow('2026-09-27T09:00:00', week));
+
+const month = buildWindow({ mode: 'month', now: NOW }).window;
+check('the month starts on the first', iso(month.from) === '2026-10-01', iso(month.from));
+check('the month excludes the last day of September',
+  !withinWindow('2026-09-30T12:00:00', month));
+
+const year = buildWindow({ mode: 'year', now: NOW }).window;
+check('the year starts on the first of January', iso(year.from) === '2026-01-01', iso(year.from));
+check('the year includes last December... no: excludes it',
+  !withinWindow('2025-12-31T12:00:00', year));
+check('and includes this January',
+  withinWindow('2026-01-15T12:00:00', year));
+
+// All time really is all time, which is what the previous filter claimed to be
+// while showing something else.
+const all = buildWindow({ mode: 'all', now: NOW });
+check('"all time" has no window at all', all.window === null && all.error === null);
+check('and therefore includes every record, however old',
+  withinWindow('1999-01-01', null) && withinWindow(`${iso(NOW)}T23:00:00`, null));
+
+// Dates the application cannot read are reported rather than guessed at.
+check('an unparseable date is not silently placed inside a window',
+  !withinWindow('not-a-date', today));
+check('a missing date is not silently placed inside a window',
+  !withinWindow(undefined, today) && !withinWindow(null, today) && !withinWindow('', today));
+check('a calendar date that does not exist is rejected, not rolled forward',
+  parseStoredDate('2026-02-31') === null);
+check('29 February of a leap year is accepted (2024 is a leap year)',
+  parseStoredDate('2024-02-29') !== null);
+check('29 February of a common year is rejected (2026 is not)',
+  parseStoredDate('2026-02-29') === null);
+check('unreadable dates are counted so the report can say so',
+  countUnreadable(['2026-10-01', 'oops', '', null, undefined, '2026-09-30']) === 4);
+
+// A bare date means that whole day, in the viewer's own timezone. Comparing the
+// raw string would move a morning's clinic into yesterday for anybody west of UTC.
+const westOfUtc = new Date('2026-10-01T08:00:00'); // stored 08:00 local
+check('a bare date is read as a whole local day',
+  iso(parseStoredDate('2026-10-01')) === '2026-10-01');
+check('and its local midnight is local midnight, not UTC midnight',
+  parseStoredDate('2026-10-01').getHours() === 0);
+check('a timestamped record keeps its time of day',
+  parseStoredDate('2026-10-01T14:45:00').getHours() === 14);
+
+check('the screen is told which range it is showing', describeWindow(month) === 'This month');
+check('and an all-time report says so rather than saying nothing', describeWindow(null) === 'All time');
+check('and a custom range is named', /2026-09-01 to 2026-09-30/.test(describeWindow(custom.window)));
+
+// ---------------------------------------------------------------------------
+// Typeahead: the suggestion you most likely meant comes first
+// ---------------------------------------------------------------------------
+
+section('searching finds the thing that was meant, not just the first thing that matches');
+
+const DRUGS = [
+  { value: '1', label: 'Amoxicillin (500mg)', secondary: '₦2,000 • Stock 240' },
+  { value: '2', label: 'Amoxicillin (250mg)', secondary: '₦1,400 • Stock 12' },
+  { value: '3', label: 'Amoxicillin/Clavulanic Acid (625mg)', secondary: '₦3,100 • Stock 8' },
+  { value: '4', label: 'Erythromycin (500mg)', secondary: '₦900 • Stock 60' },
+  { value: '5', label: 'Ibuprofen (400mg)', secondary: '₦450 • Stock 300' },
+  { value: '6', label: 'Ferrous Sulphate (200mg)', secondary: '₦300 • Stock 5' },
+  // "sul" now reaches two of these: once at the start of a word, once inside one.
+  // "Bisulolol" sorts before "Ferrous" alphabetically, so with the word-start rule
+  // gone, alphabetical order alone would put the wrong one first - which is what
+  // makes this fixture able to notice anything.
+  { value: '7', label: 'Bisulolol (5mg)', secondary: '₦600 • Stock 40' },
+];
+
+// "amo" reaches exactly the three amoxicillins. It does NOT reach Ibuprofen,
+// Erythromycin or Ferrous Sulphate, so anything extra in the list is a filtering
+// bug. Note that "amo" is a substring of "Paracetamol" (par-a-**c-e-t-a-m-o**-l),
+// which is why this fixture avoids it: a name that contains the letters is
+// correctly a match, and using it here would have tested nothing.
+const amo = filterAndRank(DRUGS, 'amo');
+check('a prefix finds exactly the medicines that contain it', amo.length === 3, amo.map(o => o.label).join(' | '));
+check('and every one of them is an amoxicillin',
+  amo.every(o => o.label.toLowerCase().startsWith('amoxicillin')),
+  amo.map(o => o.label).join(' | '));
+check('the combination sorts after the plain formulations, deterministically',
+  amo[2].label === 'Amoxicillin/Clavulanic Acid (625mg)', amo.map(o => o.label).join(' | '));
+check('and the plain ones keep a stable, alphabetical order between them',
+  amo.slice(0, 2).map(o => o.label).join(' | ') === 'Amoxicillin (250mg) | Amoxicillin (500mg)',
+  amo.slice(0, 2).map(o => o.label).join(' | '));
+check('an exact prefix outranks a mid-word match',
+  rankMatch(DRUGS[0], 'amox') < rankMatch(DRUGS[2], 'acid'));
+
+// A word-start match must outrank a match buried mid-word, so searching "sul"
+// puts Ferrous Sulphate above anything that merely contains those letters.
+const paraRanked = rankOptions(DRUGS, 'sul');
+check('a word-start match outranks a mid-word match',
+  paraRanked[0].label === 'Ferrous Sulphate (200mg)', paraRanked.map(o => `${o.label}=${o.rank}`).join(' | '));
+check('a mid-word match is still found at all',
+  rankMatch({ value: 'x', label: 'Hydroxychloroquine (200mg)' }, 'chloro') !== null);
+
+// Someone who knows the strength and not the brand can still find the medicine.
+check('the right-hand detail is searched too',
+  rankMatch({ value: '7', label: 'Ibuprofen', secondary: '400mg • Stock 30' }, '400mg') !== null);
+check('and it is found through the shared component, not a special case',
+  filterAndRank([{ value: '7', label: 'Ibuprofen', secondary: '400mg • Stock 30' }], '400mg').length === 1);
+
+// Nothing matching must produce nothing, so the caller can say so rather than
+// showing a list that silently excludes what was searched for.
+check('a query that matches nothing returns nothing', filterAndRank(DRUGS, 'zzzz').length === 0);
+check('an empty query shows everything', filterAndRank(DRUGS, '').length === DRUGS.length);
+check('whitespace alone is treated as no query, not as a query for spaces',
+  filterAndRank(DRUGS, '   ').length === DRUGS.length);
+
+// Case must not matter, or "AMOX" finds nothing in a list of Title Case names.
+check('the search ignores case', filterAndRank(DRUGS, 'AMOXICILLIN').length === 3);
+check('...and mixed case', filterAndRank(DRUGS, 'amOxIcIlLiN').length === 3);
+
+// The list is bounded, because the longest one is a whole formulary.
+const huge = Array.from({ length: 900 }, (_, i) => ({ value: String(i), label: `Medicine ${i}` }));
+check('a long list is capped rather than rendered whole',
+  filterAndRank(huge, 'medicine').length === 60, `${filterAndRank(huge, 'medicine').length} rendered`);
+
+// The highlight must be a substring of the real label, never a rewrite of it.
+const span = matchSpan('Amoxicillin/Clavulanic Acid (625mg)', 'clav');
+check('the highlighted text is exactly the substring that was matched',
+  span && span.before + span.hit + span.after === 'Amoxicillin/Clavulanic Acid (625mg)',
+  JSON.stringify(span));
+check('the highlight is the label\'s own casing, not what was typed',
+  // This is the point: matching ignores case, but the text that ends up in the
+  // field and in the record is the real name from the list, never the query.
+  matchSpan('Amoxicillin (500mg)', 'AMOX')?.hit === 'Amox',
+  JSON.stringify(matchSpan('Amoxicillin (500mg)', 'AMOX')));
+check('a label with no match has no highlight, and says so by returning null',
+  matchSpan('Ibuprofen', 'zzz') === null);
+
+// ---------------------------------------------------------------------------
+
+console.log('');
+if (failures) {
+  console.log(`[access self-test] ${failures} of ${checks} checks FAILED`);
+  process.exitCode = 1;
+} else {
+  console.log(`[access self-test] all ${checks} checks behaved as expected`);
+}

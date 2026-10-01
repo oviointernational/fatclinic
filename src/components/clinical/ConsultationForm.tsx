@@ -1,6 +1,8 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { Patient, Visit, ClinicalDiagnosis, LabCategory, LabInvestigationDefinition, LabTestOrder, Medication, wardName } from '../../types';
 import { db } from '../../services/db';
+import { Typeahead } from '../../components/common/Typeahead';
+import { useAccess } from '../../hooks/useAccess';
 import { useCurrentUser } from '../../context/AuthContext';
 import { useSyncDb } from '../../hooks/useSyncDb';
 import { aiService } from '../../services/aiService';
@@ -424,6 +426,26 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   const medications = db.getMedications();
   const settings = db.getSettings();
 
+  // The running totals on this form ARE the patient's bill - they become the
+  // invoice the cashier collects - so they are money, and money is limited to
+  // Administrator, Front Desk and Billing Officer. A doctor still orders
+  // everything; they simply do not see the amount. Hiding the total but leaving
+  // each unit price on screen would be no protection at all, since one test's
+  // price is most of the answer, so the figures go together.
+  const showMoney = useAccess().canSeeRevenue();
+
+  // The option lists for the two search boxes, built once per change rather than
+  // on every keystroke. Rebuilding several hundred strings per character typed is
+  // the difference between a search box that feels instant and one that lags.
+  const medicationOptions = useMemo(
+    () => medications.map(m => ({
+      value: m.id,
+      label: `${m.name} (${m.strength})`,
+      secondary: `${showMoney ? `${settings.currency}${m.unitPrice} • ` : ''}Stock ${m.currentStock}`,
+    })),
+    [medications, showMoney, settings.currency],
+  );
+
   // dialog states
   const [showComplaintDlg, setShowComplaintDlg] = useState(false);
   const [complaintDlgTitle, setComplaintDlgTitle] = useState('');
@@ -449,6 +471,22 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
 
   const [showLabDlg, setShowLabDlg] = useState(false);
   const [labDlgDept, setLabDlgDept] = useState<LabCategory>('HEMATOLOGY');
+
+  // Search options for the investigation picker. Declared here rather than with
+  // the other option lists because it depends on the department chosen above,
+  // and reading a variable before its declaration is a compile error - which is
+  // the whole reason this could not simply have been grouped with the rest.
+  const labDefOptions = useMemo(
+    () => labDefs
+      .filter(d => d.category === labDlgDept)
+      .map(def => ({
+        value: def.id,
+        label: `${def.name} — ${def.sampleType}`,
+        secondary: [showMoney ? `${settings.currency}${def.price.toLocaleString()}` : null, def.turnaroundTime]
+          .filter(Boolean).join(' • '),
+      })),
+    [labDefs, labDlgDept, showMoney, settings.currency],
+  );
   const [labDlgSelectedIds, setLabDlgSelectedIds] = useState<string[]>([]);
   const [labDlgPick, setLabDlgPick] = useState<string>('');
   const [labDlgPriority, setLabDlgPriority] = useState<'Routine' | 'Urgent' | 'STAT'>('Urgent');
@@ -580,8 +618,11 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
   // lab dialog handlers
   const openLabDlg = () => { if (refuseIfReadOnly()) return;
     setLabDlgSelectedIds([]);
-    const first = labDefs.find(d=> d.category===labDlgDept)?.id || labDefs[0]?.id || '';
-    setLabDlgPick(first);
+    // Deliberately empty. It used to preselect the first investigation in the
+    // department, which meant the box was never blank and the doctor had to clear
+    // it before searching - and a field that arrives pre-filled invites the first
+    // item to be ordered by accident.
+    setLabDlgPick('');
     setLabDlgPriority(currentPriority);
     setLabDlgNotes(orderClinicalNotes);
     setShowLabDlg(true);
@@ -1375,7 +1416,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
             </div>
             {/* ordered list */}
             <div className="space-y-2">
-              <div className="flex items-center justify-between"><span className="text-xs font-bold text-slate-700 dark:text-slate-300">Ordered Investigations List ({orderedLabTests.length}):</span>{orderedLabTests.length>0 && <span className="text-xs font-extrabold text-emerald-700 dark:text-emerald-400">Total Lab Fee: {settings.currency}{totalLabPrice.toLocaleString()}</span>}</div>
+              <div className="flex items-center justify-between"><span className="text-xs font-bold text-slate-700 dark:text-slate-300">Ordered Investigations List ({orderedLabTests.length}):</span>{orderedLabTests.length>0 && showMoney && <span className="text-xs font-extrabold text-emerald-700 dark:text-emerald-400">Total Lab Fee: {settings.currency}{totalLabPrice.toLocaleString()}</span>}</div>
               {orderedLabTests.length===0 ? (
                 <div className="p-6 rounded-xl border-2 border-dashed border-light-border dark:border-dark-border text-center text-xs text-slate-400">
                   <Beaker className="w-6 h-6 mx-auto mb-1 opacity-50" />No laboratory tests added yet. Click "Add Lab Order" to select investigations.
@@ -1392,7 +1433,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
                         </div>
                         <div className="flex items-center space-x-3">
                           <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-200 dark:bg-dark-card text-slate-700 dark:text-slate-300">{item.priority}</span>
-                          <span className="font-extrabold text-emerald-700 dark:text-emerald-400 text-xs">{settings.currency}{item.price.toLocaleString()}</span>
+                          {showMoney && <span className="font-extrabold text-emerald-700 dark:text-emerald-400 text-xs">{settings.currency}{item.price.toLocaleString()}</span>}
                           <button type="button" onClick={()=> setOrderedLabTests(prev=> prev.filter(t=>t.id!==item.id))} className="text-rose-500 hover:text-rose-700 p-1 rounded-lg hover:bg-rose-50 dark:hover:bg-rose-950/40"><Trash2 className="w-4 h-4" /></button>
                         </div>
                       </div>
@@ -1458,7 +1499,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
                 <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">Prescribe medications via dialog – you can add multiple at once</p>
               </div>
               <div className="flex items-center space-x-3">
-                {rxItems.length>0 && <span className="text-xs font-extrabold text-purple-700 dark:text-purple-400">Total Rx: {settings.currency}{totalRxPrice.toLocaleString()}</span>}
+                {rxItems.length>0 && showMoney && <span className="text-xs font-extrabold text-purple-700 dark:text-purple-400">Total Rx: {settings.currency}{totalRxPrice.toLocaleString()}</span>}
                 <button type="button" onClick={openRxDlg} className="flex items-center space-x-1.5 px-4 py-2 rounded-xl text-xs font-bold bg-purple-600 hover:bg-purple-700 text-white shadow-sm disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"><Plus className="w-4 h-4" /><span>Add Prescription</span></button>
               </div>
             </div>
@@ -1473,7 +1514,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
                   return (
                     <div key={idx} className="p-4 rounded-xl bg-slate-50 dark:bg-dark-surface border border-light-border dark:border-dark-border text-xs">
                       <div className="flex items-center justify-between mb-2">
-                        <span className="font-extrabold text-purple-700 dark:text-purple-300 flex items-center space-x-2"><span className="w-6 h-6 rounded-full bg-purple-600 text-white flex items-center justify-center text-[10px] font-black">{idx+1}</span><span>{med?.name}</span><span className="text-[10px] font-normal text-slate-500">({med?.strength}) • {settings.currency}{med?.unitPrice}</span></span>
+                        <span className="font-extrabold text-purple-700 dark:text-purple-300 flex items-center space-x-2"><span className="w-6 h-6 rounded-full bg-purple-600 text-white flex items-center justify-center text-[10px] font-black">{idx+1}</span><span>{med?.name}</span><span className="text-[10px] font-normal text-slate-500">({med?.strength}){showMoney ? ` • ${settings.currency}${med?.unitPrice}` : ''}</span></span>
                         <button type="button" onClick={()=> setRxItems(prev=> prev.filter((_,i)=>i!==idx))} className="text-rose-500 hover:text-rose-700 flex items-center space-x-1"><Trash2 className="w-3.5 h-3.5" /><span>Remove</span></button>
                       </div>
                       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
@@ -1689,24 +1730,22 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
               <div><label className={labelCls}>Select Department*</label>
                 <div className="flex flex-wrap gap-2">
                   {DEPARTMENTS.map(d=>(
-                    <button key={d.id} type="button" onClick={()=> { setLabDlgDept(d.id); const first = labDefs.find(x=> x.category===d.id)?.id || ''; setLabDlgPick(first); }} className={`px-3 py-2 rounded-xl text-xs font-bold border ${labDlgDept===d.id? d.color+' text-white border-transparent shadow-md':'bg-white dark:bg-dark-surface border-light-border'}`}>{d.label}</button>
+                    <button key={d.id} type="button" onClick={()=> { setLabDlgDept(d.id); setLabDlgPick(''); }} className={`px-3 py-2 rounded-xl text-xs font-bold border ${labDlgDept===d.id? d.color+' text-white border-transparent shadow-md':'bg-white dark:bg-dark-surface border-light-border'}`}>{d.label}</button>
                   ))}
                 </div>
               </div>
               <div>
                 <label className={labelCls}>Select Investigation (dropdown)*</label>
                 <div className="flex gap-2">
-                  <select
-                    value={labDlgPick}
-                    onChange={e=> setLabDlgPick(e.target.value)}
-                    className={inputCls + ' flex-1'}
-                  >
-                    {labDefs.filter(d=> d.category===labDlgDept).map(def=>(
-                      <option key={def.id} value={def.id}>
-                        {def.name} — {def.sampleType} • {settings.currency}{def.price.toLocaleString()} {def.turnaroundTime?`• ${def.turnaroundTime}`:''}
-                      </option>
-                    ))}
-                  </select>
+                  <Typeahead
+                    options={labDefOptions}
+                    value={labDlgPick || null}
+                    onChange={(v) => setLabDlgPick(v)}
+                    placeholder={`Type to search ${(labDlgDept || '').replace(/_/g, ' ').toLowerCase()} investigations`}
+                    searchingFor="investigations in this department"
+                    className="flex-1"
+                    inputClassName="py-2.5"
+                  />
                   <button type="button" onClick={handleLabDropdownAdd} disabled={!labDlgPick || labDlgSelectedIds.includes(labDlgPick)} className="px-4 py-2 rounded-xl text-xs font-bold bg-amber-500 hover:bg-amber-600 text-white shadow-sm disabled:opacity-40 disabled:cursor-not-allowed flex items-center space-x-1 flex-shrink-0">
                     <Plus className="w-3.5 h-3.5" /><span>Add</span>
                   </button>
@@ -1723,7 +1762,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
                           <div key={id} className="flex items-center justify-between p-2.5 rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 text-xs">
                             <div>
                               <div className="font-bold text-slate-900 dark:text-white">{def.name}</div>
-                              <div className="text-[10px] text-slate-500">{def.sampleType} • TAT: {def.turnaroundTime} • {settings.currency}{def.price.toLocaleString()}</div>
+                              <div className="text-[10px] text-slate-500">{def.sampleType} • TAT: {def.turnaroundTime}{showMoney ? ` • ${settings.currency}${def.price.toLocaleString()}` : ''}</div>
                             </div>
                             <button type="button" onClick={()=> setLabDlgSelectedIds(prev=> prev.filter(x=>x!==id))} className="p-1.5 rounded-lg hover:bg-rose-100 text-rose-500"><X className="w-3.5 h-3.5" /></button>
                           </div>
@@ -1739,7 +1778,7 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
               </div>
             </div>
             <div className="px-5 py-3 bg-slate-50 dark:bg-dark-surface/60 rounded-b-2xl flex justify-between items-center flex-shrink-0">
-              <span className="text-xs font-bold text-slate-600">{labDlgSelectedIds.length} test(s) • Est. {settings.currency}{labDefs.filter(d=> labDlgSelectedIds.includes(d.id)).reduce((s,t)=>s+t.price,0).toLocaleString()}</span>
+              <span className="text-xs font-bold text-slate-600">{labDlgSelectedIds.length} test(s){showMoney ? ` • Est. ${settings.currency}${labDefs.filter(d=> labDlgSelectedIds.includes(d.id)).reduce((s,t)=>s+t.price,0).toLocaleString()}` : ''}</span>
               <div className="flex space-x-2">
                 <button onClick={()=> setShowLabDlg(false)} className="px-4 py-2 rounded-xl text-xs font-bold border">Cancel</button>
                 <button onClick={confirmLabAdd} disabled={labDlgSelectedIds.length===0} className="px-5 py-2 rounded-xl text-xs font-bold bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-40">Add to Order</button>
@@ -1755,7 +1794,22 @@ export const ConsultationForm: React.FC<ConsultationFormProps> = ({
           <div className="relative bg-white dark:bg-dark-card rounded-2xl shadow-2xl w-full max-w-xl border max-h-[90vh] flex flex-col animate-in zoom-in">
             <div className="px-5 py-4 border-b flex items-center justify-between flex-shrink-0"><h3 className="font-extrabold text-sm flex items-center space-x-2"><Pill className="w-4 h-4 text-purple-600" /><span>Add Prescription</span></h3><button onClick={()=> setShowRxDlg(false)} className="p-1.5 rounded-lg hover:bg-slate-100"><X className="w-4 h-4" /></button></div>
             <div className="p-5 space-y-3 overflow-y-auto">
-              <div><label className={labelCls}>Medication*</label><select value={rxDlgMedId} onChange={e=> setRxDlgMedId(e.target.value)} className={inputCls}>{medications.map(m=> <option key={m.id} value={m.id}>{m.name} ({m.strength}) • {settings.currency}{m.unitPrice} [Stock {m.currentStock}]</option>)}</select></div>
+              <div>
+                <label className={labelCls}>Medication*</label>
+                {/* Was a `<select>` of every item in the formulary. A clinic has
+                    hundreds, and a native dropdown offers no search at all, so
+                    finding one meant scrolling past everything before it. Typing
+                    a few letters now narrows it, and the stock count stays on the
+                    right so a doctor can see what there is before prescribing. */}
+                <Typeahead
+                  options={medicationOptions}
+                  value={rxDlgMedId || null}
+                  onChange={(v) => setRxDlgMedId(v)}
+                  placeholder="Type a drug name or strength"
+                  searchingFor="medications in stock"
+                  inputClassName="py-2.5"
+                />
+              </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div><label className={labelCls}>Dosage*</label><input value={rxDlgDosage} onChange={e=> setRxDlgDosage(e.target.value)} className={inputCls} placeholder="e.g. 1 tablet 500mg" /></div>
                 <div><label className={labelCls}>Route</label><select value={rxDlgRoute} onChange={e=> setRxDlgRoute(e.target.value)} className={inputCls}><option>Oral</option><option>IV</option><option>IM</option><option>Topical</option><option>Inhalation</option><option>Sublingual</option></select></div>
