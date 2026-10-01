@@ -10,49 +10,27 @@
  */
 import { useMemo } from 'react';
 import { db } from '../services/db';
-import { useCurrentUser } from '../context/AuthContext';
-import {
-  canOpenMainNav, canOpenSubNav, canSeeRevenue, permittedMainNavs, permittedSubNavs,
-  resolveRoute, deniedReason,
-} from '../services/accessControl';
-import type { MainNavId, SubNavId } from '../components/layout/navModel';
-import type { User } from '../types';
+// `useAuth`, deliberately NOT `useCurrentUser`.
+//
+// `useCurrentUser()` throws when nobody is signed in, which is right for a
+// clinical screen that App already refuses to render without a session. But App
+// calls this hook at the top of its own component, ABOVE the signed-out gate,
+// because `goTo` needs the answers. So `useCurrentUser()` here threw during the
+// render that exists precisely to show the sign-in card, React unmounted the
+// tree, and /staff came up blank for everybody - there was no way to sign in at
+// all. `currentUser` is already nullable in the context, so read that.
+//
+// All the deciding is in `accessFor`/`denyAllAccess`, which are plain functions
+// in `accessControl.ts` and are checked directly by the self-test. This hook only
+// supplies the person.
+import { useAuth } from '../context/AuthContext';
+import { accessFor } from '../services/accessControl';
 
 export function useAccess() {
-  const currentUser = useCurrentUser();
-  const user = currentUser as User | null;
+  const { currentUser } = useAuth();
 
-  return useMemo(() => {
-    const customRole = user?.customRoleId ? db.getCustomRoleById(user.customRoleId) : undefined;
-
-    if (!user) {
-      // No signed-in person: nothing is visible and nothing is openable. Every
-      // predicate below answers false rather than throwing, so a screen rendered
-      // during sign-out shows an empty shell instead of crashing.
-      const denyAll = () => false;
-      return {
-        user: null,
-        customRole: undefined,
-        canSeeRevenue: () => false,
-        canOpenMainNav: denyAll as (nav: MainNavId) => boolean,
-        canOpenSubNav: denyAll as (nav: MainNavId, sub: SubNavId) => boolean,
-        permittedMainNavs: () => [],
-        permittedSubNavs: () => [],
-        resolveRoute: () => ({ nav: null, sub: null, refused: null, redirected: false }),
-        deniedReason: () => 'Nobody is signed in.',
-      };
-    }
-
-    return {
-      user,
-      customRole,
-      canSeeRevenue: () => canSeeRevenue(user, customRole),
-      canOpenMainNav: (nav: MainNavId) => canOpenMainNav(user, nav, customRole),
-      canOpenSubNav: (nav: MainNavId, sub: SubNavId) => canOpenSubNav(user, nav, sub, customRole),
-      permittedMainNavs: () => permittedMainNavs(user, customRole),
-      permittedSubNavs: (nav: MainNavId) => permittedSubNavs(user, nav, customRole),
-      resolveRoute: (nav: MainNavId, sub: SubNavId) => resolveRoute(user, customRole, nav, sub),
-      deniedReason: (nav: MainNavId, sub: SubNavId) => deniedReason(user, nav, sub, customRole),
-    };
-  }, [user, user?.customRoleId]);
+  return useMemo(
+    () => accessFor(currentUser, id => db.getCustomRoleById(id)),
+    [currentUser, currentUser?.customRoleId],
+  );
 }

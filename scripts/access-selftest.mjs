@@ -62,6 +62,7 @@ const {
 const {
   canSeeRevenue, canOpenMainNav, canOpenSubNav, permittedMainNavs, permittedSubNavs,
   firstPermittedNav, firstPermittedSub, resolveRoute, deniedReason,
+  denyAllAccess, accessFor,
 } = await import('../src/services/accessControl.ts');
 
 const {
@@ -651,6 +652,95 @@ check('a timestamped record keeps its time of day',
 check('the screen is told which range it is showing', describeWindow(month) === 'This month');
 check('and an all-time report says so rather than saying nothing', describeWindow(null) === 'All time');
 check('and a custom range is named', /2026-09-01 to 2026-09-30/.test(describeWindow(custom.window)));
+
+// ---------------------------------------------------------------------------
+// The signed-out visitor gets a page, not a crash
+// ---------------------------------------------------------------------------
+
+section('a signed-out visitor gets a page, not a crash');
+
+// This section guards a bug that shipped: `/staff` rendered blank for everybody,
+// because `App` calls `useAccess()` above its own signed-out gate and that hook
+// used `useCurrentUser()`, which throws when nobody is signed in. The throw
+// happened during the render whose job is to show the sign-in card, React
+// unmounted the tree, and there was no way to sign in at all. It passed `tsc`,
+// passed the build, and passed every other check, because the landing page is
+// rendered by a different component and looked perfectly fine.
+
+const signedOut = denyAllAccess();
+
+check('a signed-out visitor has no user', signedOut.user === null);
+check('and nothing is openable',
+  MAIN_NAV.every(n => !signedOut.canOpenMainNav(n.id)),
+  MAIN_NAV.filter(n => signedOut.canOpenMainNav(n.id)).map(n => n.id).join(', '));
+check('and no screen inside any department is openable',
+  Object.keys(SUB_NAV).every(nav => signedOut.permittedSubNavs(nav).length === 0));
+check('and no menu at all is offered', signedOut.permittedMainNavs().length === 0);
+check('and no money', signedOut.canSeeRevenue() === false);
+check('and a navigation goes nowhere, without throwing',
+  signedOut.resolveRoute('laboratory', 'hematology').nav === null);
+check('and it says why in words rather than crashing',
+  signedOut.deniedReason('laboratory', 'hematology') === 'Nobody is signed in.');
+
+// Deny-all must be total, not partial: every entry point answered, and none of
+// them raises whatever arguments it is handed.
+let signedOutThrew = null;
+try {
+  signedOut.canSeeRevenue();
+  signedOut.canOpenMainNav('laboratory');
+  signedOut.canOpenSubNav('laboratory', 'hematology');
+  signedOut.permittedMainNavs();
+  signedOut.permittedSubNavs('laboratory');
+  signedOut.resolveRoute('admin', 'users_mgmt');
+  signedOut.deniedReason('admin', 'users_mgmt');
+} catch (err) {
+  signedOutThrew = err.message;
+}
+check('none of the signed-out answers throws, whatever it is asked', signedOutThrew === null, signedOutThrew);
+
+// `accessFor(null, ...)` must be the same answer, since that is the path the hook
+// actually takes. If it ever diverged from `denyAllAccess`, the thing under test
+// and the thing in use would be two different functions.
+const viaAccessFor = accessFor(null, () => undefined);
+check('accessFor(null) agrees with denyAllAccess about every answer',
+  viaAccessFor.canOpenMainNav('laboratory') === signedOut.canOpenMainNav('laboratory')
+  && viaAccessFor.permittedMainNavs().length === signedOut.permittedMainNavs().length
+  && viaAccessFor.canSeeRevenue() === signedOut.canSeeRevenue());
+
+// ...and a signed-in person still gets their own answers from the same function,
+// so the signed-out path is a branch, not a replacement of the real thing.
+const adminViaAccessFor = accessFor(user('ADMINISTRATOR'), () => undefined);
+check('accessFor still answers for somebody who IS signed in',
+  adminViaAccessFor.canOpenMainNav('admin') && adminViaAccessFor.user !== null);
+
+// The static half. Nothing App renders above its signed-out gate may raise, and
+// the hook that supplies those answers is the only place that could.
+//
+// Comments are stripped first, and that matters: the fix for this bug is a
+// comment explaining WHY `useCurrentUser` must not be called here, which means
+// the file names the very thing the check forbids. A check that read prose would
+// fail on the explanation and pass on the bug.
+function codeOnly(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/^\s*\/\/.*$/gm, ' ');
+}
+
+const hookSrc = codeOnly(fs.readFileSync(path.join(ROOT, 'src', 'hooks', 'useAccess.ts'), 'utf8'));
+check('useAccess does not call the hook that throws while signed out',
+  !/useCurrentUser\s*\(/.test(hookSrc),
+  'useAccess is called by App above the signed-out gate; a throw there unmounts the tree and /staff renders blank');
+check('useAccess does not import it either',
+  !/import[^;]*useCurrentUser/.test(hookSrc));
+
+const appSrc = codeOnly(fs.readFileSync(path.join(ROOT, 'src', 'App.tsx'), 'utf8'));
+const gateAt = appSrc.indexOf('if (isResolvingSession)');
+check('App still gates on the session before rendering any clinical screen', gateAt > 0);
+const preGate = appSrc.slice(0, gateAt > 0 ? gateAt : appSrc.length);
+const preGateHooks = [...preGate.matchAll(/\b(use[A-Z]\w*)\s*\(/g)].map(m => m[1]);
+check('nothing App calls above its gate can raise on a signed-out visitor',
+  !preGateHooks.includes('useCurrentUser'),
+  `above the gate App calls: ${[...new Set(preGateHooks)].join(', ')}`);
 
 // ---------------------------------------------------------------------------
 // Typeahead: the suggestion you most likely meant comes first

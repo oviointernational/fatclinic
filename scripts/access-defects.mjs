@@ -25,6 +25,7 @@ const TARGETS = {
   permissions: path.join(ROOT, 'src', 'services', 'permissions.ts'),
   dateRange: path.join(ROOT, 'src', 'services', 'dateRange.ts'),
   searchRank: path.join(ROOT, 'src', 'services', 'searchRank.ts'),
+  useAccess: path.join(ROOT, 'src', 'hooks', 'useAccess.ts'),
 };
 
 /** Where each injected source lives, for writing it back. */
@@ -34,6 +35,7 @@ const PATHS = {
   permissions: ['services', 'permissions.ts'],
   dateRange: ['services', 'dateRange.ts'],
   searchRank: ['services', 'searchRank.ts'],
+  useAccess: ['hooks', 'useAccess.ts'],
 };
 
 /** Pristine bytes, read in-process so no backup can go stale. */
@@ -53,6 +55,36 @@ const norm = (s) => s.replaceAll('\r\n', '\n');
 const TZ = { lagos: { TZ: 'Africa/Lagos' }, la: { TZ: 'America/Los_Angeles' } };
 
 const DEFECTS = [
+  {
+    file: 'useAccess',
+    name: 'the hook above the signed-out gate calls the hook that throws when signed out',
+    // The defect that actually shipped. `/staff` was blank for every visitor: the
+    // sign-in card is rendered by the signed-out branch of App, App calls
+    // useAccess above that branch, and useCurrentUser raises - so the render that
+    // exists to show the sign-in card is the render that dies.
+    from: `  const { currentUser } = useAuth();`,
+    to: `  useCurrentUser();
+  const { currentUser } = useAuth();`,
+    count: 1,
+  },
+  {
+    file: 'accessControl',
+    name: 'a signed-out visitor is allowed everything',
+    // The other half of the same bug: if the deny-all stops denying, the blank
+    // page would be replaced by a dashboard full of menus and no session.
+    from: `export function denyAllAccess(): Access {
+  const nothing = () => false;`,
+    to: `export function denyAllAccess(): Access {
+  const nothing = () => true;`,
+    count: 1,
+  },
+  {
+    file: 'accessControl',
+    name: 'the signed-out route resolution invents a destination instead of refusing',
+    from: `    resolveRoute: () => ({ nav: null, sub: null, refused: null, redirected: false }),`,
+    to: `    resolveRoute: () => ({ nav: 'dashboard', sub: 'overview', refused: null, redirected: false }),`,
+    count: 1,
+  },
   {
     file: 'accessControl',
     name: 'the revenue gate is dropped, so a permission is the only check again',
@@ -316,6 +348,39 @@ function restore() {
     }
   }
 }
+
+/**
+ * Restore on the way out, however we are leaving.
+ *
+ * This script rewrites real source files to break them on purpose. Between the
+ * write and the restore, `src/` holds a defect, and a defect that outlives the
+ * process is far worse than a test that failed: the next `npm test` reports a
+ * failing check nobody introduced, and the obvious response - to "fix" the source
+ * - deletes the code under test.
+ *
+ * That is not hypothetical. `node scripts/access-defects.mjs | Select-Object
+ * -First 20` closes the pipeline once it has twenty lines, PowerShell stops the
+ * upstream process, and node is killed before it reaches `restore()`. The tree
+ * was left holding a real regression that the next run reported as a genuine
+ * failure in the shipping code.
+ *
+ * So the restore is bound to `exit`, SIGINT and SIGTERM rather than only reached
+ * on the happy path. It runs again on the way out even after the normal
+ * in-loop restores, which is cheap and leaves nothing to chance.
+ */
+let restoredOnExit = false;
+function restoreOnExit() {
+  if (restoredOnExit) return;
+  restoredOnExit = true;
+  restore();
+}
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    restoreOnExit();
+    process.exit(130);
+  });
+}
+process.on('exit', restoreOnExit);
 
 function run(env) {
   try {

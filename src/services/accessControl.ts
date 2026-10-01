@@ -137,6 +137,81 @@ export function firstPermittedSub(user: User, nav: MainNavId, customRole?: Custo
 }
 
 // ---------------------------------------------------------------------------
+// The signed-out case, as a value rather than a branch inside a hook
+// ---------------------------------------------------------------------------
+
+/** The shape every caller destructures from `access`, for a given person. */
+export interface Access {
+  user: User | null;
+  customRole: CustomRole | undefined;
+  canSeeRevenue: () => boolean;
+  canOpenMainNav: (nav: MainNavId) => boolean;
+  canOpenSubNav: (nav: MainNavId, sub: SubNavId) => boolean;
+  permittedMainNavs: () => MainNavItem[];
+  permittedSubNavs: (nav: MainNavId) => SubNavItem[];
+  resolveRoute: (nav: MainNavId, sub: SubNavId) => RouteDecision;
+  deniedReason: (nav: MainNavId, sub: SubNavId) => string;
+}
+
+/**
+ * What a person who is not signed in is allowed: nothing, and told so.
+ *
+ * WHY THIS IS EXPORTED RATHER THAN LIVING INSIDE THE HOOK
+ * ------------------------------------------------------
+ * `App` calls `useAccess()` at the top of its own component, ABOVE the signed-out
+ * gate that draws the sign-in card - `goTo` needs the answers on every render.
+ * The first version of that hook reached for `useCurrentUser()`, which throws when
+ * nobody is signed in. So the throw happened during the render whose entire
+ * purpose is to show somebody how to sign in, React unmounted the tree, and
+ * `/staff` came up blank for every visitor: no card, no error, no way in.
+ *
+ * Two things have to be true for that not to happen again, and only one of them
+ * is visible in the browser:
+ *
+ *   1. nothing called above the gate may raise. That is why this deny-all is a
+ *      value with no throwing path in it, and why `useAccess` reads the nullable
+ *      `currentUser` rather than `useCurrentUser()`.
+ *   2. the signed-out answers really are "nothing is openable". That is a claim
+ *      about behaviour, so it lives here, where the self-test can call it.
+ */
+export function denyAllAccess(): Access {
+  const nothing = () => false;
+  return {
+    user: null,
+    customRole: undefined,
+    canSeeRevenue: nothing,
+    canOpenMainNav: nothing,
+    canOpenSubNav: nothing,
+    permittedMainNavs: () => [],
+    permittedSubNavs: () => [],
+    resolveRoute: () => ({ nav: null, sub: null, refused: null, redirected: false }),
+    deniedReason: () => 'Nobody is signed in.',
+  };
+}
+
+/** The answers for `user`, resolving their custom role first. */
+export function accessFor(
+  user: User | null,
+  lookupCustomRole: (id: string) => CustomRole | undefined,
+): Access {
+  if (!user) return denyAllAccess();
+
+  const customRole = user.customRoleId ? lookupCustomRole(user.customRoleId) : undefined;
+
+  return {
+    user,
+    customRole,
+    canSeeRevenue: () => canSeeRevenue(user, customRole),
+    canOpenMainNav: (nav: MainNavId) => canOpenMainNav(user, nav, customRole),
+    canOpenSubNav: (nav: MainNavId, sub: SubNavId) => canOpenSubNav(user, nav, sub, customRole),
+    permittedMainNavs: () => permittedMainNavs(user, customRole),
+    permittedSubNavs: (nav: MainNavId) => permittedSubNavs(user, nav, customRole),
+    resolveRoute: (nav: MainNavId, sub: SubNavId) => resolveRoute(user, customRole, nav, sub),
+    deniedReason: (nav: MainNavId, sub: SubNavId) => deniedReason(user, nav, sub, customRole),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Navigation that cannot be talked out of
 // ---------------------------------------------------------------------------
 
