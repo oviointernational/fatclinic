@@ -177,7 +177,12 @@ const renderContent = () => {
               onNavigatePharmacy={() => onNavigate('pharmacy', 'rx_queue')}
               onNavigateRadiology={() => onNavigate('radiology', 'radiology_all')}
               onNavigatePhysiotherapy={() => onNavigate('physiotherapy', 'physio_all')}
-              onNavigateBilling={() => onNavigate('billing', 'all_invoices')}
+              // Through Front Desk, not the removed Billing column. Both render
+              // `<CentralBilling initialTab="invoices" />`, but Front Desk is a row
+              // in the first column - so the screen the card opens is one the menu
+              // can account for. Routing to `billing` left Central Billing on screen
+              // with nothing marked in the menu at all.
+              onNavigateBilling={() => onNavigate('patients', 'central_billing')}
               onOpenClinicalGroup={handleOpenClinicalGroup}
               onSelectPatient={(p) => {
                 onSelectPatient(p);
@@ -196,7 +201,12 @@ const renderContent = () => {
               onNavigatePharmacy={() => onNavigate('pharmacy', 'rx_queue')}
               onNavigateRadiology={() => onNavigate('radiology', 'radiology_all')}
               onNavigatePhysiotherapy={() => onNavigate('physiotherapy', 'physio_all')}
-              onNavigateBilling={() => onNavigate('billing', 'all_invoices')}
+              // Through Front Desk, not the removed Billing column. Both render
+              // `<CentralBilling initialTab="invoices" />`, but Front Desk is a row
+              // in the first column - so the screen the card opens is one the menu
+              // can account for. Routing to `billing` left Central Billing on screen
+              // with nothing marked in the menu at all.
+              onNavigateBilling={() => onNavigate('patients', 'central_billing')}
               onOpenClinicalGroup={handleOpenClinicalGroup}
               onSelectPatient={(p) => {
                 onSelectPatient(p);
@@ -213,7 +223,7 @@ const renderContent = () => {
             onNavigatePharmacy={() => onNavigate('pharmacy', 'rx_queue')}
             onNavigateRadiology={() => onNavigate('radiology', 'radiology_all')}
             onNavigatePhysiotherapy={() => onNavigate('physiotherapy', 'physio_all')}
-            onNavigateBilling={() => onNavigate('billing', 'all_invoices')}
+            onNavigateBilling={() => onNavigate('patients', 'central_billing')}
             onOpenClinicalGroup={handleOpenClinicalGroup}
             onSelectPatient={(p) => {
               onSelectPatient(p);
@@ -470,7 +480,7 @@ const renderContent = () => {
             onNavigatePharmacy={() => onNavigate('pharmacy', 'rx_queue')}
             onNavigateRadiology={() => onNavigate('radiology', 'radiology_all')}
             onNavigatePhysiotherapy={() => onNavigate('physiotherapy', 'physio_all')}
-            onNavigateBilling={() => onNavigate('billing', 'all_invoices')}
+            onNavigateBilling={() => onNavigate('patients', 'central_billing')}
             onOpenClinicalGroup={handleOpenClinicalGroup}
             onSelectPatient={onOpenPatientProfile}
           />

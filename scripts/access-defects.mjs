@@ -60,6 +60,35 @@ const TZ = { lagos: { TZ: 'Africa/Lagos' }, la: { TZ: 'America/Los_Angeles' } };
 
 const DEFECTS = [
   {
+    file: 'navModel',
+    name: 'Billing goes back to being a column of its own, duplicating the Front Desk',
+    // The repetition that was reported: the same billing screens, listed under a
+    // second name, while Front Desk already carries four billing rows.
+    from: "    anyOf: BILLING_KEYS, revenue: 'anyOfBilling', inMenu: false,",
+    to: "    anyOf: BILLING_KEYS, revenue: 'anyOfBilling',",
+    count: 1,
+  },
+  {
+    file: 'mainContainer',
+    name: 'a card navigates to the removed Billing column, stranding the screen outside the menu',
+    // This is not hypothetical: the dashboard's billing card did exactly this, and
+    // Central Billing opened with no row marked in the first column. Found by
+    // clicking it in a browser, not by reading the code.
+    // All four dashboard screens that open billing do so the same way, so the
+    // injector reverts all four - putting back the old route even in one of them
+    // is the same defect.
+    from: "onNavigateBilling={() => onNavigate('patients', 'central_billing')}",
+    to: "onNavigateBilling={() => onNavigate('billing', 'all_invoices')}",
+    count: 4,
+  },
+  {
+    file: 'accessControl',
+    name: 'the menu ignores inMenu, so a screen reached from elsewhere is listed twice',
+    from: 'return MAIN_NAV.filter(n => n.inMenu !== false && canOpenMainNav(user, n.id, customRole));',
+    to: 'return MAIN_NAV.filter(n => canOpenMainNav(user, n.id, customRole));',
+    count: 1,
+  },
+  {
     file: 'sidebar2',
     name: 'the submenu goes back to being a percentage, which clips its own labels',
     // The reported defect. `w-[20%]` of the workspace resolved to 80px on an

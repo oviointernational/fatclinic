@@ -99,8 +99,18 @@ export function canOpenSubNav(user: User, nav: MainNavId, sub: SubNavId, customR
 // The filtered menus
 // ---------------------------------------------------------------------------
 
+/**
+ * The first column, as this person sees it.
+ *
+ * `inMenu === false` destinations are filtered out here rather than in
+ * `Sidebar1`, so that everything which reasons about "the menu" agrees: the
+ * sidebar that draws it, `firstPermittedNav` - which is where a refused
+ * navigation lands somebody - and the self-test that brute-forces every role
+ * against every screen. Filtering in the component would have left the other two
+ * answering a question about a menu the person cannot see.
+ */
 export function permittedMainNavs(user: User, customRole?: CustomRole): MainNavItem[] {
-  return MAIN_NAV.filter(n => canOpenMainNav(user, n.id, customRole));
+  return MAIN_NAV.filter(n => n.inMenu !== false && canOpenMainNav(user, n.id, customRole));
 }
 
 /**

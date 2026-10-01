@@ -508,6 +508,107 @@ for (const nav of MAIN_NAV) {
 check('the administrator can open every screen', adminHiddenSubs.length === 0, adminHiddenSubs.join(', '));
 
 // ---------------------------------------------------------------------------
+// The menu does not list a destination twice under two names
+// ---------------------------------------------------------------------------
+
+section('a screen reached from elsewhere is not also a column of its own');
+
+/*
+ * Billing and Analytics were both in the first column while the identical
+ * screens were already one click away - Billing as the Front Desk's four billing
+ * rows and the dashboard's Billing card, Analytics as `dashboard -> analytics`,
+ * which renders the same component. Not a different department offered twice; the
+ * same department.
+ *
+ * The interesting part is not that they are removed from the menu. It is that
+ * removing a menu row must not remove the only way into a screen, and must not
+ * leave somebody with no menu at all. Both are checked below rather than
+ * assumed, because this is a clinical system and a person who cannot reach the
+ * cashier cannot take a payment.
+ */
+
+const notInMenu = MAIN_NAV.filter(n => n.inMenu === false);
+check('exactly Billing and Analytics are reached from elsewhere',
+  notInMenu.map(n => n.id).sort().join(',') === 'analytics,billing',
+  notInMenu.map(n => n.id).join(', ') || 'none marked');
+
+// They are destinations, not screens that were deleted. The gate must still work.
+for (const n of notInMenu) {
+  check(`${n.id} is still a real, gated destination`, (() => {
+    if (!SUB_NAV[n.id]) return false;
+    const subs = allSubNavItems(n.id);
+    if (subs.length === 0) return false;
+    // At least one role can get in, and at least one cannot.
+    return subs.some(s => canOpenSubNav(user('ADMINISTRATOR'), n.id, s.id))
+      && !canOpenSubNav(user('FRONT_DESK'), n.id, 'nl_query');
+  })());
+
+  check(`${n.id} is not offered to anyone as a menu row`,
+    ROLES.every(r => !permittedMainNavs(user(r)).some(x => x.id === n.id)),
+    ROLES.filter(r => permittedMainNavs(user(r)).some(x => x.id === n.id)).join(', '));
+}
+
+// A refusal must never land somebody on a screen with no menu row above it: they
+// would be stuck, with no way back into the application.
+for (const role of ROLES) {
+  const landed = firstPermittedNav(user(role));
+  check(`${role} is never stranded on a screen with no menu row`,
+    landed === null || MAIN_NAV.find(n => n.id === landed)?.inMenu !== false,
+    `landed on ${landed}`);
+}
+
+// And the brute force: nobody's menu is emptied by removing these two rows.
+for (const role of ROLES) {
+  const menu = permittedMainNavs(user(role));
+  const reachable = menu.length > 0
+    ? menu.some(m => permittedSubNavs(user(role), m.id).length > 0)
+    : false;
+  check(`${role} still has a column and it leads somewhere`, reachable,
+    `${menu.length} column(s)`);
+}
+
+// The specific case that worried us: a Billing Officer's whole job is behind that
+// door. They must still be able to do it, through Front Desk.
+const officer = user('BILLING_OFFICER');
+check('a Billing Officer can still take a payment', canOpenSubNav(officer, 'patients', 'pay_bills'));
+check('a Billing Officer can still open an invoice', canOpenSubNav(officer, 'patients', 'central_billing'));
+check('a Billing Officer can still see the price schedule', canOpenSubNav(officer, 'patients', 'price_schedule'));
+check('a Billing Officer reaches analytics through the dashboard',
+  canOpenSubNav(officer, 'dashboard', 'analytics'));
+check('and the billing destination they are sent to is one they may open',
+  canOpenMainNav(officer, 'billing') && canOpenSubNav(officer, 'billing', 'all_invoices'));
+
+/*
+ * `billing/all_invoices` and `patients/central_billing` are the same screen twice:
+ * both render `<CentralBilling initialTab="invoices" />`. Same for the cashier and
+ * the price schedule. Repointing the dashboard's Billing card from one to the other
+ * is therefore free - provided the gate really is identical, which is asserted for
+ * every role rather than reasoned about. If a role could open the old route but
+ * not the new one, the card would have started refusing people who could
+ * previously use it, and no reading of the source would have shown that.
+ */
+const SAME_SCREEN_TWICE = [
+  ['billing', 'all_invoices', 'patients', 'central_billing', 'All Invoices / Central Billing'],
+  ['billing', 'process_payment', 'patients', 'pay_bills', 'Cashier'],
+  ['billing', 'price_schedule', 'patients', 'price_schedule', 'Price Schedule'],
+];
+
+for (const role of ROLES) {
+  for (const [navA, subA, navB, subB, what] of SAME_SCREEN_TWICE) {
+    const a = canOpenSubNav(user(role), navA, subA);
+    const b = canOpenSubNav(user(role), navB, subB);
+    check(`${role} reaches ${what} the same way through either route`, a === b,
+      `${navA}/${subA}=${a} but ${navB}/${subB}=${b}`);
+  }
+}
+
+// A nurse must not have gained the invoice list by this rearrangement.
+const nurse = user('NURSE');
+check('a nurse still cannot open an invoice', !canOpenSubNav(nurse, 'patients', 'central_billing'));
+check('a nurse still cannot open the price schedule', !canOpenSubNav(nurse, 'patients', 'price_schedule'));
+check('a nurse still cannot see revenue analytics', !canOpenSubNav(nurse, 'analytics', 'financial_stats'));
+
+// ---------------------------------------------------------------------------
 // Refusals say something true
 // ---------------------------------------------------------------------------
 
@@ -668,6 +769,64 @@ for (const [file, marker] of [['Sidebar1.tsx', 'item.label'], ['Sidebar2.tsx', '
     !/hidden[^"'`]*>\{item\.label\}/.test(code));
 }
 
+// ---------------------------------------------------------------------------
+// Nothing navigates to a destination the menu does not have
+// ---------------------------------------------------------------------------
+
+section('no screen is opened by a route the menu cannot get back out of');
+
+/*
+ * Removing Billing and Analytics from the first column left one loose end, and it
+ * was found by clicking the dashboard's "Collected Revenue" card in a browser
+ * rather than by reading anything: that card still navigated to `billing`, so the
+ * Central Billing screen opened with NO row marked in the first column. The
+ * person could still leave - clicking any row works - but for a moment the
+ * application was showing a screen it could not account for.
+ *
+ * The fix is to route it through Front Desk, which renders the identical
+ * component, so the screen the card opens is one the menu already knows about.
+ * That is safe because the two routes are proven gated identically above.
+ *
+ * This check is the guard: it forbids the loose end rather than trusting the one
+ * site that had it. `onNavigate` calls are read out of the source, so a card
+ * added next month cannot reintroduce it silently.
+ */
+
+const outOfMenuIds = MAIN_NAV.filter(n => n.inMenu === false).map(n => n.id);
+const mainContainerCode = readSrc('src', 'components', 'layout', 'MainContainer.tsx')
+  .replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^\s*\/\/.*$/gm, ' ');
+
+const routedIds = new Set(
+  [...mainContainerCode.matchAll(/onNavigate\(\s*'([a-z_]+)'/g)].map(m => m[1]),
+);
+check('the application reads as navigating somewhere at all', routedIds.size > 0,
+  `${routedIds.size} distinct destination(s) found`);
+
+const unroutable = [...routedIds].filter(id => outOfMenuIds.includes(id));
+check('nothing navigates to a destination that is not a menu row',
+  unroutable.length === 0, unroutable.join(', '));
+
+// The positive half: the billing card goes to Front Desk, which is a menu row.
+check("the dashboard's billing card opens the billing screen through Front Desk",
+  mainContainerCode.includes("onNavigate('patients', 'central_billing')"));
+check("and it no longer opens it through the removed Billing column",
+  !mainContainerCode.includes("onNavigate('billing'"));
+
+// Analytics is a ROW IN THE DASHBOARD'S SUBMENU, not a route anybody calls. That
+// is the whole reason it needs no second route: clicking it sets
+// `activeNav = 'dashboard'`, so the first column keeps marking the place and the
+// menu never disagrees with the screen. Checked as the submenu entry it is,
+// rather than as an `onNavigate` call that never existed.
+const analyticsRow = (SUB_NAV.dashboard?.items ?? []).find(i => i.id === 'analytics');
+check('analytics is offered as a row inside the dashboard submenu',
+  !!analyticsRow, analyticsRow?.label ?? 'absent from SUB_NAV.dashboard');
+
+// And the component behind it is the same one the removed column rendered, which
+// is what made the second entry a duplicate in the first place.
+check('the dashboard renders AnalyticsDashboard for that row',
+  /activeSubNav === 'analytics'/.test(mainContainerCode)
+  && /return <AnalyticsDashboard \/>/.test(mainCode),
+  'no AnalyticsDashboard for dashboard/analytics');
 
 
 section('a date range covers exactly the days that were asked for');

@@ -80,6 +80,35 @@ export interface MainNavItem {
   anyOf: string[];
   /** Only these roles may see money anywhere in this destination. */
   revenue?: 'anyOfBilling';
+  /**
+   * Whether this destination is offered as a row in the first column.
+   *
+   * `false` means it is a real, gated destination - it has a submenu, a
+   * `MainContainer` case and its own permission checks - but it is reached from
+   * somewhere else, and offering it in the menu as well shows the same screens
+   * twice over.
+   *
+   * Two destinations are like this, and both got into the menu by accident. This
+   * list was rebuilt from the old sidebar, and these two were added because the
+   * rest of the application already navigated to them:
+   *
+   *   - `billing` is what the dashboard's Billing card and the Front Desk's four
+   *     billing rows (`central_billing`, `front_desk_billing`, `pay_bills`,
+   *     `price_schedule`) all point at. A separate Billing column repeated those
+   *     same screens under a second name.
+   *   - `analytics` is `dashboard -> analytics`, which renders the identical
+   *     component. Two entries, one screen.
+   *
+   * So they stay in `MAIN_NAV` and stay in `SUB_NAV` - `MainContainer` dispatches
+   * on the id, and `renderContent`'s guard asks `canOpenSubNav` about it, so
+   * removing either would turn a valid destination into "Access denied". They are
+   * simply not offered as a row.
+   *
+   * The permission gate is untouched by this: they are refused exactly as
+   * strictly as before, and `firstPermittedNav` cannot land anybody here, because
+   * a screen with no menu row has no way back out of it.
+   */
+  inMenu?: boolean;
 }
 
 export interface SubNavItem {
@@ -167,14 +196,18 @@ export const MAIN_NAV: MainNavItem[] = [
     anyOf: ['PHYSIOTHERAPY.QUEUE.VIEW', 'PHYSIOTHERAPY.CONSUMABLES.VIEW', 'PHYSIOTHERAPY.TARIFFS'],
   },
   {
+    // Not a menu row - see `inMenu`. The Billing screens are the Front Desk's
+    // four billing rows, and the dashboard's Billing card lands here too.
     id: 'billing', label: 'Billing', sublabel: 'Invoices & Payments',
     icon: 'Receipt', color: 'from-cyan-600 to-sky-700',
-    anyOf: BILLING_KEYS, revenue: 'anyOfBilling',
+    anyOf: BILLING_KEYS, revenue: 'anyOfBilling', inMenu: false,
   },
   {
+    // Not a menu row - see `inMenu`. This is `dashboard -> analytics`, rendering
+    // the same component.
     id: 'analytics', label: 'Analytics', sublabel: 'Statistics & Reports',
     icon: 'PieChart', color: 'from-teal-500 to-emerald-600',
-    anyOf: ['DASHBOARD.VIEW'], revenue: 'anyOfBilling',
+    anyOf: ['DASHBOARD.VIEW'], revenue: 'anyOfBilling', inMenu: false,
   },
   {
     id: 'ai', label: 'AI Assistant', sublabel: 'Query & Summaries',
