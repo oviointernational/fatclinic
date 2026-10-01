@@ -11,13 +11,12 @@ interface Sidebar1Props {
   activeNav: MainNavId;
   onSelectNav: (id: MainNavId) => void;
   /**
-   * Rendered as an overlay drawer on a phone rather than as a 10% column.
+   * Rendered as an overlay drawer on a phone rather than as a column.
    *
-   * The column's width is a percentage of the workspace, which is a width
-   * percentage of the whole viewport once it is fixed, so a percentage would
-   * make the drawer three icons wide on a large phone and unusable. Fixed widths
-   * are used instead, and it starts expanded because an icon-only rail on a
-   * phone is a guessing game.
+   * Widths are fixed for the same reason as the submenu's, and in the drawer both
+   * columns add up to 264px, which leaves a phone-width screen with something to
+   * tap outside of. It starts expanded because an icon-only rail on a phone is a
+   * guessing game.
    */
   asDrawer?: boolean;
 }
@@ -45,9 +44,9 @@ export const Sidebar1: React.FC<Sidebar1Props> = ({ activeNav, onSelectNav, asDr
     <aside
       className={`${
         isExpanded
-          ? asDrawer ? 'w-[168px] min-w-[168px]' : 'w-[200px] min-w-[200px]'
-          : asDrawer ? 'w-[64px] min-w-[64px]' : 'w-[10%] min-w-[70px] max-w-[100px]'
-      } h-full overflow-y-auto py-4 flex flex-col items-center select-text bg-light-bg dark:bg-dark-bg border-r border-light-border/40 dark:border-dark-border/40 transition-all duration-300`}
+          ? asDrawer ? 'w-[168px]' : 'w-[200px]'
+          : asDrawer ? 'w-[64px]' : 'w-[76px]'
+      } flex-shrink-0 h-full overflow-y-auto py-4 flex flex-col items-center select-text bg-light-bg dark:bg-dark-bg border-r border-light-border/40 dark:border-dark-border/40 transition-all duration-300`}
     >
       <nav className={`w-full flex flex-col ${isExpanded ? 'items-start px-3' : 'items-center px-2'} space-y-2`}>
         {items.map(item => {

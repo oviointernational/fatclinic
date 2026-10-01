@@ -77,7 +77,7 @@ export const MainContainer: React.FC<MainContainerProps> = ({
   // If user clicked "Visit Tabs" from a patient
   if (isViewingVisitTabs && selectedPatient) {
     return (
-      <main className={`${isWideMode ? 'w-full' : 'w-[70%]'} h-full flex flex-col overflow-hidden bg-light-bg dark:bg-dark-bg transition-all duration-300`}>
+      <main className="flex-1 min-w-0 h-full flex flex-col overflow-hidden bg-light-bg dark:bg-dark-bg transition-colors">
         <div className="flex-shrink-0 px-4 py-2 border-b border-light-border dark:border-dark-border bg-white dark:bg-dark-card flex items-center justify-between text-xs">
           <div className="flex items-center space-x-2">
             <span className="font-extrabold text-[10px] uppercase tracking-wider text-emerald-600 dark:text-emerald-400">Encounter Tabs</span>
@@ -479,7 +479,20 @@ const renderContent = () => {
   };
 
   return (
-    <main className={`${isWideMode ? 'w-full' : 'w-[70%]'} h-full flex flex-col overflow-hidden bg-light-bg dark:bg-dark-bg transition-all duration-300`}>
+    // `flex-1 min-w-0`, not a percentage.
+    //
+    // This was `w-[70%]`, which left a strip of empty background down the right
+    // of every screen: 70% of the workspace plus the submenu's 20% plus the first
+    // column's 10% comes to 100% only on paper, and the first column was capped at
+    // 100px, so whatever it gave back was never collected. `flex-1` asks for
+    // exactly the space the two columns did not take, so the body reaches the edge
+    // of the screen at every window size. `min-w-0` lets a wide table inside it
+    // scroll rather than shove the columns off the screen.
+    //
+    // `isWideMode` no longer affects this element at all: in that mode the two
+    // columns are a `fixed` overlay, so they take no space and the body takes all
+    // of it either way.
+    <main className="flex-1 min-w-0 h-full flex flex-col overflow-hidden bg-light-bg dark:bg-dark-bg transition-colors">
       <div className="flex-1 overflow-y-auto">
         {renderContent()}
       </div>

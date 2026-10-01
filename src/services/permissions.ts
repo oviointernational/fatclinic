@@ -303,6 +303,42 @@ export function countGranted(selected: string[]): number {
   return n;
 }
 
+/**
+ * Every permission in the application, in its smallest stored form.
+ *
+ * Granting a top-level key grants everything under it, so ten keys is "all" and
+ * it is also what keeps the stored set minimal - the same thing `togglePermission`
+ * rolls up to when every leaf is ticked by hand. There was no way to reach this
+ * from the role editor: the only control was a checkbox per node, so an
+ * administrator who wanted "this role may do anything" had to open and tick
+ * every branch, and the result depended on which branches they happened to
+ * notice.
+ */
+export function grantEverything(): string[] {
+  return PERMISSION_TREE.map(n => n.key).sort();
+}
+
+/**
+ * Top-level modules this grant set does not include.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * A role is stored as the set of keys it held when it was saved. When a new
+ * module is added to `PERMISSION_TREE` later, every role saved before that
+ * moment is quietly incomplete - and a role named "Chief Administrator" with
+ * the description "Has all rights" will say exactly that while missing one
+ * department. Nothing in the editor said so.
+ *
+ * That is not hypothetical: `AI` was added to the tree with no second thought
+ * about the roles already in the database, and the "Has all rights" role in the
+ * running clinic lost the AI Assistant for its physician. `grantEverything()`
+ * repairs it in one click, and this list is what tells the administrator there
+ * is something to repair.
+ */
+export function missingModules(selected: string[]): PermissionNode[] {
+  return PERMISSION_TREE.filter(n => !isEffectivelyGranted(selected, n.key));
+}
+
 export function totalPermissionCount(): number {
   let n = 0;
   const walk = (nodes: PermissionNode[]) => {

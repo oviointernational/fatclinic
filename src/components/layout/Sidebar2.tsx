@@ -10,7 +10,20 @@ interface Sidebar2Props {
   activeNav: MainNavId;
   activeSubNav: SubNavId;
   onSelectSubNav: (id: SubNavId) => void;
-  /** Fixed widths in drawer mode; a 20% slice of a phone is unreadable. */
+  /**
+   * Fixed widths, always. Not a percentage.
+   *
+   * This used to be `w-[20%]`, and at a 892px window it resolved to 80px - the
+   * menu was not missing its text, the text was being clipped to zero width
+   * inside a column too narrow to hold it. A percentage is also a share of a
+   * container that is itself being sized by the other columns, so the two fight:
+   * the first column took a fixed 200px, this one took a fifth of whatever was
+   * left, and on a narrow window that is not enough for a label. The body
+   * complained about the leftover space on the right for the same reason.
+   *
+   * A fixed width is what "the submenu keeps its text" actually requires, and it
+   * is also what makes the drawer predictable rather than proportional.
+   */
   asDrawer?: boolean;
 }
 
@@ -30,7 +43,7 @@ export const Sidebar2: React.FC<Sidebar2Props> = ({
   // bar says why it is empty rather than showing an empty column.
   if (!group || items.length === 0) {
     return (
-      <aside className={`${asDrawer ? 'w-[190px] min-w-[190px]' : 'w-[20%]'} h-full overflow-y-auto px-3 py-4 select-text bg-white dark:bg-dark-card border-r border-light-border/60 dark:border-dark-border/60`}>
+      <aside className={`${asDrawer ? 'w-[190px]' : 'w-[240px]'} flex-shrink-0 h-full overflow-y-auto px-3 py-4 select-text bg-white dark:bg-dark-card border-r border-light-border/60 dark:border-dark-border/60`}>
         <div className="flex flex-col items-center justify-center h-full text-center gap-2 px-2">
           <ShieldAlert className="w-5 h-5 text-slate-300 dark:text-slate-600" />
           <p className="text-[10px] text-slate-400 dark:text-slate-500 leading-relaxed">
@@ -43,7 +56,7 @@ export const Sidebar2: React.FC<Sidebar2Props> = ({
 
   return (
     <aside
-      className={`${asDrawer ? 'w-[190px] min-w-[190px]' : 'w-[20%]'} h-full overflow-y-auto px-3 py-4 select-text bg-white dark:bg-dark-card border-r border-light-border/60 dark:border-dark-border/60 transition-colors`}
+      className={`${asDrawer ? 'w-[190px]' : 'w-[240px]'} flex-shrink-0 h-full overflow-y-auto px-3 py-4 select-text bg-white dark:bg-dark-card border-r border-light-border/60 dark:border-dark-border/60 transition-colors`}
     >
       <div className="px-3 pb-2.5 border-b border-light-border/50 dark:border-dark-border/50 mb-3">
         <h2 className="text-xs font-black tracking-wide uppercase text-emerald-600 dark:text-emerald-400 truncate">

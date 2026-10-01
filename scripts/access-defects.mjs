@@ -26,6 +26,8 @@ const TARGETS = {
   dateRange: path.join(ROOT, 'src', 'services', 'dateRange.ts'),
   searchRank: path.join(ROOT, 'src', 'services', 'searchRank.ts'),
   useAccess: path.join(ROOT, 'src', 'hooks', 'useAccess.ts'),
+  mainContainer: path.join(ROOT, 'src', 'components', 'layout', 'MainContainer.tsx'),
+  sidebar2: path.join(ROOT, 'src', 'components', 'layout', 'Sidebar2.tsx'),
 };
 
 /** Where each injected source lives, for writing it back. */
@@ -36,6 +38,8 @@ const PATHS = {
   dateRange: ['services', 'dateRange.ts'],
   searchRank: ['services', 'searchRank.ts'],
   useAccess: ['hooks', 'useAccess.ts'],
+  mainContainer: ['components', 'layout', 'MainContainer.tsx'],
+  sidebar2: ['components', 'layout', 'Sidebar2.tsx'],
 };
 
 /** Pristine bytes, read in-process so no backup can go stale. */
@@ -55,6 +59,24 @@ const norm = (s) => s.replaceAll('\r\n', '\n');
 const TZ = { lagos: { TZ: 'Africa/Lagos' }, la: { TZ: 'America/Los_Angeles' } };
 
 const DEFECTS = [
+  {
+    file: 'sidebar2',
+    name: 'the submenu goes back to being a percentage, which clips its own labels',
+    // The reported defect. `w-[20%]` of the workspace resolved to 80px on an
+    // 892px window and the label text was rendered at zero width, so the column
+    // looked like icons with no text. Nothing in the JSX is wrong when you read
+    // it; only a real browser shows it.
+    from: "asDrawer ? 'w-[190px]' : 'w-[240px]'",
+    to: "asDrawer ? 'w-[190px]' : 'w-[20%]'",
+    count: 2,
+  },
+  {
+    file: 'mainContainer',
+    name: 'the body goes back to being 70%, leaving a strip of nothing on the right',
+    from: '<main className="flex-1 min-w-0 h-full flex flex-col overflow-hidden bg-light-bg dark:bg-dark-bg transition-colors">',
+    to: '<main className="w-[70%] h-full flex flex-col overflow-hidden bg-light-bg dark:bg-dark-bg transition-colors">',
+    count: 2,
+  },
   {
     file: 'useAccess',
     name: 'the hook above the signed-out gate calls the hook that throws when signed out',
@@ -203,6 +225,30 @@ const DEFECTS = [
     // cannot see their own menu item and reports it as "the menu is broken".
     from: `anyOf: [labKey('MOLECULAR', 'VIEW')] },`,
     to: `anyOf: [labKey('MOLYMARKET', 'VIEW')] },`,
+    count: 1,
+  },
+  {
+    file: 'permissions',
+    name: 'granting everything quietly omits a module',
+    // The exact shape of the report: a role created with "all rights" that was
+    // missing AI. Here the one-click button repeats it instead of fixing it.
+    from: `export function grantEverything(): string[] {
+  return PERMISSION_TREE.map(n => n.key).sort();
+}`,
+    to: `export function grantEverything(): string[] {
+  return PERMISSION_TREE.filter(n => n.key !== 'AI').map(n => n.key).sort();
+}`,
+    count: 1,
+  },
+  {
+    file: 'permissions',
+    name: 'a role that fell behind is still reported as complete',
+    from: `export function missingModules(selected: string[]): PermissionNode[] {
+  return PERMISSION_TREE.filter(n => !isEffectivelyGranted(selected, n.key));
+}`,
+    to: `export function missingModules(selected: string[]): PermissionNode[] {
+  return [];
+}`,
     count: 1,
   },
   {

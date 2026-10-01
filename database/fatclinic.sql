@@ -1885,6 +1885,7 @@ INSERT INTO permission_nodes (key, parent_key, label, depth) VALUES
   ('RADIOLOGY', NULL, 'Radiology', 1),
   ('PHYSIOTHERAPY', NULL, 'Physiotherapy', 1),
   ('BILLING', NULL, 'Billing & Cashier', 1),
+  ('AI', NULL, 'Clinical AI Assistant', 1),
   ('ADMIN', NULL, 'Administration', 1),
   ('DASHBOARD.VIEW', 'DASHBOARD', 'View dashboard', 2),
   ('PATIENTS.VIEW', 'PATIENTS', 'View patient directory', 2),
@@ -1998,7 +1999,10 @@ INSERT INTO permission_nodes (key, parent_key, label, depth) VALUES
   ('ADMIN.TARIFFS.MANAGE', 'ADMIN.TARIFFS', 'Change tariffs', 3),
   ('ADMIN.SETTINGS.MANAGE', 'ADMIN.SETTINGS', 'Edit settings', 3),
   ('ADMIN.ROLES.VIEW', 'ADMIN.ROLES', 'View roles', 3),
-  ('ADMIN.ROLES.MANAGE', 'ADMIN.ROLES', 'Create / edit roles', 3)
+  ('ADMIN.ROLES.MANAGE', 'ADMIN.ROLES', 'Create / edit roles', 3),
+  ('AI.QUERY', 'AI', 'Natural language query', 2),
+  ('AI.SUMMARIZE', 'AI', 'Patient summarizer', 2),
+  ('AI.SAFEGUARDS', 'AI', 'Clinical AI safeguards', 2)
 ON CONFLICT (key) DO NOTHING;
 
 -- Example granular role: a histopathology scientist who may do everything in

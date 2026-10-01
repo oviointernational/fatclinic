@@ -57,6 +57,7 @@ const {
 
 const {
   PERMISSION_TREE, allDescendants, isEffectivelyGranted, BASE_ROLE_PERMISSIONS,
+  grantEverything, missingModules, countGranted, totalPermissionCount,
 } = await import('../src/services/permissions.ts');
 
 const {
@@ -545,8 +546,129 @@ for (const role of ['FRONT_DESK', 'BILLING_OFFICER']) {
 }
 
 // ---------------------------------------------------------------------------
-// Date ranges actually cover the days a person asked for
+// "Give this role all rights" has to mean all of them
 // ---------------------------------------------------------------------------
+
+section('a role meant to have all rights has all of them, and says so when it does not');
+
+// The complaint this section answers: an access-control role was created, given
+// everything, assigned to a doctor - and the doctor could not see the AI
+// Assistant. Not a broken gate and not a broken assignment. Two ordinary things
+// had happened at once:
+//
+//   1. `AI` was added to `PERMISSION_TREE` with the navigation gate, which is
+//      after that role was saved. A stored role is the set of keys it held at
+//      that moment, so it cannot contain a module that did not exist yet.
+//   2. Assigning a custom role REPLACES the base role rather than adding to it.
+//      The doctor's own base grants included `AI`, so assigning the custom role
+//      took the AI Assistant away from them.
+//
+// Nothing in the editor said so. It offered a checkbox per node and no way to
+// reach "everything" in one action, and the role card printed "122 permissions
+// granted", which reads as complete.
+
+check('there is a one-click way to grant everything', typeof grantEverything === 'function');
+
+const everything = grantEverything();
+check('granting everything is a real grant of every top-level module',
+  PERMISSION_TREE.every(n => isEffectivelyGranted(everything, n.key)),
+  PERMISSION_TREE.filter(n => !isEffectivelyGranted(everything, n.key)).map(n => n.key).join(', '));
+check('and it covers every single permission in the application',
+  countGranted(everything) === totalPermissionCount(),
+  `${countGranted(everything)} of ${totalPermissionCount()}`);
+check('and nothing reports a gap when everything is granted',
+  missingModules(everything).length === 0,
+  missingModules(everything).map(m => m.key).join(', '));
+
+// A role that went behind: everything a role could have held on the day the AI
+// node did not yet exist. This is the role the clinic actually saved.
+const roleFromBeforeAI = everything.filter(k => k !== 'AI');
+check('a role that went behind reports the module it is missing',
+  missingModules(roleFromBeforeAI).map(m => m.key).join(',') === 'AI',
+  missingModules(roleFromBeforeAI).map(m => m.key).join(','));
+check('and is not reported as complete',
+  countGranted(roleFromBeforeAI) < totalPermissionCount());
+
+// The trap itself, end to end: the same person, before and after.
+const doc = user('PHYSICIAN');
+const asCustom = { id: 'ROLE-X', name: 'Has all rights', description: '', permissions: roleFromBeforeAI, createdAt: '', createdBy: '' };
+
+check('that doctor CAN see every department on their base role',
+  canOpenMainNav(doc, 'ai') && missingModules(roleFromBeforeAI).length > 0);
+check('but loses the AI Assistant once the custom role is assigned',
+  !canOpenMainNav(doc, 'ai', asCustom));
+check('and every other department is untouched, which is why it looks like a small problem',
+  MAIN_NAV.filter(n => n.id !== 'ai').every(n => canOpenMainNav(doc, n.id, asCustom)),
+  MAIN_NAV.filter(n => n.id !== 'ai' && !canOpenMainNav(doc, n.id, asCustom)).map(n => n.id).join(', '));
+check('assigning the repaired role restores it',
+  canOpenMainNav(doc, 'ai', { ...asCustom, permissions: grantEverything() }));
+
+// "Everything" must also mean the same thing as an administrator's grants, or
+// there would be two answers to one question.
+check('granting everything is indistinguishable from an administrator',
+  MAIN_NAV.every(n => canOpenMainNav(doc, n.id, { ...asCustom, permissions: everything })));
+check('and it reaches every screen, not only every department door',
+  Object.keys(SUB_NAV).every(nav => permittedSubNavs(doc, nav, { ...asCustom, permissions: everything })
+    .length === (SUB_NAV[nav]?.items.length ?? 0)));
+
+// ---------------------------------------------------------------------------
+// The columns keep their labels and the body reaches the right-hand edge
+// ---------------------------------------------------------------------------
+
+section('the workspace columns keep their text and the body fills the screen');
+
+// This is a source-level guard, not a render test, and the distinction matters.
+// The defect it catches was found by measuring a real browser, not by reading
+// the code: the submenu was `w-[20%]`, which resolved to 80px on a 892px window,
+// so the labels were rendered and clipped to zero width - "icons with no text".
+// Nothing about the JSX looks wrong. The body was `w-[70%]`, which with the
+// submenu at 20% and the first column capped at 100px left a strip of empty
+// background down the right of every screen.
+//
+// Percentages in a row of flex columns are the mistake, so that is what is
+// forbidden here. What is NOT asserted is that the layout looks right - only a
+// real browser can say that, and a check which claimed otherwise would be worse
+// than none.
+
+function readSrc(...parts) {
+  return fs.readFileSync(path.join(ROOT, ...parts), 'utf8');
+}
+
+// Strip comments: the reasoning above lives in the source and names the very
+// classes it is checking for.
+const layoutFiles = [
+  ['src', 'components', 'layout', 'MainContainer.tsx'],
+  ['src', 'components', 'layout', 'Sidebar1.tsx'],
+  ['src', 'components', 'layout', 'Sidebar2.tsx'],
+];
+
+for (const rel of layoutFiles) {
+  const code = readSrc(...rel).replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^\s*\/\/.*$/gm, ' ');
+  const pct = [...code.matchAll(/w-\[\d+(\.\d+)?%\]/g)].map(m => m[0]);
+  check(`${rel[3]} gives its column a real width, not a percentage`,
+    pct.length === 0, [...new Set(pct)].join(', '));
+}
+
+// The body takes exactly the space the two columns did not, which is `flex-1`,
+// and is allowed to be squeezed below its content by `min-w-0`.
+const mainCode = readSrc('src', 'components', 'layout', 'MainContainer.tsx')
+  .replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/^\s*\/\/.*$/gm, ' ');
+const mainTags = [...mainCode.matchAll(/<main className="([^"]*)"/g)].map(m => m[1]);
+check('the body is present on every screen it renders',
+  mainTags.length > 0 && mainTags.every(c => /\bflex-1\b/.test(c) && /\bmin-w-0\b/.test(c)),
+  mainTags.join(' | '));
+
+// A label that is not in the markup cannot appear, and a column that clips is
+// how it disappeared in the first place.
+for (const [file, marker] of [['Sidebar1.tsx', 'item.label'], ['Sidebar2.tsx', 'item.label']]) {
+  const code = readSrc('src', 'components', 'layout', file);
+  check(`${file} still renders the menu text, not only the icon`,
+    code.includes(marker));
+  check(`${file} does not hide its labels`,
+    !/hidden[^"'`]*>\{item\.label\}/.test(code));
+}
+
+
 
 section('a date range covers exactly the days that were asked for');
 
@@ -656,6 +778,7 @@ check('and a custom range is named', /2026-09-01 to 2026-09-30/.test(describeWin
 // ---------------------------------------------------------------------------
 // The signed-out visitor gets a page, not a crash
 // ---------------------------------------------------------------------------
+
 
 section('a signed-out visitor gets a page, not a crash');
 

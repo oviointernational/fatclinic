@@ -31,7 +31,7 @@ import {
   X
 } from 'lucide-react';
 import { PermissionTreeEditor } from './PermissionTreeEditor';
-import { countGranted } from '../../services/permissions';
+import { countGranted, totalPermissionCount, missingModules } from '../../services/permissions';
 
 export type AdminTab = 'users' | 'consumables' | 'lab' | 'pharmacy' | 'radiology_physio' | 'pricing' | 'receipts' | 'settings';
 
@@ -781,13 +781,34 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
               </button>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-              {db.getCustomRoles().map(role => (
+              {db.getCustomRoles().map(role => {
+                const roleMissing = missingModules(role.permissions);
+                return (
                 <div key={role.id} className="p-4 rounded-2xl bg-white dark:bg-dark-card border shadow-sm flex flex-col justify-between">
                   <div>
                     <h4 className="font-bold text-sm text-slate-900 dark:text-white">{role.name}</h4>
                     <p className="text-[11px] text-slate-500 mt-1">{role.description}</p>
                     <div className="flex flex-wrap gap-1 mt-2">
-                      <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">{countGranted(role.permissions)} permissions granted</span>
+                      {/* "of N", and the named gaps.
+                          This used to read "122 permissions granted", which is
+                          indistinguishable from complete. A role is stored as the
+                          keys it held when it was saved, so adding a module to the
+                          tree leaves every older role short of it - and a role
+                          described as "Has all rights" says exactly that while
+                          missing a department. The count alone cannot show that;
+                          the count out of a total can. */}
+                      <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${
+                        roleMissing.length
+                          ? 'bg-amber-50 text-amber-800 border-amber-300'
+                          : 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                      }`}>
+                        {countGranted(role.permissions)} of {totalPermissionCount()} permissions granted
+                      </span>
+                      {roleMissing.map(m => (
+                        <span key={m.key} className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-50 text-amber-800 border border-amber-300">
+                          {m.label} not granted
+                        </span>
+                      ))}
                       {role.permissions.slice(0, 4).map(p => (
                         <span key={p} className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-50 text-slate-500 border border-slate-200">{p}</span>
                       ))}
@@ -801,7 +822,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ initialTab = 'us
                     <button onClick={() => { if (confirm('Delete this role?')) db.deleteCustomRole(role.id, currentUser); }} className="p-1.5 rounded-lg hover:bg-rose-50 text-rose-600"><Trash2 className="w-3.5 h-3.5" /></button>
                   </div>
                 </div>
-              ))}
+                );
+              })}
               {db.getCustomRoles().length === 0 && <div className="col-span-3 text-center text-xs text-slate-400 py-6">No custom roles yet. Create one to define custom permissions.</div>}
             </div>
           </div>

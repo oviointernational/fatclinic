@@ -8,6 +8,8 @@ import {
   togglePermission,
   countGranted,
   totalPermissionCount,
+  grantEverything,
+  missingModules,
 } from '../../services/permissions';
 
 interface PermissionTreeEditorProps {
@@ -80,6 +82,7 @@ export const PermissionTreeEditor: React.FC<PermissionTreeEditorProps> = ({ sele
   const [filter, setFilter] = useState('');
   const granted = countGranted(selected);
   const total = totalPermissionCount();
+  const missing = missingModules(selected);
 
   const filteredTree: PermissionNode[] = React.useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -105,6 +108,38 @@ export const PermissionTreeEditor: React.FC<PermissionTreeEditorProps> = ({ sele
         />
         <span className="text-[10px] font-bold text-slate-500 whitespace-nowrap">{granted}/{total} granted</span>
       </div>
+
+      {/* "Has all rights" has to be reachable in one click.
+          The only control here used to be a checkbox per node, so a role meant to
+          grant everything meant opening and ticking every branch by hand, and the
+          result depended on which branches the administrator happened to notice.
+          It also repairs a role that went behind: a saved role cannot contain a
+          module that did not exist when it was saved, so "everything" silently
+          stopped meaning everything the day a new module was added. */}
+      <div className="px-3 py-1.5 bg-slate-50 dark:bg-dark-surface border-b flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => onChange(grantEverything())}
+          disabled={missing.length === 0}
+          className="px-2.5 py-1 text-[10px] font-bold rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed text-white"
+        >
+          Grant everything
+        </button>
+        <button
+          type="button"
+          onClick={() => onChange([])}
+          disabled={selected.length === 0}
+          className="px-2.5 py-1 text-[10px] font-bold rounded-lg border border-slate-300 dark:border-dark-border hover:bg-slate-100 dark:hover:bg-dark-surface disabled:opacity-40 disabled:cursor-not-allowed text-slate-600 dark:text-slate-300"
+        >
+          Clear all
+        </button>
+        {missing.length > 0 && (
+          <span className="text-[10px] font-bold text-amber-700 dark:text-amber-400">
+            Not granted: {missing.map(m => m.label).join(', ')}
+          </span>
+        )}
+      </div>
+
       <div className="p-2 space-y-0.5 max-h-72 overflow-y-auto">
         {filteredTree.map(node => (
           <Row key={node.key} node={node} selected={selected} onToggle={key => onChange(togglePermission(selected, key))} depth={0} />
